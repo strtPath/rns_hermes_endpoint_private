@@ -185,10 +185,13 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 - Does `chat -q -c <name>` resume one thread, or mint a new session per call?
   (DB says per-call — needs a direct test. **This is Tier 1.1.**)
 - Which Tier-2 commands do we actually want over mesh vs. keep Telegram-only?
-  The registry is now verified; the *selection* is a product call, not a research
-  one. My read: land the **high-value** set first (`/status`, `/stop`, `/pause`,
-  `/approve`/`/deny`, `/retry`, `/whoami`, `/usage`, `/version`).
-- Is voice/attachment over LXMF in scope at all, or is text-only the target?
+  **DECIDED 2026-08-20:** fuller session control is in scope — land the
+  high-value batch first, then the full non-`cli_only` session set
+  (`/resume`, `/branch`, `/compress`, `/undo`, `/queue`, `/steer`, `/background`,
+  `/sessions`, …).
+- **Voice & media: in scope as Tier 5.** Voice-out (5.1) is feasible now.
+  Voice-in (5.2) needs a spike on the `rngit` inbound path. **Live call (5.3)
+  is out of scope** for the LXMF transport — documented, not deferred.
 - Does `/stop` need to kill the `hermes chat` subprocess, or just flag the
   bridge to ignore the next reply?
 
@@ -199,5 +202,46 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
    `/retry`, `/whoami`, `/usage`, `/version`. All are thin handlers on the
    existing `CommandDispatcher`.
 3. **Tier 3** — tool-call / clarify / accept-deny rendering over plain text.
-4. **Tier 4** — `/status` health, watchdog, CI, then cut the upstream PR from
-   the clean branch.
+4. **Tier 4** — `/status` health, watchdog, CI.
+5. **Tier 2 fuller session control** — the full non-`cli_only` session set
+   (`/resume`, `/branch`, `/compress`, `/undo`, `/queue`, `/steer`, `/background`,
+   `/sessions`, …) once the core batch is stable.
+6. **Tier 5 — Voice & media** — voice-out first (5.1), then a spike on voice-in
+   (5.2). See the transport constraints below before committing to 5.2.
+7. Then cut the upstream PR from the clean branch (after Tier 4).
+
+---
+
+## Tier 5 — Voice & media over LXMF (transport-constrained)
+
+**Verified transport facts** (RNS 1.4.2 + LXMF 1.1.1, read from the venv,
+2026-08-20):
+
+- **LXMF is a tiny-message protocol, not a streaming one.** Each message carries
+  **~368 bytes of content max** (documented in `LXMessage.py`: ~112B fixed
+  overhead, ~368B content). No chunked/streaming voice channel exists.
+- **Outbound file transfer exists.** RNS `Resource.py` provides a real
+  `Resource` class for transferring arbitrary bytes over an RNS Link
+  (hashmap + chunked transfer). LXMF carries only the **hash/pointer**
+  (~60 bytes — fits), the client pulls the actual file.
+- **Inbound file transfer is the gap.** LXMF messages are content-only (no
+  file-receive). The only inbound binary path in the stack is RNS
+  **`rngit`** (`RNS/Utilities/rngit/{client,server}.py`) — a git-backed
+  resource server. That is a heavier, separate subsystem.
+- **Live two-way "call" is not realistic** over LoRa/LXMF: 368-byte messages,
+  opportunistic delivery, no QoS. The honest model is **async voice messages**,
+  not a phone call.
+
+### Sub-tiers
+
+| # | Item | Feasibility | Notes |
+|---|------|-----------|-------|
+| 5.1 | **Voice-out** (TTS → OGG/Opus → RNS-Resource → LXMF pointer) | ✅ medium, high feasibility | Generate OGG locally (edge-tts/piper already in the stack's toolchain), transfer via RNS `Resource`, LXMF message carries hash+size. Mirrors Telegram voice bubbles. |
+| 5.2 | **Voice-in** (STT: your note → faster-whisper → text) | ⚠️ hard — spike first | No LXMF inbound file path. Options: (a) RNS `rngit` server the phone pushes to; (b) base64-chunked text (fragile, 368B/msg — only for tiny clips). **Spike 5.2 before building.** |
+| 5.3 | **Live call** (continuous two-way voice) | ❌ out of scope | Not feasible on this transport. Documented, not deferred. |
+
+### Open design questions for Tier 5
+- Voice-out codec + bitrate for LoRa bandwidth (Opus q~0.3? ~16–24 kbps?).
+- Where the OGG is stored + how the client is told the resource hash (a
+  structured LXMF message field, or a short text preamble).
+- For 5.2: do we stand up `rngit`, or is voice-out-only an acceptable v1?
