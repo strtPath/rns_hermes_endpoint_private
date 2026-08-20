@@ -18,7 +18,9 @@ from pathlib import Path
 from hermes_reticulum import __version__
 from hermes_reticulum.core.acl import AccessControl
 from hermes_reticulum.core.bridge import LXMFBridge
+from hermes_reticulum.core.commands import build_dispatcher
 from hermes_reticulum.core.hermes_client import HermesClient
+from hermes_reticulum.core.model_command import ModelCommandHandler
 
 
 def _load_dotenv():
@@ -58,6 +60,14 @@ def cmd_run(args):
     # Initialize components
     acl = AccessControl()
     hermes = HermesClient(hermes_bin=hermes_bin, timeout=timeout)
+
+    # /model command handler (mirrors the Telegram gateway's /model).
+    model_cmd = ModelCommandHandler(hermes)
+
+    # Generic slash-command dispatcher — adds /model, /new, /help, /commands.
+    # Add more in core/commands.py (COMMANDS dict); no cli.py changes needed.
+    dispatcher = build_dispatcher(hermes, model_cmd)
+
     bridge = LXMFBridge(
         display_name=display_name,
         storage_path=storage,
@@ -65,11 +75,17 @@ def cmd_run(args):
         rns_config_path=rns_config,
     )
 
-    # Wire up: LXMF message → ACL check → profile → Hermes → reply
+    # Wire up: LXMF message → ACL check → command dispatch → profile → Hermes → reply
     def handle_message(source_hash: str, content: str, profile=None) -> str | None:
         if not acl.is_allowed(source_hash):
             logger.info("Message from %s rejected by ACL", source_hash[:16])
             return "⛔ Access not authorized."
+
+        # Slash commands — handled locally, never sent to the LLM.
+        command_reply = dispatcher.handle(content)
+        if command_reply is not None:
+            logger.info("Command from %s: %s", source_hash[:16], content)
+            return command_reply
 
         # Build prompt with adaptive instruction from profile
         if profile and profile.instruction:
