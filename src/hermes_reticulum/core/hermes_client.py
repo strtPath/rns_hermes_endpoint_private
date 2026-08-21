@@ -81,11 +81,90 @@ class HermesClient:
             "HERMES_SESSION_NAME", f"mesh-{source_tag}"
         )
         self._model_lock = __import__("threading").Lock()
+        self._resume_id: str | None = None
 
         logger.info("Hermes binary: %s", self.hermes_bin)
         if self.model:
             logger.info("Hermes model pinned: %s", self.model)
         logger.info("Hermes session thread: %s", self.session_name)
+
+    def _resolve_session_id(self) -> str | None:
+        """
+        Resolve the named mesh thread to a concrete session ID.
+
+        Queries ``~/.hermes/state.db`` directly (read-only) instead of
+        shelling out to ``hermes sessions export``. This is faster and
+        avoids the source-mismatch bug: sessions created via
+        ``-c <name> --create-if-missing`` are stored with source='cli',
+        not the bridge's source_tag, so an export filtered on
+        ``--source reticulum`` never finds them.
+
+        Returns the most recently active session whose title matches
+        exactly, or None if no such session exists.
+        """
+        import os
+        import sqlite3
+
+        db_path = os.path.expanduser(
+            os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
+        )
+        if not os.path.exists(db_path):
+            logger.debug("state.db not found at %s", db_path)
+            return None
+
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE title = ? "
+                    "ORDER BY last_activity_at DESC LIMIT 1",
+                    (self.session_name,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is not None:
+                logger.debug(
+                    "Resolved mesh thread %r -> session %s",
+                    self.session_name, row[0],
+                )
+                return row[0]
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("Could not query state.db for %r: %s",
+                           self.session_name, exc)
+        return None
+
+    def _ensure_session(self, new_session: bool) -> None:
+        """
+        Maintain the resume target.
+
+        - new_session=True  → start a fresh thread (bump name, clear cache).
+        - new_session=False → resolve the named thread to an ID; create the
+          titled session once if it doesn't exist yet.
+
+        Sets self._resume_id (the concrete session ID to resume) or None.
+        """
+        if new_session:
+            import time
+
+            self.session_name = f"mesh-{self.source_tag}-{int(time.time())}"
+            self._resume_id = None
+            logger.info("Session reset — new thread: %s", self.session_name)
+            return
+
+        if self._resume_id:
+            return  # already pinned for this thread
+        resolved = self._resolve_session_id()
+        if resolved:
+            self._resume_id = resolved
+            logger.info("Resuming mesh thread %r via session %s",
+                        self.session_name, resolved[:12])
+            return
+        # No resolvable thread yet: leave _resume_id None. The first `chat()`
+        # call falls back to `-c <name> --create-if-missing`, which opens the
+        # titled session; the next call resolves it to an ID and pins it.
+        logger.info("Mesh thread %r not resolvable yet — will create on send",
+                    self.session_name)
 
     def chat(self, message: str, new_session: bool = False) -> str | None:
         """
@@ -94,11 +173,13 @@ class HermesClient:
         Args:
             message: The user's message text.
             new_session: If True, this call starts a fresh conversation
-                thread (drops prior context). See _session_args.
+                thread (drops prior context). See _ensure_session.
 
         Returns:
             The agent's reply text, or None on error.
         """
+        self._ensure_session(new_session)
+
         cmd = [
             self.hermes_bin,
             "chat",
@@ -109,13 +190,11 @@ class HermesClient:
             "-Q",  # quiet — suppress banner/spinner
         ]
         # Session handling:
-        #  - new_session=True  → brand-new thread, drops all prior context
-        #  - new_session=False → resume the per-source named thread (continuity)
-        if new_session:
-            cmd += ["--pass-session-id"]
+        #  - resume by explicit session ID (deterministic), or
+        #  - create/resume the named thread if we couldn't pin an ID yet.
+        if self._resume_id:
+            cmd += ["--resume", self._resume_id]
         else:
-            # Continue (create-if-missing) the named thread for this source so
-            # mesh conversations keep context across calls. `/new` resets it.
             cmd += ["-c", self.session_name, "--create-if-missing"]
         with self._model_lock:
             model = self.model
@@ -185,12 +264,13 @@ class HermesClient:
         End the current conversation thread so the next message starts fresh.
 
         We can't delete the named thread in-place, so we bump the session name
-        — the next `chat()` call opens a brand-new thread with no prior context.
-        This is what the `/new` command triggers.
+        and clear the pinned ID — the next `chat()` call opens a brand-new
+        thread with no prior context. This is what the `/new` command triggers.
         """
         import time
 
         self.session_name = f"mesh-{self.source_tag}-{int(time.time())}"
+        self._resume_id = None
         logger.info("Session reset — new thread: %s", self.session_name)
 
     def _error_reply(self, returncode: int, stderr: str) -> str:
