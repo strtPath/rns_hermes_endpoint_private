@@ -10,6 +10,8 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
+import time
 
 logger = logging.getLogger("hermes_reticulum.hermes")
 
@@ -74,6 +76,11 @@ class HermesClient:
 
         self.hermes_bin = hermes_bin
         self.timeout = timeout
+        # Liveness guard: if zero output (stdout+stderr) for this many seconds,
+        # the model is considered wedged. Set to 0 to disable.
+        self.liveness_timeout = int(
+            os.getenv("HERMES_LIVENESS_TIMEOUT", "180")
+        )
         self.source_tag = source_tag
         self.extra_args = extra_args or []
         self.model = model or os.getenv("HERMES_MODEL", "").strip() or None
@@ -82,11 +89,15 @@ class HermesClient:
         )
         self._model_lock = __import__("threading").Lock()
         self._resume_id: str | None = None
+        self._process: subprocess.Popen | None = None
+        self._stop_requested = False
 
         logger.info("Hermes binary: %s", self.hermes_bin)
         if self.model:
             logger.info("Hermes model pinned: %s", self.model)
         logger.info("Hermes session thread: %s", self.session_name)
+        if self.liveness_timeout:
+            logger.info("Liveness guard: %ds (0=off)", self.liveness_timeout)
 
     def _resolve_session_id(self) -> str | None:
         """
@@ -179,6 +190,7 @@ class HermesClient:
             The agent's reply text, or None on error.
         """
         self._ensure_session(new_session)
+        self._stop_requested = False
 
         cmd = [
             self.hermes_bin,
@@ -204,36 +216,7 @@ class HermesClient:
 
         try:
             logger.debug("Calling: %s", " ".join(cmd))
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-
-            if result.returncode != 0:
-                logger.error(
-                    "Hermes exited with code %d: %s",
-                    result.returncode,
-                    result.stderr[:500] if result.stderr else "(no stderr)",
-                )
-                return self._error_reply(result.returncode, result.stderr)
-
-            reply = result.stdout.strip()
-            if not reply:
-                logger.warning("Hermes returned empty output")
-                return "_(no response)_"
-
-            return reply
-
-        except subprocess.TimeoutExpired:
-            logger.error("Hermes timed out after %ds", self.timeout)
-            return (
-                f"⏱️ Processing exceeded the {self.timeout}s limit. "
-                "Try a shorter question."
-            )
+            return self._run_with_liveness_guard(cmd)
 
         except FileNotFoundError:
             logger.error("Hermes binary not found at: %s", self.hermes_bin)
@@ -242,6 +225,135 @@ class HermesClient:
         except Exception as e:
             logger.error("Unexpected error calling Hermes: %s", e, exc_info=True)
             return f"❌ Unexpected error: {str(e)[:200]}"
+
+    def _run_with_liveness_guard(self, cmd: list[str]) -> str | None:
+        """
+        Run the hermes subprocess with a liveness guard.
+
+        Kills the process if zero output (stdout+stderr) for
+        ``liveness_timeout`` seconds. Returns the reply text or an
+        error message.
+        """
+        last_activity = time.monotonic()
+        activity_lock = threading.Lock()
+        done = threading.Event()
+
+        def _touch():
+            nonlocal last_activity
+            with activity_lock:
+                last_activity = time.monotonic()
+
+        def _read_stream(stream, parts: list[str]):
+            """Read a stream line-by-line until EOF, touching the liveness clock."""
+            for line in stream:
+                parts.append(line)
+                _touch()
+            stream.close()
+
+        def _watchdog():
+            if not self.liveness_timeout:
+                return
+            while not done.is_set():
+                with activity_lock:
+                    remaining = (last_activity + self.liveness_timeout) - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "Liveness guard: no output for %ds, killing hermes",
+                        self.liveness_timeout,
+                    )
+                    self._kill_process()
+                    return
+                done.wait(min(remaining, 1.0))
+
+        proc: subprocess.Popen | None = None
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            self._process = proc
+
+            stdout_thread = threading.Thread(
+                target=_read_stream, args=(proc.stdout, stdout_parts),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_read_stream, args=(proc.stderr, stderr_parts),
+                daemon=True,
+            )
+            watcher = threading.Thread(
+                target=_watchdog, daemon=True, name="hermes-liveness"
+            )
+
+            stdout_thread.start()
+            stderr_thread.start()
+            watcher.start()
+
+            proc.wait()
+
+            stdout_thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
+            watcher.join(timeout=2)
+
+            stdout = "".join(stdout_parts)
+            stderr = "".join(stderr_parts)
+
+            if proc.returncode != 0:
+                logger.error(
+                    "Hermes exited with code %d: %s",
+                    proc.returncode,
+                    stderr[:500] if stderr else "(no stderr)",
+                )
+                return self._error_reply(proc.returncode, stderr)
+
+            reply = stdout.strip()
+            if not reply:
+                logger.warning("Hermes returned empty output")
+                return "_(no response)_"
+            return reply
+
+        except FileNotFoundError:
+            logger.error("Hermes binary not found at: %s", self.hermes_bin)
+            return "❌ Hermes Agent not found. Check your installation."
+
+        except Exception as e:
+            logger.error("Unexpected error calling Hermes: %s", e, exc_info=True)
+            self._kill_process()
+            return f"❌ Unexpected error: {str(e)[:200]}"
+
+        finally:
+            self._process = None
+            done.set()
+
+    def _kill_process(self) -> None:
+        """Terminate the running hermes subprocess (if any)."""
+        proc = self._process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def stop(self) -> bool:
+        """
+        Manually stop a running hermes subprocess (the `/stop` command).
+
+        Returns True if a process was killed, False if nothing was running.
+        """
+        proc = self._process
+        if proc is None or proc.poll() is not None:
+            return False
+        self._stop_requested = True
+        logger.info("Stop requested — killing hermes subprocess")
+        self._kill_process()
+        return True
 
     def set_model(self, model: str | None) -> str:
         """

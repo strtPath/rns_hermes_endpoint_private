@@ -33,8 +33,8 @@ the gap, grouped into four tiers by effort/value:
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
-| 1.1 | **True session continuity** | ❌ open | `-c <name> --create-if-missing` is wired, but the DB shows a *new* session id per `chat -q` call (fresh `reticulum` rows at 01:29/02:01/02:19/02:26/10:02/11:39 today). Need to confirm whether `-c` actually resumes one thread or whether `chat -q` always mints a new session. *(verified this session: DB rows are per-call.)* |
-| 1.2 | **Model responsiveness guard** | ⚠️ partial | 600s timeout is in place, but a hung 27b still eats the full cap (one test ran 16:38→16:44). Add a liveness/first-token timeout or a watchdog so a wedged model is detected fast. ` /model` is the manual escape hatch. *(verified this session.)* |
+| 1.1 | **True session continuity** | ✅ done | Resolves thread by title via direct `state.db` query (no subprocess). Fix committed 2026-08-21. |
+| 1.2 | **Model responsiveness guard** | ✅ done | Liveness watchdog: kills `hermes` if zero stdout+stderr output for `HERMES_LIVENESS_TIMEOUT` (default 180s). `/stop` command kills manually. Pairs with slow 27b — threshold is configurable. |
 | 1.3 | **`/model` runtime discovery** | ✅ done | `model_command.py` now reads models from `config.yaml` at runtime (no hardcoded catalog). *(verified this session.)* |
 | 1.4 | **`/new`, `/help`, `/commands`** | ✅ done | `CommandDispatcher` in `commands.py`; `/new` confirmed via log `Session reset — new thread: mesh-reticulum-<ts>`. *(verified this session.)* |
 | 1.5 | **Startup loud-fail on missing `hermes`** | ⚠️ partial | `find_hermes_bin()` raises `RuntimeError`; service unit now pins `PATH`. Add a clear, actionable startup message + a `/status`-style check. |
@@ -168,15 +168,6 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | 4.4 | **Structured logging of commands** | ⚠️ partial | Commands log to journal (`Command from <id>: /new`) but not to the session DB. Consider a lightweight audit log. |
 | 4.5 | **Watchdog / auto-restart** | ⬜ | systemd `Restart=` + a liveness ping so a dead bridge is caught. (Matches the CamoFox health-check pattern.) |
 | 4.6 | **CI on the fork** | ⬜ | A lint/import check on the private fork before PR. |
-
----
-
-## Suggested order (value × effort)
-
-1. **1.1 + 1.2** — fix continuity + add the responsiveness guard (the two real pain points, both verified).
-2. **Tier 2 verify** — 10-min grep of the Telegram command list, then land `/status`, `/stop`, `/ping` (cheap, high value).
-3. **Tier 3** — the tool-call/clarify rendering fix (the one genuine functional gap).
-4. **Tier 4** — `/status` + watchdog + CI, then cut the upstream PR from the clean branch.
 
 ---
 

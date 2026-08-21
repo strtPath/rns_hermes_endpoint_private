@@ -45,12 +45,20 @@ CommandFn = Callable[[CommandContext, str], str | None]
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _cmd_stop(ctx: CommandContext, args: str) -> str | None:
+    killed = ctx.hermes.stop()
+    if killed:
+        return "⛔ Stopped the running Hermes process."
+    return "Nothing to stop — no active process."
+
+
 def _cmd_help(ctx: CommandContext, args: str) -> str | None:
     lines = [
         "Hermes endpoint commands:",
         "",
         "/model — list models, switch, or reset the model",
         "/new — start a fresh conversation (clears context)",
+        "/stop — kill the running Hermes process",
         "/help — show this message",
     ]
     return "\n".join(lines)
@@ -70,6 +78,7 @@ def _cmd_new(ctx: CommandContext, args: str) -> str | None:
 COMMANDS: dict[str, CommandFn] = {
     "/model": lambda ctx, args: ctx.model_handler.run(f"/model {args}".strip()),
     "/new": _cmd_new,
+    "/stop": _cmd_stop,
     "/help": _cmd_help,
     "/commands": _cmd_help,
 }
@@ -102,6 +111,8 @@ class CommandDispatcher:
             command = "/new"
         elif command in ("help", "commands"):
             command = "/help"
+        elif command in ("stop",):
+            command = "/stop"
 
         handler = COMMANDS.get(command)
         if handler is None:
