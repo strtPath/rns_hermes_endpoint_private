@@ -36,17 +36,28 @@ def discover_models() -> list[str]:
     """
     Discover switchable model names from the active Hermes config.
 
-    Reads ``providers.<name>.models`` for every provider in
-    ``~/.hermes/config.yaml`` and returns the flattened list (in file order).
-    Falls back to an empty list when the config can't be read, so the command
-    degrades gracefully to "list the active model" rather than crashing.
+    Reads two config shapes (both may be present):
 
-    Returns:
-        A list of model name strings, possibly empty.
+    - ``providers.<name>.models`` — list of model names or ``{name: ...}``
+      dicts (legacy / hand-written provider blocks).
+    - ``custom_providers`` — list of provider entries, each with its own
+      ``models`` mapping (the format Hermes auto-writes, e.g. after a
+      ``/model`` discovery or provider migration). The entry's default
+      ``model`` is included too.
+
+    Returns the flattened list in file order, deduplicated, possibly empty
+    (the command then degrades to "list the active model" rather than crash).
     """
     try:
         import yaml
-    except ImportError:  # PyYAML not available — nothing to discover.
+    except ImportError:
+        # A missing dependency should not silently masquerade as "no models
+        # configured" — that makes /model look broken with no clue. Log loud.
+        logger.error(
+            "PyYAML is not installed in the bridge environment — "
+            "/model cannot read the configured model list. "
+            "Run: <venv>/bin/pip install pyyaml"
+        )
         return []
 
     config_path = Path(os.getenv(
@@ -64,12 +75,28 @@ def discover_models() -> list[str]:
 
     models: list[str] = []
     seen: set[str] = set()
+
+    def add(name):
+        if name and name not in seen:
+            seen.add(name)
+            models.append(name)
+
+    # Legacy shape: providers.<name>.models = [str | {name: ...}]
     for provider in (data.get("providers") or {}).values():
+        if not isinstance(provider, dict):
+            continue
         for m in provider.get("models") or []:
             name = m if isinstance(m, str) else (m or {}).get("name")
-            if name and name not in seen:
-                seen.add(name)
-                models.append(name)
+            add(name)
+
+    # New shape: custom_providers = [{name, model, models: {name: ...}}]
+    for provider in data.get("custom_providers") or []:
+        if not isinstance(provider, dict):
+            continue
+        add(provider.get("model"))
+        for name in (provider.get("models") or {}):
+            add(name)
+
     return models
 
 

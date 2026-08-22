@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "rns>=1.3.5",
     "lxmf>=1.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
