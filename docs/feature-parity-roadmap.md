@@ -55,6 +55,14 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | `/new` (alias `/reset`) | ✅ |
 | `/help` | ✅ |
 | `/commands` | ✅ |
+| `/stop` | ✅ (kills running hermes subprocess; pairs with 1.2 liveness guard) |
+| `/status` | ✅ (model, session, process, tokens, timeouts) |
+| `/pause` / `/resume` | ✅ (global emergency stop via `hermes pause`/`resume`) |
+| `/retry` | ✅ (resends last prompt) |
+| `/usage` | ✅ (session-local token totals from state.db) |
+| `/version` | ✅ (`hermes --version`) |
+| `/whoami` | ⏸️ deferred (needs ACL access-level plumbing) |
+| `/approve` / `/deny` | ⏸️ deferred (needs interactive approval infrastructure) |
 
 ### Not `cli_only` — in parity scope (grouped, with mesh priority)
 

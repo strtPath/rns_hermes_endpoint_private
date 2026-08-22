@@ -216,6 +216,7 @@ class HermesClient:
 
         try:
             logger.debug("Calling: %s", " ".join(cmd))
+            self.set_last_prompt(message)
             return self._run_with_liveness_guard(cmd)
 
         except FileNotFoundError:
@@ -370,6 +371,108 @@ class HermesClient:
     def get_model(self) -> str:
         with self._model_lock:
             return self.model or "(hermes default)"
+
+    def is_running(self) -> bool:
+        """True while a hermes subprocess is actively running."""
+        proc = self._process
+        return proc is not None and proc.poll() is None
+
+    def set_last_prompt(self, prompt: str) -> None:
+        """Remember the last user prompt sent to hermes (for /retry)."""
+        self._last_prompt = (prompt or "").strip() or None
+
+    def get_last_prompt(self) -> str | None:
+        """The last user prompt sent to hermes, or None."""
+        return getattr(self, "_last_prompt", None)
+
+    def pause(self, reason: str = "") -> str:
+        """
+        Engage Hermes' global emergency stop (``hermes pause``).
+
+        Halts new work (cron/kanban dispatch, new gateway turns) until
+        ``resume()`` is called. In-flight subprocesses are NOT killed —
+        use ``stop()`` for that.
+        """
+        cmd = [self.hermes_bin, "pause"]
+        if reason:
+            cmd += ["--reason", reason]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                return f"⚠️ pause failed: {result.stderr.strip()[:200]}"
+            return f"⏸️ Hermes paused. New work halted. Use /resume to lift."
+        except Exception as e:
+            return f"⚠️ pause error: {e}"
+
+    def resume(self) -> str:
+        """Lift the global emergency stop set by ``pause()``."""
+        try:
+            result = subprocess.run(
+                [self.hermes_bin, "resume"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                return f"⚠️ resume failed: {result.stderr.strip()[:200]}"
+            return "▶️ Hermes resumed. New work allowed again."
+        except Exception as e:
+            return f"⚠️ resume error: {e}"
+
+    def version(self) -> str:
+        """
+        Return the running Hermes Agent version string (first line of
+        ``hermes --version``), or a fallback on error.
+        """
+        try:
+            result = subprocess.run(
+                [self.hermes_bin, "--version"],
+                capture_output=True, text=True, timeout=10,
+            )
+            line = (result.stdout or result.stderr).strip().split("\n")[0]
+            return line or "unknown"
+        except Exception as e:
+            return f"unknown ({e})"
+
+    def session_token_stats(self) -> tuple[int, int, str | None]:
+        """
+        Read token totals for the current mesh session from state.db.
+
+        Returns (total_tokens, message_count, session_id). All zeros if
+        the session has not been persisted yet (e.g. before the first
+        turn completes) or the DB is unreadable.
+        """
+        import sqlite3
+
+        sid = self._resume_id
+        if not sid:
+            sid = self._resolve_session_id()
+        if not sid:
+            return 0, 0, None
+
+        db_path = os.path.expanduser(
+            os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
+        )
+        if not os.path.exists(db_path):
+            return 0, 0, sid
+
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(token_count), 0), COUNT(*)"
+                    " FROM messages"
+                    " WHERE session_id = ? AND active = 1 AND compacted = 0",
+                    (sid,),
+                ).fetchone()
+                if row is None:
+                    return 0, 0, sid
+                return int(row[0]), int(row[1]), sid
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("Could not read token stats for %s: %s", sid, exc)
+        return 0, 0, sid
 
     def reset_session(self) -> None:
         """
