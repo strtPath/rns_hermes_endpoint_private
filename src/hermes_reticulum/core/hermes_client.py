@@ -78,8 +78,12 @@ class HermesClient:
         self.timeout = timeout
         # Liveness guard: if zero output (stdout+stderr) for this many seconds,
         # the model is considered wedged. Set to 0 to disable.
+        # NOTE: in `-q` mode the child is silent for the entire model turn, so
+        # this is effectively a max-turn-latency wall clock. 600s is the floor
+        # for realistic single-turn latency on a local 27B-class model (observed
+        # 100-950s turns).
         self.liveness_timeout = int(
-            os.getenv("HERMES_LIVENESS_TIMEOUT", "180")
+            os.getenv("HERMES_LIVENESS_TIMEOUT", "600")
         )
         self.source_tag = source_tag
         self.extra_args = extra_args or []
@@ -91,6 +95,14 @@ class HermesClient:
         self._resume_id: str | None = None
         self._process: subprocess.Popen | None = None
         self._stop_requested = False
+        self._guard_killed = False
+        # Serialize turns per model: two bridge turns must not race the same
+        # local model (they would queue on the GPU and look dead to the
+        # liveness guard). One turn at a time per HermesClient instance.
+        self._turn_lock = __import__("threading").Lock()
+        # Steering text queued by /steer — injected as a prefix to the
+        # *next* prompt (next hermes chat invocation), then cleared.
+        self._steer_pending: str | None = None
 
         logger.info("Hermes binary: %s", self.hermes_bin)
         if self.model:
@@ -98,6 +110,71 @@ class HermesClient:
         logger.info("Hermes session thread: %s", self.session_name)
         if self.liveness_timeout:
             logger.info("Liveness guard: %ds (0=off)", self.liveness_timeout)
+
+    def steer(self, text: str) -> None:
+        """Queue steering text to be injected as a prefix to the next prompt."""
+        self._steer_pending = (text or "").strip() or None
+
+    def pop_steer(self) -> str | None:
+        """Return and clear pending steering text (called before each chat())."""
+        text = self._steer_pending
+        self._steer_pending = None
+        return text or None
+
+    def tool_recap(self, limit: int = 10) -> list[dict]:
+        """Recap of the last tool calls in the current mesh session.
+
+        Read from state.db (the same store hermes persists to), so this
+        works even when the live ``agent:step`` hook is unavailable.
+        Returns a list of ``{"name": str, "is_error": bool, "preview": str}``
+        for the most recent ``limit`` tool messages (oldest first).
+        """
+        import json
+        import sqlite3
+
+        sid = self._resume_id or self._resolve_session_id()
+        if not sid:
+            return []
+        db_path = os.path.expanduser(
+            os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
+        )
+        if not os.path.exists(db_path):
+            return []
+        out: list[dict] = []
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                # Tool-call messages are persisted as assistant rows with a
+                # tool_calls JSON payload; tool *results* as role='tool'.
+                rows = conn.execute(
+                    "SELECT content, tool_calls FROM messages "
+                    "WHERE session_id = ? AND role = 'assistant' "
+                    "ORDER BY id ASC",
+                    (sid,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("tool_recap: state.db query failed: %s", exc)
+            return []
+        for content, tool_calls_json in rows:
+            if not tool_calls_json:
+                continue
+            try:
+                calls = json.loads(tool_calls_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if isinstance(call, dict) and call.get("function"):
+                    name = call["function"].get("name", "?")
+                    out.append({
+                        "name": name,
+                        "is_error": False,
+                        "preview": str(call["function"].get("arguments", ""))[:120],
+                    })
+        return out[-limit:]
 
     def _resolve_session_id(self) -> str | None:
         """
@@ -192,6 +269,13 @@ class HermesClient:
         self._ensure_session(new_session)
         self._stop_requested = False
 
+        # Steering from /steer: prefix the next prompt with the operator's
+        # queued instruction (consumed once).
+        steer = self.pop_steer()
+        if steer:
+            message = f"[Operator steering] {steer}\n\n{message}"
+            logger.info("Injected steering: %s", steer[:80])
+
         cmd = [
             self.hermes_bin,
             "chat",
@@ -217,7 +301,38 @@ class HermesClient:
         try:
             logger.debug("Calling: %s", " ".join(cmd))
             self.set_last_prompt(message)
-            return self._run_with_liveness_guard(cmd)
+            # Serialize turns per model: wait for an in-flight turn (on this
+            # HermesClient) instead of racing the same local model. The
+            # liveness clock inside _run_with_liveness_guard is per-subprocess,
+            # so waiting for the lock here does not trip the guard — the child
+            # only starts (and the clock only starts) once we hold the lock.
+            with self._turn_lock:
+                result = self._run_with_liveness_guard(cmd)
+            if result is not None and self._guard_killed:
+                # The liveness guard SIGKILL'd the child mid-turn. The prompt
+                # is already persisted in the session, so resume and retry
+                # exactly once — a wedged/stalled model often recovers.
+                logger.warning(
+                    "Liveness guard killed the child; retrying once"
+                )
+                time.sleep(5)
+                self._ensure_session(False)
+                with self._model_lock:
+                    model = self.model
+                cmd = [
+                    self.hermes_bin, "chat", "-q", message,
+                    "--source", self.source_tag, "-Q",
+                ]
+                if self._resume_id:
+                    cmd += ["--resume", self._resume_id]
+                elif not self._resolve_session_id():
+                    cmd += ["-c", self.session_name, "--create-if-missing"]
+                if model:
+                    cmd += ["-m", model]
+                cmd.extend(self.extra_args)
+                with self._turn_lock:
+                    result = self._run_with_liveness_guard(cmd)
+            return result
 
         except FileNotFoundError:
             logger.error("Hermes binary not found at: %s", self.hermes_bin)
@@ -238,6 +353,7 @@ class HermesClient:
         last_activity = time.monotonic()
         activity_lock = threading.Lock()
         done = threading.Event()
+        self._guard_killed = False
 
         def _touch():
             nonlocal last_activity
@@ -262,6 +378,8 @@ class HermesClient:
                         "Liveness guard: no output for %ds, killing hermes",
                         self.liveness_timeout,
                     )
+                    self._guard_killed = True
+                    self._stop_requested = True
                     self._kill_process()
                     return
                 done.wait(min(remaining, 1.0))
@@ -310,13 +428,22 @@ class HermesClient:
                     proc.returncode,
                     stderr[:500] if stderr else "(no stderr)",
                 )
+                if self._guard_killed:
+                    # "We killed it" (liveness guard or /stop), not a hermes
+                    # crash: give the user an honest message, and the caller
+                    # will auto-retry once (see chat()).
+                    return (
+                        f"⏱️ Turn exceeded the liveness window "
+                        f"({self.liveness_timeout}s) — the model may be "
+                        f"busy or stalled. Please retry."
+                    )
                 return self._error_reply(proc.returncode, stderr)
 
             reply = stdout.strip()
             if not reply:
                 logger.warning("Hermes returned empty output")
                 return "_(no response)_"
-            return reply
+            return self._with_tool_recap(reply)
 
         except FileNotFoundError:
             logger.error("Hermes binary not found at: %s", self.hermes_bin)
@@ -330,6 +457,26 @@ class HermesClient:
         finally:
             self._process = None
             done.set()
+
+    def _with_tool_recap(self, reply: str) -> str:
+        """Append a compact tool recap to the reply (recap fallback).
+
+        Live ``agent:step`` hook events are the primary channel; this is the
+        safety net — if the hook is disabled or a hermes update changes the
+        event surface, the mesh still sees which tools ran.
+        """
+        try:
+            recap = self.tool_recap(limit=8)
+        except Exception as exc:
+            logger.debug("tool_recap failed: %s", exc)
+            return reply
+        if not recap:
+            return reply
+        names = [r["name"] for r in recap]
+        line = "🔧 " + ", ".join(names)
+        if len(names) > 8:
+            line += f" (+{len(names) - 8} more)"
+        return f"{reply}\n\n_{line}_"
 
     def _kill_process(self) -> None:
         """Terminate the running hermes subprocess (if any)."""

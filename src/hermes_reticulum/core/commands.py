@@ -23,6 +23,7 @@ from typing import Callable
 
 from hermes_reticulum.core.hermes_client import HermesClient
 from hermes_reticulum.core.model_command import ModelCommandHandler
+from hermes_reticulum.core.control_server import ControlServer
 
 logger = logging.getLogger("hermes_reticulum.commands")
 
@@ -33,6 +34,8 @@ class CommandContext:
 
     hermes: HermesClient
     model_handler: ModelCommandHandler
+    # ControlServer instance (None until the CLI wires it).
+    control_server: ControlServer | None = None
     # Free-form bag for handlers that need to stash cross-call state.
     state: dict = field(default_factory=dict)
 
@@ -67,6 +70,14 @@ def _cmd_status(ctx: CommandContext, args: str) -> str | None:
         lines.append(f"  Tokens:     {total_tokens:,} across {msg_count} turns this session")
     else:
         lines.append("  Tokens:     (session not persisted yet)")
+    cs = ctx.control_server
+    if cs is not None:
+        pending = cs.has_pending_approval(h.session_name)
+        steps = len(cs.turn_recap(h.session_name))
+        lines.append(
+            f"  Tools:      {steps} this turn"
+            + (" | ⏸️ AWAITING /approve or /deny" if pending else "")
+        )
     return "\n".join(lines)
 
 
@@ -106,6 +117,11 @@ def _cmd_help(ctx: CommandContext, args: str) -> str | None:
         "/model — list models, switch, or reset the model",
         "/new — start a fresh conversation (clears context)",
         "/stop — kill the running Hermes process",
+        "/approve — allow the pending risky tool to run",
+        "/deny — deny the pending tool and abort this turn",
+        "/steer <text> — queue an instruction for the next turn",
+        "/tools — recap of tool calls this turn",
+        "/verbose on|off — include tool args/results in recaps",
         "/status — bridge status (model, session, process, tokens)",
         "/pause [reason] — halt new Hermes work (emergency stop)",
         "/resume — lift the emergency stop",
@@ -124,6 +140,79 @@ def _cmd_new(ctx: CommandContext, args: str) -> str | None:
     return "🔄 Started a new session. Context cleared — next message begins fresh."
 
 
+# ── tool-approval / steering commands (need the control server) ──────
+
+
+def _ctrl(ctx: CommandContext):
+    cs = ctx.control_server
+    if cs is None:
+        return None, "Control endpoint not running."
+    return cs, None
+
+
+def _cmd_approve(ctx: CommandContext, args: str) -> str | None:
+    cs, err = _ctrl(ctx)
+    if err:
+        return err
+    session = ctx.hermes.session_name
+    if not session:
+        return "No active mesh session."
+    if cs.answer_approval(session, approve=True):
+        return "✅ Approved — tool may proceed."
+    return "No pending approval to approve."
+
+
+def _cmd_deny(ctx: CommandContext, args: str) -> str | None:
+    cs, err = _ctrl(ctx)
+    if err:
+        return err
+    session = ctx.hermes.session_name
+    if not session:
+        return "No active mesh session."
+    if cs.answer_approval(session, approve=False):
+        return "⛔ Denied — aborting this turn."
+    return "No pending approval to deny."
+
+
+def _cmd_steer(ctx: CommandContext, args: str) -> str | None:
+    cs, err = _ctrl(ctx)
+    if err:
+        return err
+    text = args.strip()
+    if not text:
+        return "Usage: /steer <instruction> — queued for the next turn."
+    session = ctx.hermes.session_name
+    if not session:
+        return "No active mesh session."
+    cs.queue_steer(session, text)
+    return f"📌 Steering queued for next turn:\n{text}"
+
+
+def _cmd_verbose(ctx: CommandContext, args: str) -> str | None:
+    verbose = args.strip().lower() in ("on", "1", "yes", "true")
+    if verbose == "":
+        cur = bool(ctx.state.get("verbose", False))
+        return f"Verbose tool detail: {'on' if cur else 'off'} (use /verbose on|off)"
+    ctx.state["verbose"] = verbose
+    return f"Verbose tool detail: {'on' if verbose else 'off'}"
+
+
+def _cmd_tools(ctx: CommandContext, args: str) -> str | None:
+    cs, err = _ctrl(ctx)
+    if err:
+        return "No tool events recorded yet."
+    session = ctx.hermes.session_name
+    steps = cs.turn_recap(session) if session else []
+    if not steps:
+        return "No tool calls this turn yet."
+    lines = [f"🔧 Tools this turn ({len(steps)}):"]
+    for s in steps[-10:]:
+        lines.append(f"  {s.summary()}" + (" ❌" if s.is_error else ""))
+    if len(steps) > 10:
+        lines.append(f"  … and {len(steps) - 10} earlier")
+    return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Registry — add new commands here
 # ──────────────────────────────────────────────────────────────────────
@@ -140,6 +229,12 @@ COMMANDS: dict[str, CommandFn] = {
     "/version": _cmd_version,
     "/help": _cmd_help,
     "/commands": _cmd_help,
+    # Tool-approval / steering (need the control server at runtime).
+    "/approve": _cmd_approve,
+    "/deny": _cmd_deny,
+    "/steer": _cmd_steer,
+    "/verbose": _cmd_verbose,
+    "/tools": _cmd_tools,
 }
 
 
@@ -172,6 +267,16 @@ class CommandDispatcher:
             command = "/help"
         elif command in ("stop",):
             command = "/stop"
+        elif command in ("approve", "a"):
+            command = "/approve"
+        elif command in ("deny", "d"):
+            command = "/deny"
+        elif command in ("steer",):
+            command = "/steer"
+        elif command in ("verbose",):
+            command = "/verbose"
+        elif command in ("tools", "t"):
+            command = "/tools"
         elif command in ("status", "s"):
             command = "/status"
         elif command in ("pause", "p"):
@@ -205,6 +310,14 @@ class CommandDispatcher:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def build_dispatcher(hermes: HermesClient, model_handler: ModelCommandHandler) -> CommandDispatcher:
-    ctx = CommandContext(hermes=hermes, model_handler=model_handler)
+def build_dispatcher(
+    hermes: HermesClient,
+    model_handler: ModelCommandHandler,
+    control_server: ControlServer | None = None,
+) -> CommandDispatcher:
+    ctx = CommandContext(
+        hermes=hermes,
+        model_handler=model_handler,
+        control_server=control_server,
+    )
     return CommandDispatcher(ctx)

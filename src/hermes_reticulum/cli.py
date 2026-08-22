@@ -19,6 +19,7 @@ from hermes_reticulum import __version__
 from hermes_reticulum.core.acl import AccessControl
 from hermes_reticulum.core.bridge import LXMFBridge
 from hermes_reticulum.core.commands import build_dispatcher
+from hermes_reticulum.core.control_server import ControlServer
 from hermes_reticulum.core.hermes_client import HermesClient
 from hermes_reticulum.core.model_command import ModelCommandHandler
 
@@ -44,6 +45,11 @@ def setup_logging(verbose: bool = False):
     logging.basicConfig(level=level, format=fmt, datefmt="%Y-%m-%d %H:%M:%S")
 
 
+def _deny_veto(hermes) -> None:
+    """Abort the in-flight hermes child when the mesh operator denies a tool."""
+    hermes.stop()
+
+
 def cmd_run(args):
     """Start the bridge and run until interrupted."""
     setup_logging(args.verbose)
@@ -64,9 +70,36 @@ def cmd_run(args):
     # /model command handler (mirrors the Telegram gateway's /model).
     model_cmd = ModelCommandHandler(hermes)
 
+    # Local control endpoint: receives agent:step tool events from the
+    # gateway hook (HTTP POST) and serves /approve /deny /stop /steer.
+    ctrl = ControlServer(storage_path=storage)
+    ctrl.on_deny = lambda session: _deny_veto(hermes)  # veto: kill the child
+    # Push live tool events to the mesh as they happen. The hook POSTs each
+    # step here; we reply with a short one-liner (bandwidth-aware).
+    mesh_push: dict[str, dict] = {}  # mesh title -> {"hash": source_hash, "ident": dest}
+
+    def _on_tool_step(session: str, step) -> None:
+        label = getattr(step, "name", None) or str(step)
+        push = mesh_push.get(session)
+        if push is None:
+            logger.debug("no mesh peer for %r — dropping tool event", session)
+            return
+        ok = bridge.send_reply(push["hash"], f"🔧 {label}", push["ident"])
+        if ok:
+            logger.info("Tool event %s pushed to mesh peer %s", label, push["hash"][:16])
+        else:
+            logger.warning("Failed to push tool event %s to mesh", label)
+
+    ctrl.on_step = _on_tool_step
+    if not ctrl.start():
+        logger.warning(
+            "Control endpoint not started — /approve /deny /steer and live "
+            "tool streaming disabled (recap fallback still works)."
+        )
+
     # Generic slash-command dispatcher — adds /model, /new, /help, /commands.
     # Add more in core/commands.py (COMMANDS dict); no cli.py changes needed.
-    dispatcher = build_dispatcher(hermes, model_cmd)
+    dispatcher = build_dispatcher(hermes, model_cmd, ctrl)
 
     bridge = LXMFBridge(
         display_name=display_name,
@@ -80,6 +113,22 @@ def cmd_run(args):
         if not acl.is_allowed(source_hash):
             logger.info("Message from %s rejected by ACL", source_hash[:16])
             return "⛔ Access not authorized."
+
+        # Track this peer so live tool events can be pushed to it.
+        try:
+            import RNS  # noqa: F401
+
+            ident = RNS.Identity.recall(bytes.fromhex(source_hash))
+            if ident is not None:
+                mesh_push[hermes.session_name] = {
+                    "hash": source_hash,
+                    "ident": RNS.Destination(
+                        ident, RNS.Destination.OUT, RNS.Destination.SINGLE,
+                        "lxmf", "delivery",
+                    ),
+                }
+        except Exception:
+            pass
 
         # Slash commands — handled locally, never sent to the LLM.
         command_reply = dispatcher.handle(content)
