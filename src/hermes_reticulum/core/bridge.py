@@ -13,20 +13,150 @@ Hermes CLI) don't stall incoming message processing.
 import logging
 import os
 import signal
+import threading
 import time
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import LXMF
 import RNS
 
-from hermes_reticulum.core.adapter import prepare_reply
+from hermes_reticulum.core.adapter import prepare_reply, split_message
 from hermes_reticulum.core.profiler import ChannelMetrics, ChannelProfiler
 
 logger = logging.getLogger("hermes_reticulum.bridge")
 
 # Max concurrent message handlers — prevents hermes subprocess flood
 _MAX_HANDLERS = 4
+
+# Chunked tool I/O delivery ("steps mode"): cap per LXMF post.
+# 1500 chars ≈ 4 standard ~368-byte content blocks, keeps LoRa sane,
+# TCP delivers instantly. User-approved bandwidth cost.
+STEP_CHUNK_CHARS = 1500
+
+# Step-through checkpoint gate.
+#
+# Lives on the BRIDGE side (hermes-reticulum process), not in the hook:
+# the hook runs inside the gateway process and can't see the control
+# server, but /hold and /go are dispatched here.  contextvars make it
+# safe across the thread pool (each turn = one context).
+_step_mode_var: ContextVar[str] = ContextVar("reticulum_step_mode", default="off")
+_hold_release_var: ContextVar[bool] = ContextVar("reticulum_hold_release", default=False)
+_hold_active_var: ContextVar[bool] = ContextVar("reticulum_hold_active", default=False)
+
+# Hold timeout (seconds): if the user never says /go, release anyway so
+# the reply is never lost. 0 = hold indefinitely.
+HOLD_TIMEOUT_S = float(os.environ.get("HERMES_STEP_HOLD_TIMEOUT", "1800"))
+
+# Hold state file: bridge writes, hook (gateway process) polls.
+HOLD_STATE_PATH = os.environ.get(
+    "HERMES_STEP_HOLD_FILE",
+    os.path.expanduser("~/.hermes/.reticulum-hold-state"),
+)
+
+# Mode state file: bridge writes, hook (gateway process) polls.
+MODE_STATE_PATH = os.environ.get(
+    "HERMES_STEP_MODE_FILE",
+    os.path.expanduser("~/.hermes/.reticulum-step-mode"),
+)
+
+
+class StepThroughManager:
+    """
+    Step-through mode state: "print the full tool call and full output
+    before the model moves on" over mesh.
+
+    What this mode does (and doesn't):
+
+    - The hook (agent:step, fires AFTER each tool batch) pushes the FULL
+      tool call arguments and full output to the user, chunked across
+      multiple LXMF posts, instead of a one-line truncated recap.
+    - It also injects a "step-through active" prefix into the prompt so
+      the model reports each tool it's about to run before running it —
+      the closest thing to "show before next action" that the mesh
+      transport allows (agent:step has no veto; the tool has already run).
+    - Checkpoint gate: while a turn is running, `/hold` sets a flag; the
+      bridge then waits for `/go` (or the timeout) before releasing the
+      final reply to the mesh.  This is an opt-in pause on the reply,
+      not a pre-tool-execution gate.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.enabled = False
+        self.hold_requested = False
+
+    # ── mode ─────────────────────────────────────────────────────────
+
+    def set_mode(self, enabled: bool):
+        with self._lock:
+            self.enabled = bool(enabled)
+        # The hook (gateway process) reads this file to know whether to
+        # stream full tool I/O.  Bridge writes, hook polls.
+        try:
+            Path(MODE_STATE_PATH).write_text("1" if enabled else "0")
+        except OSError as e:
+            logger.debug("Could not write mode state file: %s", e)
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self.enabled
+
+    # ── hold gate (checkpoint) ───────────────────────────────────────
+
+    def request_hold(self) -> None:
+        """User pressed /hold: gate the next final reply until /go."""
+        self.hold_requested = True
+        _hold_active_var.set(True)
+        self._write_hold_state(True)
+
+    def release_hold(self) -> None:
+        """User pressed /go: release the gated reply."""
+        self.hold_requested = False
+        _hold_release_var.set(True)
+        self._write_hold_state(False)
+
+    def _write_hold_state(self, held: bool) -> None:
+        try:
+            Path(HOLD_STATE_PATH).write_text("1" if held else "0")
+        except OSError as e:
+            logger.debug("Could not write hold state file: %s", e)
+
+    def gate_and_wait(self, source_hash: str, push) -> None:
+        """
+        Block until hold is released (or timeout) before the final reply
+        is sent.  Only blocks if /hold was requested for THIS turn.
+
+        Call from the bridge's thread-pool worker (has source identity +
+        push capability), never from the hook/gateway process.
+        """
+        if not self.hold_requested:
+            return
+
+        push("⏸ held — send /go to release (or it releases on its own)")
+
+        deadline = None
+        if HOLD_TIMEOUT_S > 0:
+            deadline = time.time() + HOLD_TIMEOUT_S
+
+        while self.hold_requested:
+            if deadline is not None and time.time() >= deadline:
+                break
+            time.sleep(1)
+
+        self.hold_requested = False
+        _hold_release_var.set(True)
+        self._write_hold_state(False)
+
+
+# Module-level default manager (the bridge instance owns its own copy).
+_default_step_through = StepThroughManager()
+
+
+def step_through_manager() -> StepThroughManager:
+    """The manager owned by the running bridge, or the module default."""
+    return _default_step_through
 
 
 class LXMFBridge:
@@ -85,6 +215,52 @@ class LXMFBridge:
         if self.destination:
             return RNS.prettyhexrep(self.destination.hash)
         return None
+
+    # ── Step-through ("steps") mode ─────────────────────────────────
+
+    step_through = StepThroughManager()
+
+    @property
+    def _hold_state_path(self) -> Path:
+        return Path(HOLD_STATE_PATH)
+
+    def push_reply(
+        self,
+        recipient_hex: str,
+        text: str,
+        source_identity=None,
+        chunk: bool = True,
+        max_chars: int = STEP_CHUNK_CHARS,
+    ) -> bool:
+        """
+        Push a proactive (non-reply) LXMF message, optionally split into
+        multiple posts for long content.
+
+        This is how step-through mode delivers FULL tool calls and full
+        tool output over mesh: the text is split into ≤max_chars pieces
+        (numbered [n/N]) and sent as separate LXMF messages, with a small
+        delay between parts for the LoRa profiles.  Bandwidth cost is
+        user-approved.
+
+        Returns True if at least one part was dispatched.
+        """
+        if not text:
+            return False
+        parts = split_message(text, max_chars) if chunk else [text]
+        if len(parts) > 1:
+            logger.info(
+                "Push reply to %s: %d chars → %d parts (max=%d)",
+                recipient_hex[:16], len(text), len(parts), max_chars,
+            )
+        ok = False
+        for i, part in enumerate(parts):
+            if i > 0:
+                # LoRa profiles get a pause between posts; TCP doesn't care
+                # but 500ms is harmless and keeps ordering clean.
+                time.sleep(0.5)
+            if self.send_reply(recipient_hex, part, source_identity):
+                ok = True
+        return ok
 
     def set_message_handler(self, handler):
         """

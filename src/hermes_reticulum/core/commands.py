@@ -129,6 +129,10 @@ def _cmd_help(ctx: CommandContext, args: str) -> str | None:
         "/usage — token usage for this session",
         "/version — Hermes Agent version",
         "/help — show this message",
+        "/steps on|off — full tool call + output before each next action",
+        "/hold — pause the final reply (checkpoint gate)",
+        "/go — release a /hold",
+        "",
     ]
     return "\n".join(lines)
 
@@ -213,6 +217,56 @@ def _cmd_tools(ctx: CommandContext, args: str) -> str | None:
     return "\n".join(lines)
 
 
+# ── step-through mode ────────────────────────────────────────────────
+
+
+def _cmd_steps(ctx: CommandContext, args: str) -> str | None:
+    """Toggle step-through mode: full tool call + output before next action."""
+    arg = args.strip().lower()
+    if arg in ("on", "1", "yes", "true"):
+        ctx.hermes.set_step_mode(True)
+        return (
+            "👁️ Step-through ON: each tool call and its full output will be "
+            "posted to you in chunks (multiple mesh messages) before the "
+            "model proceeds. Use /steps off to stop, /hold to pause the "
+            "final reply until /go."
+        )
+    if arg in ("off", "0", "no", "false"):
+        ctx.hermes.set_step_mode(False)
+        return "👁️ Step-through OFF: back to the default terse recap."
+    # No arg: report current state
+    cur = ctx.hermes.is_step_mode()
+    state = "ON" if cur else "off"
+    return (
+        f"Step-through: {state}\n"
+        "Usage: /steps on|off\n"
+        "  on  — full tool call + output posted in chunks before each "
+        "next action (uses more mesh bandwidth)\n"
+        "  off — default terse recap\n"
+        "Companions: /hold (pause reply), /go (release hold)"
+    )
+
+
+def _cmd_hold(ctx: CommandContext, args: str) -> str | None:
+    """Pause the final reply until /go is sent (checkpoint gate)."""
+    if not ctx.hermes.is_running():
+        return "Nothing to hold — no turn running."
+    ctx.hermes.set_hold_gate(True)
+    return (
+        "⏸ Held — the final reply will be gated until you send /go.\n"
+        "(Auto-releases in ~30 min if you forget.)"
+    )
+
+
+def _cmd_go(ctx: CommandContext, args: str) -> str | None:
+    """Release a /hold gate so the final reply can leave the bridge."""
+    if ctx.hermes.is_step_mode() and not ctx.hermes._hold_gate:
+        # /go with no active hold: treat as a no-op confirmation
+        return "Not held — nothing to release."
+    ctx.hermes.set_hold_gate(False)
+    return "🚀 Released — sending the reply."
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Registry — add new commands here
 # ──────────────────────────────────────────────────────────────────────
@@ -235,6 +289,10 @@ COMMANDS: dict[str, CommandFn] = {
     "/steer": _cmd_steer,
     "/verbose": _cmd_verbose,
     "/tools": _cmd_tools,
+    # Step-through mode
+    "/steps": _cmd_steps,
+    "/hold": _cmd_hold,
+    "/go": _cmd_go,
 }
 
 

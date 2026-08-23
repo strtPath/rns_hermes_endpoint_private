@@ -103,6 +103,16 @@ class HermesClient:
         # Steering text queued by /steer — injected as a prefix to the
         # *next* prompt (next hermes chat invocation), then cleared.
         self._steer_pending: str | None = None
+        # Step-through mode ("print the full tool call and output before the
+        # model moves on"). See StepThroughManager in core/bridge.py.
+        self._step_mode = False
+        # Checkpoint gate: while set, chat() blocks before returning the
+        # reply until /go (or the hold timeout). Set by /hold.
+        self._hold_gate = False
+        # Push callback: callable(text: str) → sends a message to the mesh
+        # peer. Set by the bridge (cli.py); the hook can't push directly
+        # (it runs in the gateway process, not the bridge).
+        self._push_callback = None
 
         logger.info("Hermes binary: %s", self.hermes_bin)
         if self.model:
@@ -120,6 +130,60 @@ class HermesClient:
         text = self._steer_pending
         self._steer_pending = None
         return text or None
+
+    # ── Step-through mode ─────────────────────────────────────────────
+
+    def set_step_mode(self, enabled: bool) -> None:
+        """Toggle step-through mode: full tool I/O before the model moves on."""
+        self._step_mode = bool(enabled)
+        logger.info("Step-through mode: %s", "ON" if enabled else "OFF")
+
+    def is_step_mode(self) -> bool:
+        return self._step_mode
+
+    def set_hold_gate(self, enabled: bool) -> None:
+        """Enable/disable the checkpoint gate (set by /hold; /go releases)."""
+        self._hold_gate = bool(enabled)
+
+    def set_push_callback(self, callback) -> None:
+        """Register a push callback: callable(text: str) → send to mesh peer."""
+        self._push_callback = callback
+
+    def _step_prompt_prefix(self) -> str | None:
+        """Prefix injected when step-through mode is ON.
+
+        The hook (agent:step) can only fire AFTER a tool batch runs — it
+        can't veto.  So the "show before next action" part is handled by
+        instructing the model to announce each tool it's about to run,
+        and the hook delivers the FULL tool call + full output chunked
+        across multiple LXMF posts as the turn progresses.
+        """
+        if not self._step_mode:
+            return None
+        return (
+            "[Step-through mode is ACTIVE.]\n"
+            "You are being watched over the mesh, one action at a time.\n"
+            "Before you call a tool, state in plain text: which tool and why.\n"
+            "After each tool, state what you learned in one or two lines.\n"
+            "Do NOT batch more than one tool call per step.\n"
+            "This is mandatory while step-through mode is on.\n\n"
+        )
+
+    def _apply_hold_gate(self, reply: str | None) -> str | None:
+        """If /hold was requested, gate the reply until /go or timeout."""
+        if not self._hold_gate:
+            return reply
+        if self._push_callback:
+            self._push_callback(
+                "⏸ Held — send /go to release (auto-releases in ~30 min)"
+            )
+        # Block until released or timeout. The /go handler (running in a
+        # different thread) sets _hold_gate=False.
+        deadline = time.time() + 1800
+        while self._hold_gate and time.time() < deadline:
+            time.sleep(1)
+        self._hold_gate = False
+        return reply
 
     def tool_recap(self, limit: int = 10) -> list[dict]:
         """Recap of the last tool calls in the current mesh session.
@@ -276,6 +340,12 @@ class HermesClient:
             message = f"[Operator steering] {steer}\n\n{message}"
             logger.info("Injected steering: %s", steer[:80])
 
+        # Step-through mode: instruct the model to announce each tool call
+        # before making it (the hook delivers full I/O chunked over mesh).
+        step_prefix = self._step_prompt_prefix()
+        if step_prefix:
+            message = f"{step_prefix}{message}"
+
         cmd = [
             self.hermes_bin,
             "chat",
@@ -332,6 +402,9 @@ class HermesClient:
                 cmd.extend(self.extra_args)
                 with self._turn_lock:
                     result = self._run_with_liveness_guard(cmd)
+            # Checkpoint gate: if the operator pressed /hold, block here
+            # until /go (or timeout) before the reply leaves the bridge.
+            result = self._apply_hold_gate(result)
             return result
 
         except FileNotFoundError:

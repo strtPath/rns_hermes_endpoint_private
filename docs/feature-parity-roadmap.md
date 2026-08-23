@@ -5,7 +5,7 @@ parity with the Hermes **Telegram** gateway, so the mesh endpoint is a first-cla
 way to talk to the agent, not a degraded one. This is a living doc — update the
 Status column as we land items._
 
-_Last updated: 2026-08-20. Owner: Holo + user._
+_Last updated: 2026-08-22. Owner: Holo + user._
 
 ---
 
@@ -62,9 +62,19 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | `/usage` | ✅ (session-local token totals from state.db) |
 | `/version` | ✅ (`hermes --version`) |
 | `/whoami` | ⏸️ deferred (needs ACL access-level plumbing) |
-| `/approve` / `/deny` | ⏸️ deferred (needs interactive approval infrastructure) |
+| `/approve` / `/deny` | ✅ done (2026-08-22, via mesh control server + agent:step hook; see findings doc) |
+| `/steer` | ✅ done (2026-08-22, queues text consumed by next `chat()`) |
+| `/tools` | ✅ done (2026-08-22, per-turn tool recap from control server / state.db) |
+| `/verbose` | ✅ done (2026-08-22, toggles detailed tool recaps) |
+| `/steps on\|off` | ✅ done (2026-08-22, step-through mode: full tool call + full output chunked across multiple LXMF posts; model instructed to announce each tool before running it) |
+| `/hold` / `/go` | ✅ done (2026-08-22, checkpoint gate: holds the final reply until /go or 30-min timeout; auto-releases) |
 
 ### Not `cli_only` — in parity scope (grouped, with mesh priority)
+
+**Model selection — provider-level (follow-up):**
+| Item | Status | Notes |
+|------|--------|-------|
+| `/model` lists all providers | ⏸️ backlog | Currently only surfaces `custom_providers` (HecateV). Should also list `fallback_providers` (e.g. the OpenRouter entry) and the top-level default, grouped by provider. Requires `set_model` to pin **provider + model** (not just model name) so the pin survives and targets the right provider. |
 
 **High value — do next (cheap + closes real pain):**
 | Command | Description | Why it matters for mesh |
@@ -158,7 +168,7 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | Item | Telegram behavior | Mesh status | Notes |
 |------|-------------------|-------------|-------|
 | Streaming replies | Token-by-token | ⬜ | LXMF is message-based, no streaming. Out of scope unless we chunk. |
-| Tool-call / clarify rendering | Renders tool activity, confirmations | ❌ open | Known upstream issue (see `reticulum-bridge-findings.md`): `unknown-toolsets` warning prefix + clarify/accept-deny prompts don't render over plain-text LXMF. |
+| Tool-call visibility | Renders tool activity | ⚠️ partial (2026-08-22) | Live `🔧 tool` push via `agent:step` hook → control server; `/approve`/`/deny` gate + `/steer`; state.db recap fallback. Caveat: `agent:step` fires *after* tool execution — veto, not pre-execution gate. See `mesh-bridge-findings-2026-08-22-tool-calls.md`. |
 | Attachments (image/file) | User sends image/file, agent sees it | ⬜ verify | LXMF text-only; likely out of scope. Confirm. |
 | Voice (STT/TTS) | Voice note in, voice out | ⬜ verify | Constrained over mesh; likely out of scope. |
 | Markdown/formatting | Rich formatting | ⬜ | LXMF is plain text; keep replies plain-text-safe (TTS-friendly). |

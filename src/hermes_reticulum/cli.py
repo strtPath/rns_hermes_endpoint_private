@@ -91,6 +91,25 @@ def cmd_run(args):
             logger.warning("Failed to push tool event %s to mesh", label)
 
     ctrl.on_step = _on_tool_step
+
+    # Step-through mode: the hook POSTs the full tool call + full output
+    # to /step/full.  We chunk it into ≤1500-char LXMF posts and send
+    # them one by one (user-approved bandwidth cost).
+    def _on_full_step(session: str, text: str) -> None:
+        push = mesh_push.get(session)
+        if push is None:
+            logger.debug("no mesh peer for %r — dropping full step", session)
+            return
+        ok = bridge.push_reply(push["hash"], text, push["ident"])
+        if ok:
+            logger.info(
+                "Full step pushed to mesh peer %s (%d chars)",
+                push["hash"][:16], len(text),
+            )
+        else:
+            logger.warning("Failed to push full step to mesh for %s", session)
+
+    ctrl.on_full_step = _on_full_step
     if not ctrl.start():
         logger.warning(
             "Control endpoint not started — /approve /deny /steer and live "

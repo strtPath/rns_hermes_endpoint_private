@@ -152,6 +152,10 @@ class ControlServer:
         # step the hook reports — the bridge uses this to push a live
         # "🔧 tool" message to the mesh peer.
         self.on_step: Optional[Callable[[str, Any], None]] = None
+        # Wired by the CLI: called with (mesh session, full_text) for
+        # step-through mode — the bridge chunks this into multiple LXMF
+        # posts (user-approved bandwidth cost).
+        self.on_full_step: Optional[Callable[[str, str], None]] = None
         # Wired by the CLI: called when a gate opens, so the bridge can
         # push a "⏸️ waiting for /approve" message to the mesh.
         self.on_gate_open: Optional[Callable[[str, str], None]] = None
@@ -326,6 +330,26 @@ class ControlServer:
                     except Exception:
                         logger.warning("on_deny callback failed", exc_info=True)
                 return 200, decision
+            return 200, "ok"
+
+        if path == "/step/full":
+            # Step-through mode: the hook POSTs the full tool call + full
+            # output as a pre-formatted text body.  We chunk it into
+            # multiple LXMF posts (user-approved bandwidth cost).
+            session = body.get("session", "")
+            text = body.get("body", "")
+            if not session or not text:
+                return 400, "missing session/body"
+            if self.on_full_step is not None:
+                try:
+                    self.on_full_step(session, text)
+                except Exception:
+                    logger.warning("on_full_step callback failed", exc_info=True)
+            else:
+                logger.warning(
+                    "on_full_step not wired — dropping full step for %s",
+                    session,
+                )
             return 200, "ok"
 
         if path in ("/approve", "/deny"):
