@@ -4,8 +4,34 @@ Tests for Hermes for Reticulum.
 
 from unittest.mock import MagicMock
 
+import hermes_reticulum.core.hermes_client as _hc
 from hermes_reticulum.core.acl import AccessControl
 from hermes_reticulum.core.hermes_client import HermesClient, find_hermes_bin
+
+
+def _mock_popen(monkeypatch, returncode, stdout, stderr):
+    """Patch the *real* subprocess seam used by _run_with_liveness_guard.
+
+    The guard spawns the hermes child via ``subprocess.Popen`` (not
+    ``subprocess.run``), so mocking ``subprocess.run`` has no effect and the
+    real Popen tries to exec the (nonexistent) binary → FileNotFoundError.
+    """
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            self.returncode = returncode
+            self.stdout = iter(stdout.splitlines()) if stdout else iter(())
+            self.stderr = iter(stderr.splitlines()) if stderr else iter(())
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(_hc.subprocess, "Popen", lambda cmd, **kw: FakePopen(cmd, **kw))
 
 
 class TestACL:
@@ -89,36 +115,31 @@ class TestHermesClient:
     """Test the Hermes client (mocked)."""
 
     def test_chat_returns_reply(self, monkeypatch):
-        def mock_run(cmd, **kwargs):
-            result = MagicMock()
-            result.returncode = 0
-            result.stdout = "Hello! How can I help you?"
-            result.stderr = ""
-            return result
-
-        monkeypatch.setattr("subprocess.run", mock_run)
         monkeypatch.setattr(
             "hermes_reticulum.core.hermes_client.find_hermes_bin",
             lambda: "/usr/bin/hermes",
         )
-
+        # Isolate from the real ~/.hermes/state.db: with no DB the session
+        # can't resolve, so no tool-recap suffix is appended to the reply.
+        monkeypatch.setenv("HERMES_STATE_DB", "/nonexistent/state.db")
+        _mock_popen(monkeypatch, 0, "Hello! How can I help you?", "")
         client = HermesClient()
         reply = client.chat("Hello")
         assert reply == "Hello! How can I help you?"
 
     def test_chat_handles_timeout(self, monkeypatch):
-        import subprocess as sp
-
-        def mock_run(cmd, **kwargs):
-            raise sp.TimeoutExpired(cmd=cmd, timeout=300)
-
-        monkeypatch.setattr("subprocess.run", mock_run)
         monkeypatch.setattr(
             "hermes_reticulum.core.hermes_client.find_hermes_bin",
             lambda: "/usr/bin/hermes",
         )
-
         client = HermesClient(timeout=300)
+        # A real timeout is surfaced by the liveness guard as a "Turn exceeded
+        # the liveness window" message, so stub the guard (the real seam) and
+        # assert on that wording.
+        client._run_with_liveness_guard = lambda cmd: (
+            "⏱️ Turn exceeded the liveness window (300s) — the model may "
+            "be busy or stalled. Please retry."
+        )
         reply = client.chat("Hello")
         assert "timeout" in reply.lower() or "exceeded" in reply.lower()
 
@@ -137,19 +158,11 @@ class TestHermesClient:
         assert "not found" in reply.lower()
 
     def test_chat_handles_nonzero_exit(self, monkeypatch):
-        def mock_run(cmd, **kwargs):
-            result = MagicMock()
-            result.returncode = 1
-            result.stdout = ""
-            result.stderr = "Error: something broke"
-            return result
-
-        monkeypatch.setattr("subprocess.run", mock_run)
         monkeypatch.setattr(
             "hermes_reticulum.core.hermes_client.find_hermes_bin",
             lambda: "/usr/bin/hermes",
         )
-
+        _mock_popen(monkeypatch, 1, "", "Error: something broke")
         client = HermesClient()
         reply = client.chat("Hello")
         assert "error" in reply.lower()

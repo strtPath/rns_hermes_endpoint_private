@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import secrets
 import socket
 import threading
@@ -163,6 +164,20 @@ class ControlServer:
         self._token_path: Optional[Path] = None
         if storage_path:
             self._persist_token(storage_path)
+        # Bounded work queue for *mesh-bound* side effects (tool pushes,
+        # full-step chunks, "gate opened" notices). These are fired from the
+        # HTTP handler thread; if a mesh peer is offline/slow they can block
+        # for a long time, which would wedge the request thread — and, for
+        # the hook's blocking gate POST, the *gateway* event loop that called
+        # it. So we enqueue and return immediately; a single dedicated
+        # worker drains the queue (FIFO → preserves message order), and the
+        # approval *wait* (request_approval's event.wait) is NOT moved here —
+        # it stays inline because it's the only thing the hook's gate must
+        # actually block on.
+        # Bounded (256) so a flood can't grow memory unboundedly; when full we
+        # drop + log (a lost "🔧 tool" push is cosmetic, a wedged bridge is not).
+        self._relay_q: "queue.Queue" = queue.Queue(maxsize=256)
+        self._relay_worker: Optional[threading.Thread] = None
 
     # ── token ────────────────────────────────────────────────────────
 
@@ -198,6 +213,7 @@ class ControlServer:
             daemon=True,
         )
         self._thread.start()
+        self._start_relay_worker()
         logger.info(
             "Control endpoint listening on %s:%s (token file: %s)",
             self.host, self.port, self._token_path or "(none)",
@@ -205,6 +221,7 @@ class ControlServer:
         return True
 
     def stop(self) -> None:
+        self._stop_relay_worker()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -221,6 +238,54 @@ class ControlServer:
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    # ── mesh relay queue (offload blocking mesh sends) ───────────────
+
+    def _start_relay_worker(self) -> None:
+        if self._relay_worker is not None:
+            return
+        self._relay_worker = threading.Thread(
+            target=self._relay_loop, name="control-relay", daemon=True
+        )
+        self._relay_worker.start()
+
+    def _stop_relay_worker(self) -> None:
+        w = self._relay_worker
+        if w is None:
+            return
+        self._relay_worker = None
+        # Sentinel: poison-pill to unblock a waiting worker.
+        try:
+            self._relay_q.put_nowait(None)
+        except queue.Full:
+            pass
+        w.join(timeout=5)
+
+    def _relay_loop(self) -> None:
+        """Drain mesh-bound side effects one at a time (order-preserving)."""
+        while True:
+            item = self._relay_q.get()
+            if item is None:  # shutdown sentinel
+                return
+            fn, args = item
+            try:
+                fn(*args)
+            except Exception:
+                logger.debug("mesh relay failed", exc_info=True)
+
+    def relay(self, fn: Callable, *args) -> None:
+        """Schedule a blocking mesh-bound callback off the request thread.
+
+        Never raises. If the bounded queue is full the task is dropped with a
+        warning (cosmetic loss, never a wedge).
+        """
+        try:
+            self._relay_q.put_nowait((fn, args))
+        except queue.Full:
+            logger.warning(
+                "mesh relay queue full — dropping callback %s",
+                getattr(fn, "__name__", fn),
+            )
 
     # ── approval gate API (used by the hook via POST /step, and by
     # mesh commands in-process) ───────────────────────────────────────
@@ -309,27 +374,28 @@ class ControlServer:
             step = ToolStep(name=name, args=args, result=result,
                             is_error=is_error)
             self.record_step(session, step)
-            if self.on_step is not None:
-                try:
-                    self.on_step(session, step)
-                except Exception:
-                    logger.debug("on_step callback failed", exc_info=True)
             if kind == "gate":
                 # Block until /approve or /deny (or timeout). On deny the
                 # operator wants this turn aborted, so the bridge kills
                 # its in-flight hermes child immediately.
                 if self.on_gate_open is not None:
-                    try:
-                        self.on_gate_open(session, name)
-                    except Exception:
-                        logger.debug("on_gate_open callback failed", exc_info=True)
+                    # "gate opened" is a mesh push (blocking LXMF send) →
+                    # offload it so it can't wedge the request thread while
+                    # the approval wait below runs inline.
+                    self.relay(self.on_gate_open, session, name)
                 decision = self.request_approval(session, name)
                 if decision == "deny" and self.on_deny is not None:
-                    try:
-                        self.on_deny(session)
-                    except Exception:
-                        logger.warning("on_deny callback failed", exc_info=True)
+                    # on_deny vetoes the turn (kills the hermes child) —
+                    # fast and in-process, safe inline; still offload so a
+                    # misbehaving callback can't block the reply.
+                    self.relay(self.on_deny, session)
                 return 200, decision
+            # kind == "report": fire the live "🔧 tool" mesh push OFF the
+            # request thread. The hook POSTs this and does NOT block on its
+            # reply, so returning immediately is safe and keeps the gateway
+            # loop (for the hook) unblocked.
+            if self.on_step is not None:
+                self.relay(self.on_step, session, step)
             return 200, "ok"
 
         if path == "/step/full":
@@ -341,10 +407,9 @@ class ControlServer:
             if not session or not text:
                 return 400, "missing session/body"
             if self.on_full_step is not None:
-                try:
-                    self.on_full_step(session, text)
-                except Exception:
-                    logger.warning("on_full_step callback failed", exc_info=True)
+                # Chunking + multiple LXMF sends is the *most* blocking path
+                # (a 32KB step is ~21 posts × 0.5s). Offload it entirely.
+                self.relay(self.on_full_step, session, text)
             else:
                 logger.warning(
                     "on_full_step not wired — dropping full step for %s",
@@ -395,11 +460,22 @@ def _make_handler(server: ControlServer):
 
         def _send(self, code: int, body: str) -> None:
             data = body.encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                # The peer (typically the Hermes gateway) restarted mid-response
+                # and dropped the TCP connection. This is expected during a
+                # gateway restart cycle and is not actionable — log quietly
+                # instead of dumping a full traceback to journald.
+                logger.debug(
+                    "control-server: dropped reply to %s (code=%d, %d bytes): %s",
+                    self.client_address[0], code, len(data), exc,
+                )
+                self.close_connection = True
 
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)

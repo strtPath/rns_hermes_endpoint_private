@@ -318,6 +318,24 @@ class HermesClient:
         logger.info("Mesh thread %r not resolvable yet — will create on send",
                     self.session_name)
 
+    def _guard_kill_worth_retrying(self, run_ms: float) -> bool:
+        """A guard-kill is worth a single resume-retry only if the first run
+        died *early* — i.e. it actually consumed less than a full liveness
+        window. A child that already ran for a full window is a *slow* model,
+        not a wedged one: the turn did real (expensive, often irreversible)
+        work, and a resume re-runs that same work, re-burning a full window
+        and failing identically (waste, and the user waits 2× the window).
+
+        ``run_ms`` is how long the first subprocess lived. With
+        ``liveness_timeout = N`` seconds, the guard can only fire at
+        ``≥ N`` seconds of silence, so ``run_ms < N*1000`` is the
+        "died before consuming a full window" test. A fresh/wedged model
+        dies right at ~N; a slow-but-working one dies *after* N+ε — both
+        are worth the retry. A model that ran *past* N (e.g. a 900s turn on
+        a 600s window) is NOT.
+        """
+        return run_ms < self.liveness_timeout * 1000
+
     def chat(self, message: str, new_session: bool = False) -> str | None:
         """
         Send a message to Hermes and return the text reply.
@@ -379,29 +397,55 @@ class HermesClient:
             with self._turn_lock:
                 result = self._run_with_liveness_guard(cmd)
             if result is not None and self._guard_killed:
-                # The liveness guard SIGKILL'd the child mid-turn. The prompt
-                # is already persisted in the session, so resume and retry
-                # exactly once — a wedged/stalled model often recovers.
-                logger.warning(
-                    "Liveness guard killed the child; retrying once"
-                )
-                time.sleep(5)
-                self._ensure_session(False)
-                with self._model_lock:
-                    model = self.model
-                cmd = [
-                    self.hermes_bin, "chat", "-q", message,
-                    "--source", self.source_tag, "-Q",
-                ]
-                if self._resume_id:
-                    cmd += ["--resume", self._resume_id]
-                elif not self._resolve_session_id():
-                    cmd += ["-c", self.session_name, "--create-if-missing"]
-                if model:
-                    cmd += ["-m", model]
-                cmd.extend(self.extra_args)
-                with self._turn_lock:
-                    result = self._run_with_liveness_guard(cmd)
+                if self._guard_kill_worth_retrying(
+                    getattr(self, "_last_run_ms", 0.0)
+                ):
+                    # The liveness guard SIGKILL'd the child *early* (it never
+                    # consumed a full window) — that's a wedged/stalled model,
+                    # and the prompt is already persisted in the session, so
+                    # resume and retry exactly once. A wedged model often
+                    # recovers.
+                    logger.warning(
+                        "Liveness guard killed the child early "
+                        "(%.0fms < %ds window); retrying once",
+                        getattr(self, "_last_run_ms", 0.0),
+                        self.liveness_timeout,
+                    )
+                    time.sleep(5)
+                    self._ensure_session(False)
+                    with self._model_lock:
+                        model = self.model
+                    cmd = [
+                        self.hermes_bin, "chat", "-q", message,
+                        "--source", self.source_tag, "-Q",
+                    ]
+                    if self._resume_id:
+                        cmd += ["--resume", self._resume_id]
+                    elif not self._resolve_session_id():
+                        cmd += ["-c", self.session_name, "--create-if-missing"]
+                    if model:
+                        cmd += ["-m", model]
+                    cmd.extend(self.extra_args)
+                    with self._turn_lock:
+                        result = self._run_with_liveness_guard(cmd)
+                else:
+                    # The child ran a *full* window before the guard fired:
+                    # the model was slow but working, not wedged. The prompt
+                    # is persisted, but a resume would re-run the same (real,
+                    # often irreversible) work and re-burn a full window —
+                    # wasting 2× the wait and failing identically. Report
+                    # honestly and let the user retry / re-send.
+                    logger.warning(
+                        "Liveness guard killed the child after a full "
+                        "%.0fms window — model was slow, not wedged; "
+                        "skipping retry (would re-burn the window)"
+                    )
+                    result = (
+                        f"⏱️ Turn ran past the liveness window "
+                        f"({self.liveness_timeout}s) — the model was still "
+                        f"working but the turn took too long. Re-send to "
+                        f"continue; or lower HERMES_LIVENESS_TIMEOUT."
+                    )
             # Checkpoint gate: if the operator pressed /hold, block here
             # until /go (or timeout) before the reply leaves the bridge.
             result = self._apply_hold_gate(result)
@@ -424,6 +468,7 @@ class HermesClient:
         error message.
         """
         last_activity = time.monotonic()
+        started = time.monotonic()
         activity_lock = threading.Lock()
         done = threading.Event()
         self._guard_killed = False
@@ -494,6 +539,10 @@ class HermesClient:
 
             stdout = "".join(stdout_parts)
             stderr = "".join(stderr_parts)
+            # How long the child lived — chat() uses this to decide whether a
+            # guard-kill is worth a resume-retry (early death = wedged model;
+            # ran a full window = slow model, a retry would re-burn it).
+            self._last_run_ms = (time.monotonic() - started) * 1000.0
 
             if proc.returncode != 0:
                 logger.error(

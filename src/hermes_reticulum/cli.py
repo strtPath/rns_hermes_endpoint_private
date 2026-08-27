@@ -174,23 +174,43 @@ def cmd_run(args):
     bridge.run_forever()
 
 
+def _delivery_address(storage: str) -> str:
+    """
+    Compute the LXMF *delivery-destination* hash for the on-disk identity.
+
+    This is the address the running bridge actually announces and replies from —
+    i.e. ``LXMRouter.register_delivery_identity`` ->
+    ``RNS.Destination(identity, IN, SINGLE, "lxmf", "delivery").hash``.
+
+    Do NOT print ``identity.hash`` here: that is the bare *identity* hash, which
+    is a different 32-byte value and is NOT the address a client should message.
+    Confusing the two is what made the bridge look like it was "changing
+    identities" across restarts (see docs/mesh-bridge-findings-2026-08-27-
+    identity-changes-on-restart.md).
+    """
+    import RNS
+
+    RNS.Reticulum()  # init shared instance so Destination can register
+    identity = RNS.Identity.from_file(os.path.join(storage, "hermes_identity"))
+    destination = RNS.Destination(
+        identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery"
+    )
+    return RNS.prettyhexrep(destination.hash)
+
+
 def cmd_address(args):
-    """Print the LXMF address of an existing identity."""
+    """Print the LXMF delivery address of the existing identity."""
     setup_logging(False)
 
     storage = args.storage or os.getenv("RETICULUM_STORAGE", os.path.expanduser("~/.lxmf/storage"))
     identity_path = os.path.join(storage, "hermes_identity")
-
-    import RNS
 
     if not os.path.exists(identity_path):
         print(f"No identity found at {identity_path}")
         print("Run 'hermes-reticulum' first to generate one.")
         sys.exit(1)
 
-    RNS.Reticulum()  # init
-    identity = RNS.Identity.from_file(identity_path)
-    print(f"LXMF Address: {RNS.prettyhexrep(identity.hash)}")
+    print(f"LXMF Address: {_delivery_address(storage)}")
 
 
 def cmd_status(args):
@@ -210,9 +230,8 @@ def cmd_status(args):
 
     if os.path.exists(identity_path):
         import RNS
-        RNS.Reticulum()
-        identity = RNS.Identity.from_file(identity_path)
-        print(f"  Address:   {RNS.prettyhexrep(identity.hash)}")
+
+        print(f"  Address:   {_delivery_address(storage)}")
 
         # Show RNS interfaces
         print()
@@ -227,20 +246,27 @@ def cmd_status(args):
         print("  Run 'hermes-reticulum' to initialize.")
 
 
-def main():
-    _load_dotenv()  # Load .env before any command parsing
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hermes-reticulum",
         description="Hermes for Reticulum — AI agent on the mesh network",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--storage", "-s", help="Storage path for identity/messages (default: env RETICULUM_STORAGE)"
+    )
+
     sub = parser.add_subparsers(dest="command", help="Command to run")
 
-    # Default: run
-    run_p = sub.add_parser("run", help="Start the bridge (default)")
+    run_p = sub.add_parser(
+        "run",
+        help="Start the bridge",
+        parents=[common],
+        description="Start the bridge (default when no subcommand is given).",
+    )
     run_p.add_argument("--display-name", "-n", help="Display name on the mesh")
-    run_p.add_argument("--storage", "-s", help="Storage path for identity/messages")
     run_p.add_argument("--stamp-cost", type=int, help="LXMF stamp cost")
     run_p.add_argument("--rns-config", help="Path to Reticulum config dir")
     run_p.add_argument("--hermes-bin", help="Path to hermes CLI binary")
@@ -248,26 +274,32 @@ def main():
     run_p.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     run_p.set_defaults(func=cmd_run)
 
-    # Address
-    addr_p = sub.add_parser("address", help="Show LXMF address")
-    addr_p.add_argument("--storage", "-s", help="Storage path")
-    addr_p.set_defaults(func=cmd_address)
+    sub.add_parser("address", help="Show LXMF address", parents=[common]).set_defaults(
+        func=cmd_address
+    )
+    sub.add_parser("status", help="Show bridge status", parents=[common]).set_defaults(
+        func=cmd_status
+    )
+    return parser
 
-    # Status
-    stat_p = sub.add_parser("status", help="Show bridge status")
-    stat_p.add_argument("--storage", "-s", help="Storage path")
-    stat_p.set_defaults(func=cmd_status)
 
-    # Parse — if no subcommand, default to run
-    args = parser.parse_args()
-    if args.command is None:
-        # Default: run with global flags
-        args = parser.parse_args(["run"] + sys.argv[1:])
-        # Re-parse with run-specific args
-        run_parser = sub.choices["run"]
-        args = run_parser.parse_args(sys.argv[1:])
-        args.func = cmd_run
+def main():
+    _load_dotenv()  # Load .env before any command parsing
+    parser = _build_parser()
+    argv = sys.argv[1:]
 
+    # No subcommand → default to "run".
+    #
+    # "run"'s flags are a superset of the parser's own options (--storage /
+    # --verbose are shared via the `common` parent), so the single re-parse is
+    # valid: every argv token a bare invocation can carry is also recognized
+    # by the "run" parser. (Do NOT pre-parse with the main parser first — the
+    # old default path re-ran the main parser over argv, which rejected
+    # run-only flags like --stamp-cost with "unrecognized arguments".)
+    if not argv or argv[0].startswith("-") or argv[0] not in ("run", "address", "status"):
+        argv = ["run"] + argv
+
+    args = parser.parse_args(argv)
     args.func(args)
 
 
