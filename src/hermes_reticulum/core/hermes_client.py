@@ -6,6 +6,7 @@ Supports two modes:
   2. Future: direct Python import when Hermes is importable
 """
 
+import json
 import logging
 import os
 import shutil
@@ -85,6 +86,24 @@ class HermesClient:
         self.liveness_timeout = int(
             os.getenv("HERMES_LIVENESS_TIMEOUT", "600")
         )
+        # Liveness-heartbeat marker file (spec Part 1, Option A): the
+        # ``agent:step`` hook and the bridge itself write
+        # ``{"session": <thread title>, "ts": <time.time()>, "phase": ...}``
+        # here, and the per-child watcher in _run_with_liveness_guard reads
+        # it every second. A fresh marker (same session, ts within the
+        # window) touches the liveness clock, turning the guard from a
+        # max-turn wall clock into a *stall* detector: a slow-but-working
+        # model keeps the marker warm and runs to completion; a wedged one
+        # stops touching it and is killed.
+        #
+        # File mtime is authoritative (survives a write being swapped out
+        # of the page cache between reads); the JSON "ts" is informational.
+        self.turn_alive_file = os.path.expanduser(
+            os.getenv(
+                "HERMES_TURN_ALIVE_FILE",
+                "~/.hermes/.reticulum-turn-alive",
+            )
+        )
         self.source_tag = source_tag
         self.extra_args = extra_args or []
         self.model = model or os.getenv("HERMES_MODEL", "").strip() or None
@@ -120,6 +139,68 @@ class HermesClient:
         logger.info("Hermes session thread: %s", self.session_name)
         if self.liveness_timeout:
             logger.info("Liveness guard: %ds (0=off)", self.liveness_timeout)
+        logger.debug("Turn-alive heartbeat file: %s", self.turn_alive_file)
+
+    # ── Liveness-heartbeat marker (spec Part 1, Option A) ────────────
+
+    def write_turn_alive_marker(self, phase: str = "model") -> None:
+        """Write the "still working" marker for this mesh thread.
+
+        The hook (``agent:step``, in the gateway process) writes this on
+        every tool batch; the bridge writes ``phase="model"`` when it
+        spawns the child (and on each retry), so a turn that never reaches
+        a tool still has a start marker. Best-effort: a failure to write
+        degrades to the bytes-only guard (no marker = no touches), never
+        raises.
+        """
+        try:
+            tmp = self.turn_alive_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "session": self.session_name,
+                        "ts": time.time(),
+                        "phase": phase,
+                    },
+                    f,
+                )
+            os.replace(tmp, self.turn_alive_file)
+        except OSError as exc:
+            logger.debug("could not write turn-alive marker: %s", exc)
+
+    def clear_turn_alive_marker(self) -> None:
+        """Remove the marker so a dead turn's marker can't leak into the
+        next turn (spec item 3)."""
+        try:
+            os.unlink(self.turn_alive_file)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.debug("could not clear turn-alive marker: %s", exc)
+
+    def _marker_alive(self) -> bool:
+        """True if the marker file is fresh for *this* session.
+
+        Freshness is judged on file **mtime** (not the JSON ``ts``): mtime
+        survives a read racing the writer's temp-file swap, and it's what
+        the watcher polls every second. Scoped to this child's session —
+        a different bridge turn's hook firing must NOT keep this child
+        alive.
+        """
+        if not self.liveness_timeout:
+            return False
+        try:
+            mtime = os.stat(self.turn_alive_file).st_mtime
+        except OSError:
+            return False
+        if time.time() - mtime > self.liveness_timeout:
+            return False
+        try:
+            with open(self.turn_alive_file, encoding="utf-8") as f:
+                marker = json.load(f)
+        except (OSError, ValueError):
+            return False
+        return marker.get("session") == self.session_name
 
     def steer(self, text: str) -> None:
         """Queue steering text to be injected as a prefix to the next prompt."""
@@ -472,6 +553,7 @@ class HermesClient:
         activity_lock = threading.Lock()
         done = threading.Event()
         self._guard_killed = False
+        marker_touched = False  # debug: marker-driven touches are logged once
 
         def _touch():
             nonlocal last_activity
@@ -493,19 +575,46 @@ class HermesClient:
                     remaining = (last_activity + self.liveness_timeout) - time.monotonic()
                 if remaining <= 0:
                     logger.warning(
-                        "Liveness guard: no output for %ds, killing hermes",
+                        "Liveness guard: no output or heartbeat for %ds, "
+                        "killing hermes",
                         self.liveness_timeout,
                     )
                     self._guard_killed = True
                     self._stop_requested = True
                     self._kill_process()
+                    self.clear_turn_alive_marker()
                     return
+                # Liveness-heartbeat marker (spec Part 1, Option A): a fresh
+                # marker for THIS session means the model made tool progress
+                # (or at least the turn started) within the window — touch the
+                # liveness clock, turning the guard into a stall detector
+                # instead of a wall clock. The session match is what scopes
+                # this to our child: another bridge turn's hook firing can't
+                # keep ours alive.
+                if self._marker_alive():
+                    nonlocal marker_touched
+                    if not marker_touched:
+                        marker_touched = True
+                        logger.debug(
+                            "Liveness heartbeat: turn-alive marker fresh "
+                            "(session=%r, file=%s) — touching clock",
+                            self.session_name, self.turn_alive_file,
+                        )
+                    _touch()
                 done.wait(min(remaining, 1.0))
 
         proc: subprocess.Popen | None = None
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         try:
+            # Spec Part 1: reset the marker at spawn so a dead turn's stale
+            # marker can't leak into this one, then write a fresh
+            # phase="model" marker so even a turn that never reaches a tool
+            # has a start marker (and the guard has something to fall back
+            # to — a fresh start marker covers at most one full window of
+            # pure model thinking before the hook must take over).
+            self.clear_turn_alive_marker()
+            self.write_turn_alive_marker(phase="model")
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -553,11 +662,15 @@ class HermesClient:
                 if self._guard_killed:
                     # "We killed it" (liveness guard or /stop), not a hermes
                     # crash: give the user an honest message, and the caller
-                    # will auto-retry once (see chat()).
+                    # will auto-retry once (see chat()). With the heartbeat
+                    # marker in place, "no output" also means "no tool
+                    # progress" — a slow-but-working model is kept alive by
+                    # the marker and only dies here when it truly stalled.
                     return (
                         f"⏱️ Turn exceeded the liveness window "
-                        f"({self.liveness_timeout}s) — the model may be "
-                        f"busy or stalled. Please retry."
+                        f"({self.liveness_timeout}s) with no output and no "
+                        f"tool progress — the model may be busy or stalled. "
+                        f"Please retry."
                     )
                 return self._error_reply(proc.returncode, stderr)
 
@@ -601,7 +714,13 @@ class HermesClient:
         return f"{reply}\n\n_{line}_"
 
     def _kill_process(self) -> None:
-        """Terminate the running hermes subprocess (if any)."""
+        """Terminate the running hermes subprocess (if any).
+
+        Also clears the liveness marker (spec item 3): a killed turn's
+        marker must not leak into the next turn. The watcher's kill path
+        clears it too (belt-and-suspenders); this covers /stop and
+        external kills.
+        """
         proc = self._process
         if proc is None or proc.poll() is not None:
             return
@@ -610,6 +729,7 @@ class HermesClient:
             proc.wait(timeout=5)
         except Exception:
             pass
+        self.clear_turn_alive_marker()
 
     def stop(self) -> bool:
         """
@@ -623,6 +743,9 @@ class HermesClient:
         self._stop_requested = True
         logger.info("Stop requested — killing hermes subprocess")
         self._kill_process()
+        # Spec Part 1: a dead turn's stale marker must not leak into the next
+        # turn (a wedged marker would otherwise keep the next child warm).
+        self.clear_turn_alive_marker()
         return True
 
     def set_model(self, model: str | None) -> str:
