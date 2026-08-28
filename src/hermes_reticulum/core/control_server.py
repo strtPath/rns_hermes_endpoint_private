@@ -159,7 +159,10 @@ class ControlServer:
         self.on_full_step: Optional[Callable[[str, str], None]] = None
         # Wired by the CLI: called when a gate opens, so the bridge can
         # push a "⏸️ waiting for /approve" message to the mesh.
-        self.on_gate_open: Optional[Callable[[str, str], None]] = None
+        # Signature: (session, tool, command, description). The /step ack
+        # gate passes (session, label, "", ""); /gate/notify (pre-exec)
+        # passes the real tool/command/description.
+        self.on_gate_open: Optional[Callable[[str, str, str, str], None]] = None
         self._token = token or secrets.token_urlsafe(32)
         self._token_path: Optional[Path] = None
         if storage_path:
@@ -381,8 +384,10 @@ class ControlServer:
                 if self.on_gate_open is not None:
                     # "gate opened" is a mesh push (blocking LXMF send) →
                     # offload it so it can't wedge the request thread while
-                    # the approval wait below runs inline.
-                    self.relay(self.on_gate_open, session, name)
+                    # the approval wait below runs inline. Pass the tool
+                    # label; command/description stay empty for the ack
+                    # gate (the /gate/notify pre-exec path fills them).
+                    self.relay(self.on_gate_open, session, name, "", "")
                 decision = self.request_approval(session, name)
                 if decision == "deny" and self.on_deny is not None:
                     # on_deny vetoes the turn (kills the hermes child) —
@@ -390,7 +395,7 @@ class ControlServer:
                     # misbehaving callback can't block the reply.
                     self.relay(self.on_deny, session)
                 return 200, decision
-            # kind == "report": fire the live "🔧 tool" mesh push OFF the
+            # kind == "report": fire the live "💻 tool" mesh push OFF the
             # request thread. The hook POSTs this and does NOT block on its
             # reply, so returning immediately is safe and keeps the gateway
             # loop (for the hook) unblocked.
@@ -421,6 +426,35 @@ class ControlServer:
             session = body.get("session", "")
             ok = self.answer_approval(session, path == "/approve")
             return (200, "ok") if ok else (409, "no pending approval")
+
+        if path == "/gate/notify":
+            # Pre-execution gate from the in-process pre_tool_call plugin
+            # (mesh-tool-gate). The plugin has ALREADY run Hermes' own
+            # detect_dangerous_command, so by the time we're here the command
+            # is confirmed dangerous. We open an approval gate for this
+            # session, push the command to the mesh operator, and RETURN the
+            # verdict in the HTTP response (the plugin then blocks on the
+            # result). Reuses the existing /approve //deny resolution + on_gate
+            # push, so the operator's UX is identical to the ack-then-veto
+            # gate. Distinct from /step's kind='gate' (that path also fires
+            # on_deny to kill the hermes child — wrong for a pre-exec block,
+            # where we just refuse the tool and the model sees the reason).
+            session = body.get("session", "")
+            if not session:
+                return 400, "missing session"
+            name = body.get("tool", "terminal")
+            command = body.get("command", "")
+            description = body.get("description", "")
+            if self.on_gate_open is not None:
+                # Signature: (session, tool, command, description).
+                self.relay(
+                    self.on_gate_open, session, name, command, description
+                )
+            decision = self.request_approval(
+                session, name,
+                on_wait=lambda: None,
+            )
+            return 200, decision
 
         if path == "/stop":
             return 200, "ok"  # no-op; stop is handled in-process

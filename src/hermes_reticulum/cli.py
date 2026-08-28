@@ -92,6 +92,35 @@ def cmd_run(args):
 
     ctrl.on_step = _on_tool_step
 
+    # Pre-execution gate: when the mesh-tool-gate plugin asks the mesh operator
+    # to approve/deny a risky tool *before* it runs, push the pending command
+    # to the mesh peer. (The old /step gate never wired on_gate_open; this is
+    # the pre-exec path.) on_deny stays unwired for /gate/notify — a pre-exec
+    # block is handled by the plugin returning a block directive, not by
+    # killing the child.
+    def _on_gate_open(session: str, tool: str, command: str, description: str) -> None:
+        push = mesh_push.get(session)
+        if push is None:
+            logger.debug("no mesh peer for %r — dropping gate-open", session)
+            return
+        body = (
+            f"⚠️ PRE-EXEC APPROVAL\n"
+            f"Tool: {tool}\n"
+            f"Command: {command}\n"
+            f"({description})\n"
+            f"Reply /approve to run it, /deny to block."
+        )
+        ok = bridge.send_reply(push["hash"], body, push["ident"])
+        if ok:
+            logger.info(
+                "Gate-open pushed for %s → mesh peer %s",
+                tool, push["hash"][:16],
+            )
+        else:
+            logger.warning("Failed to push gate-open for %s to mesh", tool)
+
+    ctrl.on_gate_open = _on_gate_open
+
     # Step-through mode: the hook POSTs the full tool call + full output
     # to /step/full.  We chunk it into ≤1500-char LXMF posts and send
     # them one by one (user-approved bandwidth cost).
