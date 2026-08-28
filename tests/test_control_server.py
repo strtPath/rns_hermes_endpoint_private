@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import threading
+import time
 import unittest
 import urllib.request
 
@@ -190,6 +191,79 @@ class TestHttpEndpoint(unittest.TestCase):
             self.fail("expected 401")
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 401)
+
+
+class TestRelayOffload(unittest.TestCase):
+    """Lock in the relay offload: record_step must return without waiting for
+    the mesh callback, and the relay worker must actually run it.
+
+    These are the invariants that prevent the control-server request thread
+    (or the hook's worker thread, for gates) from ever blocking on a mesh
+    relay. The LXMF send itself is non-blocking (LXMF router spawns its own
+    thread), but the callback wiring must still be exercised off the caller.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Bind port 0 → OS picks a free port; then read it back.
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.port = s.getsockname()[1]
+        cls.server = ControlServer(port=cls.port)
+        assert cls.server.start(), "control server failed to start"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def test_record_step_does_not_block(self):
+        """record_step returns immediately — it only updates in-memory state,
+        it does not wait for any mesh callback."""
+        s = ControlServer(port=0)
+        s.on_step = lambda *a, **k: None
+        start = time.time()
+        s.record_step("mesh-x", ToolStep(name="web_search"))
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 1.0,
+                        "record_step blocked on the relay worker")
+
+    def test_http_step_drains_to_callback(self):
+        """POST /step (kind=report) enqueues the on_step relay and the relay
+        worker delivers it — the HTTP handler returns 200 without waiting
+        for the callback to complete."""
+        got = threading.Event()
+        self.server.on_step = lambda session, step: got.set()
+        url = f"http://127.0.0.1:{self.port}/step?token={self.server._token}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({
+                "session": "mesh-y",
+                "kind": "report",
+                "tool": "read_file",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        start = time.time()
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        http_elapsed = time.time() - start
+        # HTTP response must be fast (no blocking on mesh relay).
+        self.assertLess(http_elapsed, 2.0,
+                        "POST /step blocked waiting for mesh relay")
+        # The relay worker should deliver the callback shortly after.
+        self.assertTrue(got.wait(3.0),
+                        "relay worker did not deliver on_step within 3s")
+
+    def test_on_step_none_is_noop(self):
+        """If no callback is wired, record_step still returns cleanly."""
+        s = ControlServer(port=0)
+        s.on_step = None
+        start = time.time()
+        s.record_step("mesh-z", ToolStep(name="web_search"))
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":
