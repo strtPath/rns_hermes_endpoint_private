@@ -846,6 +846,10 @@ class HermesClient:
                     proc.returncode,
                     stderr[:500] if stderr else "(no stderr)",
                 )
+                if self._stop_requested and not self._guard_killed:
+                    # Deliberate /stop or an on_deny veto: report honestly —
+                    # the model may still have been working fine.
+                    return "⏹️ Stopped before the turn finished."
                 if self._guard_killed:
                     # "We killed it" (liveness guard or /stop), not a hermes
                     # crash: give the user an honest message, and the caller
@@ -935,6 +939,10 @@ class HermesClient:
         if proc is None or proc.poll() is not None:
             return False
         self._stop_requested = True
+        # _guard_killed stays False: a deliberate /stop (or an on_deny
+        # veto) is "stopped", not a liveness failure. The exit path uses
+        # this to report ⏹️ instead of the liveness message or code -9.
+        self._guard_killed = False
         logger.info("Stop requested — killing hermes subprocess")
         self._kill_process()
         # Spec Part 1: a dead turn's stale marker must not leak into the next

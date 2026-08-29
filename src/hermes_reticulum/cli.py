@@ -46,7 +46,18 @@ def setup_logging(verbose: bool = False):
 
 
 def _deny_veto(hermes) -> None:
-    """Abort the in-flight hermes child when the mesh operator denies a tool."""
+    """Abort the in-flight hermes child when the mesh operator denies a tool.
+
+    The deny can arrive via two paths, and neither is logged by the
+    control server, so log it here (this is the single choke point both
+    paths funnel through):
+    - legacy ack-then-veto: ControlServer POST /step kind='gate' → on_deny
+    - pre-exec: the mesh-tool-gate plugin refuses the dangerous tool and
+      the model's turn is then aborted.
+    """
+    logging.getLogger("hermes_reticulum.cli").info(
+        "mesh denied tool — aborting in-flight child"
+    )
     hermes.stop()
 
 
