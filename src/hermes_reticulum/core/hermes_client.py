@@ -320,7 +320,22 @@ class HermesClient:
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
         _diag(f"step-watcher start sid={sid}")
-        last_pushed = 0
+        # Seed at the session's existing MAX id so we only push THIS turn's
+        # rows. state.db `messages` is session-global, so a fresh watcher on
+        # the 2nd+ turn of a session would otherwise replay the whole prior
+        # tool history as a one-second burst (recap bug — see
+        # docs/mesh-bridge-findings-2026-08-29-step-watcher-recap-bug.md).
+        # Safe to seed at start: the user message is persisted before the
+        # watcher runs, so rows with id <= seed belong to earlier turns.
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ?", (sid,)
+            ).fetchone()
+            last_pushed = row[0] if row and row[0] else 0
+            conn.close()
+        except (sqlite3.Error, OSError):
+            last_pushed = 0
         pushed = 0
         while not stop_evt.is_set():
             if stop_evt.wait(1.0):
