@@ -136,6 +136,10 @@ class HermesClient:
         self._process: subprocess.Popen | None = None
         self._stop_requested = False
         self._guard_killed = False
+        # Set True by stop() when the kill came from a mesh operator veto
+        # (on_deny), as opposed to a liveness-guard kill or /stop. A veto
+        # must never be auto-retried — a denied tool re-denies forever.
+        self._deny_veto = False
         # Serialize turns per model: two bridge turns must not race the same
         # local model (they would queue on the GPU and look dead to the
         # liveness guard). One turn at a time per HermesClient instance.
@@ -674,9 +678,10 @@ class HermesClient:
             # liveness clock inside _run_with_liveness_guard is per-subprocess,
             # so waiting for the lock here does not trip the guard — the child
             # only starts (and the clock only starts) once we hold the lock.
+            self._deny_veto = False
             with self._turn_lock:
                 result = self._run_with_liveness_guard(cmd)
-            if result is not None and self._guard_killed:
+            if result is not None and self._guard_killed and not self._deny_veto:
                 if self._guard_kill_worth_retrying(
                     getattr(self, "_last_run_ms", 0.0)
                 ):
@@ -781,8 +786,14 @@ class HermesClient:
                         "killing hermes",
                         self.liveness_timeout,
                     )
-                    self._guard_killed = True
                     self._stop_requested = True
+                    self._guard_killed = True
+                    # A liveness-guard kill is NOT a mesh veto — clear it so
+                    # chat()'s early-death retry still works for a genuinely
+                    # wedged model. A mesh operator veto (stop() →
+                    # _deny_veto=True) must survive and suppress the retry,
+                    # or a denied tool re-denies in a loop.
+                    self._deny_veto = False
                     self._kill_process()
                     self.clear_turn_alive_marker()
                     return
@@ -957,7 +968,10 @@ class HermesClient:
         # _guard_killed stays False: a deliberate /stop (or an on_deny
         # veto) is "stopped", not a liveness failure. The exit path uses
         # this to report ⏹️ instead of the liveness message or code -9.
+        # _deny_veto marks this specifically as a mesh operator veto so
+        # chat() never auto-retries it (a denied tool re-denies forever).
         self._guard_killed = False
+        self._deny_veto = True
         logger.info("Stop requested — killing hermes subprocess")
         self._kill_process()
         # Spec Part 1: a dead turn's stale marker must not leak into the next
