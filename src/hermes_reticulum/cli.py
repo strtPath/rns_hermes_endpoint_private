@@ -139,6 +139,19 @@ def cmd_run(args):
             logger.warning("Failed to push full step to mesh for %s", session)
 
     ctrl.on_full_step = _on_full_step
+    # CLI-side step watcher push callback: while a mesh turn runs, the
+    # watcher (in hermes_client.chat) pushes each tool call + output as its
+    # own chunked 💻 message to the peer that sent the message. The bridge's
+    # child is a CLI process, so the gateway's agent:step hook never fires
+    # for it — this is the path that actually delivers the per-tool messages.
+    def _step_push(text: str) -> None:
+        push = mesh_push.get(hermes.session_name)
+        if push is None:
+            logger.debug("no mesh peer for step push — dropping")
+            return
+        bridge.push_reply(push["hash"], text, push["ident"])
+
+    hermes.set_push_callback(_step_push)
     if not ctrl.start():
         logger.warning(
             "Control endpoint not started — /approve /deny /steer and live "

@@ -220,22 +220,43 @@ def _cmd_tools(ctx: CommandContext, args: str) -> str | None:
 # ── step-through mode ────────────────────────────────────────────────
 
 
+def _step_mode_file_path() -> str:
+    """Path of the state file the hook (gateway process) polls for mode."""
+    from hermes_reticulum.core.bridge import MODE_STATE_PATH
+    return MODE_STATE_PATH
+
+
 def _cmd_steps(ctx: CommandContext, args: str) -> str | None:
     """Toggle step-through mode: full tool call + output before next action."""
     arg = args.strip().lower()
     if arg in ("on", "1", "yes", "true"):
+        # hermes_client flag (prompt prefix) + the state file the hook polls.
         ctx.hermes.set_step_mode(True)
+        try:
+            from pathlib import Path
+            Path(_step_mode_file_path()).write_text("1")
+        except OSError:
+            pass
         return (
             "👁️ Step-through ON: each tool call and its full output will be "
-            "posted to you in chunks (multiple mesh messages) before the "
-            "model proceeds. Use /steps off to stop, /hold to pause the "
-            "final reply until /go."
+            "posted to you as its own message before the model proceeds "
+            "(💻 <tool> <args> <output>). Use /steps off to stop, /hold to "
+            "pause the final reply until /go."
         )
     if arg in ("off", "0", "no", "false"):
         ctx.hermes.set_step_mode(False)
+        try:
+            from pathlib import Path
+            Path(_step_mode_file_path()).write_text("0")
+        except OSError:
+            pass
         return "👁️ Step-through OFF: back to the default terse recap."
-    # No arg: report current state
-    cur = ctx.hermes.is_step_mode()
+    # No arg: report current state (from the file, the source of truth)
+    try:
+        from pathlib import Path
+        cur = Path(_step_mode_file_path()).read_text().strip() == "1"
+    except OSError:
+        cur = False
     state = "ON" if cur else "off"
     return (
         f"Step-through: {state}\n"

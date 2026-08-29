@@ -10,11 +10,32 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
 
 logger = logging.getLogger("hermes_reticulum.hermes")
+
+# Where the CLI-side tool watcher writes its diagnostic log. The hook's
+# ~/.hermes/logs/mesh-tool-events.log is the gateway's; this one proves the
+# bridge's own watcher is firing for the mesh child (which the hook never
+# sees, because agent:step only fires in the gateway).
+_STEP_DIAG_LOG = os.path.expanduser(
+    os.environ.get("HERMES_STEP_DIAG_LOG", "~/.hermes/logs/mesh-bridge-step.log")
+)
+
+
+def _diag(msg: str) -> None:
+    """Append a one-line diagnostic to the step log (best-effort, never raises)."""
+    try:
+        Path = __import__("pathlib").Path
+        p = Path(_STEP_DIAG_LOG)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:  # noqa: BLE001 — diagnostics must never break a turn
+        pass
 
 # Common locations for the hermes binary
 _HERMES_CANDIDATES = [
@@ -219,7 +240,24 @@ class HermesClient:
         self._step_mode = bool(enabled)
         logger.info("Step-through mode: %s", "ON" if enabled else "OFF")
 
+    def _step_mode_file_path(self) -> str:
+        """Path of the state file that is the source of truth for step mode.
+
+        The hook (gateway process) and the CLI-side watcher (bridge process)
+        both read this; the in-process flag is only a convenience.
+        """
+        from hermes_reticulum.core.bridge import MODE_STATE_PATH
+        return MODE_STATE_PATH
+
     def is_step_mode(self) -> bool:
+        """Step mode: prefer the state file (source of truth) so the hook and
+        the CLI-side watcher always agree, then fall back to the flag."""
+        try:
+            from pathlib import Path
+            if Path(self._step_mode_file_path()).read_text().strip() == "1":
+                self._step_mode = True
+        except (OSError, Exception):
+            pass
         return self._step_mode
 
     def set_hold_gate(self, enabled: bool) -> None:
@@ -229,6 +267,123 @@ class HermesClient:
     def set_push_callback(self, callback) -> None:
         """Register a push callback: callable(text: str) → send to mesh peer."""
         self._push_callback = callback
+
+    # ── CLI-side step-through watcher ────────────────────────────────
+    #
+    # WHY THIS EXISTS: the ``agent:step`` hook only fires in the *gateway*
+    # (gateway/run.py wires agent.step_callback). The bridge's child is a
+    # ``hermes chat -q`` CLI process, so that hook NEVER runs for a mesh
+    # turn — which is why reformatting the hook's payload changed nothing
+    # on the mesh. Instead, the bridge (this process, which owns the live
+    # push path) polls state.db for new tool rows while the child runs and
+    # pushes each tool call + its output as its own 💻 message, exactly
+    # like the gateway's progress bubble. No gateway, no hook needed.
+
+    def _push_step(self, name: str, args_raw, result: str, is_error: bool) -> None:
+        """Push one tool call (💻 + command) and its output to the mesh peer."""
+        if not self._push_callback:
+            _diag(f"  push_step({name}) skipped: no push callback")
+            return
+        # Primary argument, formatted for the mesh (gateway 💻 style).
+        args_text = args_raw or ""
+        if isinstance(args_raw, (dict, list)):
+            try:
+                args_text = json.dumps(args_raw, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args_text = str(args_raw)
+        if name == "terminal" and isinstance(args_raw, dict):
+            primary = args_raw.get("command") or args_raw.get("cmd")
+            if primary:
+                args_text = str(primary)
+        if not args_text:
+            args_text = "(no arguments)"
+        # Error tools get a ❌ prefix; keep the command visible either way.
+        head = f"❌ {name}" if is_error else f"💻 {name}"
+        body = f"{head}\n{args_text}"
+        if result:
+            body += f"\n{result}"
+        _diag(f"  push_step({name}) → {len(body)} chars")
+        try:
+            self._push_callback(body)
+        except Exception as e:  # noqa: BLE001 — a push failure must not kill the turn
+            _diag(f"  push_step({name}) callback raised: {e}")
+            logger.warning("Step push failed for %s: %s", name, e)
+
+    def _run_step_watcher(self, sid: str, stop_evt: threading.Event) -> None:
+        """Poll state.db for new tool rows in this session and push each.
+
+        Runs in a daemon thread for the lifetime of one chat() turn. Tracks
+        the last pushed row id so a tool batch is pushed exactly once.
+        Best-effort: any error is logged and the loop continues.
+        """
+        db_path = os.path.expanduser(
+            os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
+        )
+        _diag(f"step-watcher start sid={sid}")
+        last_pushed = 0
+        pushed = 0
+        while not stop_evt.is_set():
+            if stop_evt.wait(1.0):
+                break
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    row = conn.execute(
+                        "SELECT MAX(id) FROM messages WHERE session_id = ?",
+                        (sid,),
+                    ).fetchone()
+                    last_id = row[0] if row and row[0] else 0
+                finally:
+                    conn.close()
+            except (sqlite3.Error, OSError) as e:
+                _diag(f"step-watcher query error: {e}")
+                continue
+            if last_id is None or last_id <= last_pushed:
+                continue
+            # New rows since the last push — fetch the tail (all roles) and
+            # extract tool calls (assistant rows) + their results
+            # (role='tool' rows, linked by tool_call_id).
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    rows = conn.execute(
+                        "SELECT id, role, tool_calls, tool_name, content, "
+                        "tool_call_id "
+                        "FROM messages WHERE session_id = ? AND id > ? "
+                        "ORDER BY id ASC",
+                        (sid, last_pushed),
+                    ).fetchall()
+                finally:
+                    conn.close()
+            except (sqlite3.Error, OSError) as e:
+                _diag(f"step-watcher fetch error: {e}")
+                continue
+            results_by_cid: dict = {}
+            for rid, role, tool_calls, tool_name, content, tool_call_id in rows:
+                if role == "tool" and tool_call_id:
+                    results_by_cid[tool_call_id] = content or ""
+                elif role == "assistant" and tool_calls:
+                    try:
+                        calls = json.loads(tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict) or "function" not in call:
+                            continue
+                        fn = call.get("function") or {}
+                        cname = fn.get("name", "?")
+                        cargs = fn.get("arguments")
+                        cid = call.get("id") or call.get("call_id")
+                        result_text = results_by_cid.get(cid, "")
+                        is_error = bool(result_text) and result_text.strip().startswith(
+                            ("❌", "Error", "error:")
+                        )
+                        self._push_step(cname, cargs, result_text, is_error)
+                        pushed += 1
+            last_pushed = last_id
+        _diag(f"step-watcher stop sid={sid} pushed={pushed}")
 
     def _step_prompt_prefix(self) -> str | None:
         """Prefix injected when step-through mode is ON.
@@ -244,10 +399,13 @@ class HermesClient:
         return (
             "[Step-through mode is ACTIVE.]\n"
             "You are being watched over the mesh, one action at a time.\n"
-            "Before you call a tool, state in plain text: which tool and why.\n"
-            "After each tool, state what you learned in one or two lines.\n"
-            "Do NOT batch more than one tool call per step.\n"
-            "This is mandatory while step-through mode is on.\n\n"
+            "Tool calls and their full output are delivered to the user as\n"
+            "their own separate messages automatically — do NOT restate,\n"
+            "summarize, or narrate tool calls, tool arguments, or tool\n"
+            "output in your reply (no 'Step 1 result...', no 'the command\n"
+            "returned...'). Just run the tools and use the results.\n"
+            "Your final message must be the answer only, in a few short\n"
+            "lines, with no recap of the tool activity.\n\n"
         )
 
     def _apply_hold_gate(self, reply: str | None) -> str | None:
@@ -439,11 +597,15 @@ class HermesClient:
             message = f"[Operator steering] {steer}\n\n{message}"
             logger.info("Injected steering: %s", steer[:80])
 
-        # Step-through mode: instruct the model to announce each tool call
-        # before making it (the hook delivers full I/O chunked over mesh).
-        step_prefix = self._step_prompt_prefix()
-        if step_prefix:
-            message = f"{step_prefix}{message}"
+        # Step-through mode: instruct the model to NOT narrate step-by-step —
+        # the CLI-side watcher delivers each tool call + output as its own
+        # mesh message (the equivalent of the gateway's 💻 progress bubble).
+        # is_step_mode() reads the state file (source of truth), so this works
+        # even if the in-process flag was never set on this process.
+        if self.is_step_mode():
+            step_prefix = self._step_prompt_prefix()
+            if step_prefix:
+                message = f"{step_prefix}{message}"
 
         cmd = [
             self.hermes_bin,
@@ -454,9 +616,6 @@ class HermesClient:
             self.source_tag,
             "-Q",  # quiet — suppress banner/spinner
         ]
-        # Session handling:
-        #  - resume by explicit session ID (deterministic), or
-        #  - create/resume the named thread if we couldn't pin an ID yet.
         if self._resume_id:
             cmd += ["--resume", self._resume_id]
         else:
@@ -466,6 +625,31 @@ class HermesClient:
         if model:
             cmd += ["-m", model]
         cmd.extend(self.extra_args)
+
+        # CLI-side step-through watcher: push each tool call + output as its
+        # own mesh message while the child runs. The gateway hook (agent:step)
+        # can't fire for a CLI child, so this is what actually delivers the
+        # per-tool 💻 messages the user sees. Gated on step-mode ON + a push
+        # callback (only the bridge sets one).
+        watcher_stop = threading.Event()
+        watcher_sid = None
+        if self.is_step_mode() and self._push_callback:
+            watcher_sid = self._resume_id or self._resolve_session_id()
+            _diag(
+                f"step-mode ON, push set, sid={watcher_sid} "
+                f"resume_id={self._resume_id}"
+            )
+            threading.Thread(
+                target=self._run_step_watcher,
+                args=(watcher_sid, watcher_stop),
+                daemon=True,
+                name="hermes-step-watcher",
+            ).start()
+        else:
+            _diag(
+                f"step watcher NOT started (step_mode={self.is_step_mode()}, "
+                f"push={self._push_callback is not None})"
+            )
 
         try:
             logger.debug("Calling: %s", " ".join(cmd))
@@ -527,6 +711,9 @@ class HermesClient:
                         f"working but the turn took too long. Re-send to "
                         f"continue; or lower HERMES_LIVENESS_TIMEOUT."
                     )
+            # Stop the step watcher now the child has finished (it only ever
+            # pushes rows created during the turn).
+            watcher_stop.set()
             # Checkpoint gate: if the operator pressed /hold, block here
             # until /go (or timeout) before the reply leaves the bridge.
             result = self._apply_hold_gate(result)
@@ -696,10 +883,17 @@ class HermesClient:
     def _with_tool_recap(self, reply: str) -> str:
         """Append a compact tool recap to the reply (recap fallback).
 
-        Live ``agent:step`` hook events are the primary channel; this is the
-        safety net — if the hook is disabled or a hermes update changes the
-        event surface, the mesh still sees which tools ran.
+        Live tool steps are the primary channel; this is the safety net —
+        if the live path is disabled or a hermes update changes the event
+        surface, the mesh still sees which tools ran.
+
+        Suppressed entirely in step mode: the CLI-side watcher already
+        delivered each tool call + output as its own 💻 message, so a recap
+        footer would be a redundant recap the user explicitly rejected.
         """
+        if self._step_mode:
+            _diag(f"  recap suppressed (step mode) reply={len(reply)} chars")
+            return reply
         try:
             recap = self.tool_recap(limit=8)
         except Exception as exc:
