@@ -5,7 +5,8 @@ parity with the Hermes **Telegram** gateway, so the mesh endpoint is a first-cla
 way to talk to the agent, not a degraded one. This is a living doc — update the
 Status column as we land items._
 
-_Last updated: 2026-08-22. Owner: Holo + user._
+_Last updated: 2026-08-30 (Tier 1.6–1.8 landed: downlink acks, RSSI/SNR profiler,
+SIGTERM clean exit — commit `1322e89`). Owner: Holo + user._
 
 ---
 
@@ -38,6 +39,9 @@ the gap, grouped into four tiers by effort/value:
 | 1.3 | **`/model` runtime discovery** | ✅ done | `model_command.py` now reads models from `config.yaml` at runtime (no hardcoded catalog). *(verified this session.)* |
 | 1.4 | **`/new`, `/help`, `/commands`** | ✅ done | `CommandDispatcher` in `commands.py`; `/new` confirmed via log `Session reset — new thread: mesh-reticulum-<ts>`. *(verified this session.)* |
 | 1.5 | **Startup loud-fail on missing `hermes`** | ⚠️ partial | `find_hermes_bin()` raises `RuntimeError`; service unit now pins `PATH`. Add a clear, actionable startup message + a `/status`-style check. |
+| 1.6 | **Downlink reliability (ack / sequence / pacing)** | ✅ done (2026-08-30) | `core/downlink.py`: per-recipient chunk pacing (500 ms floor, `HERMES_CHUNK_INTERVAL_MS`), monotonic outbound sequence, LXMF first-hop `register_delivery_callback` → journalctl ack lines, `[pN i/N]` chunk tagging for gap detection. Commit `1322e89`. |
+| 1.7 | **Real RSSI/SNR into the profiler** | ✅ done (2026-08-30) | `ChannelMetrics.from_lxmessage` reads `RNS.Transport.local_client_rssi_cache` / `local_client_snr_cache` (populated by LoRa `r_stat_rssi` receipts) before falling back to message attrs / `None`. Replaces the blind `tcp_default` 1 Gbit assumption. Commit `1322e89`. |
+| 1.8 | **Clean SIGTERM shutdown** | ✅ done (2026-08-30) | `run_forever`'s SIGTERM/SIGINT handler now calls `RNS.exit(0)` (unwinds the RNS C event loop + `os._exit`). `systemctl --user stop/restart` no longer hangs — verified 60 ms stop. Commit `1322e89`. |
 
 ---
 
