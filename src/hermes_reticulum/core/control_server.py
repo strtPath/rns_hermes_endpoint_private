@@ -45,7 +45,11 @@ logger = logging.getLogger("hermes_reticulum.control_server")
 # Default port for the local control endpoint (override via env/args).
 DEFAULT_CONTROL_PORT = 8471
 TOKEN_FILE_NAME = "control_token"
-DEFAULT_APPROVAL_TIMEOUT = 120.0  # seconds to wait for /approve or /deny
+DEFAULT_APPROVAL_TIMEOUT = 900.0  # seconds to wait for /approve or /deny.
+# Default is generous because the operator is on a LoRa mesh: the prompt
+# can take time to propagate, the phone may be silent (notifications off),
+# and the user may be AFK. 900s (15 min) covers all of that before we
+# deny-by-default. Override with HERMES_MESH_APPROVAL_TIMEOUT (seconds).
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -140,6 +144,19 @@ class ControlServer:
         storage_path: Optional[str] = None,
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
     ):
+        # Env override so the operator can tune the gate wait without a
+        # code change (LoRa latency / AFK / silent notifications vary per
+        # deployment). Accepts a float in seconds.
+        env_timeout = os.environ.get("HERMES_MESH_APPROVAL_TIMEOUT", "")
+        if env_timeout:
+            try:
+                approval_timeout = float(env_timeout)
+            except ValueError:
+                logger.warning(
+                    "HERMES_MESH_APPROVAL_TIMEOUT=%r is not a number; "
+                    "using default %.0fs",
+                    env_timeout, approval_timeout,
+                )
         self.port = port
         self.host = host
         self.approval_timeout = approval_timeout

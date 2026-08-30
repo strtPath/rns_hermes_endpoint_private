@@ -55,16 +55,36 @@ class ChannelMetrics:
         """
         Extract metrics from a received LXMessage and RNS Transport state.
 
-        Args:
-            message: An LXMF.LXMessage instance from the delivery callback.
+        RSSI/SNR: prefer the values RNS has already recorded for this
+        source in its per-destination signal caches
+        (`RNS.Transport.local_client_rssi_cache` /
+        `local_client_snr_cache`), which are populated from every
+        incoming packet receipt (including LoRa `r_stat_rssi` from
+        the RNode air interface). Falls back to any attributes LXMF
+        stashed on the message, then to None (the blind tcp_default
+        path the old code always took).
         """
         # Source hash
         src_bytes = message.source_hash
         source_hash = src_bytes.hex() if isinstance(src_bytes, bytes) else str(src_bytes)
 
-        # RSSI and SNR from the message (if available from link/radio)
-        rssi = getattr(message, "rssi", None)
-        snr = getattr(message, "snr", None)
+        # RSSI and SNR — from RNS Transport caches first (populated by
+        # incoming-packet receipts on the LoRa air interface), then
+        # from any attributes LXMF attached to the message.
+        rssi = None
+        snr = None
+        try:
+            rssi = RNS.Transport.local_client_rssi_cache.get(src_bytes)
+        except Exception:
+            rssi = None
+        try:
+            snr = RNS.Transport.local_client_snr_cache.get(src_bytes)
+        except Exception:
+            snr = None
+        if rssi is None:
+            rssi = getattr(message, "rssi", None)
+        if snr is None:
+            snr = getattr(message, "snr", None)
 
         # Delivery method
         method = getattr(message, "method", 0)
