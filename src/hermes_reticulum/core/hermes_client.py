@@ -109,22 +109,39 @@ class HermesClient:
         )
         # Liveness-heartbeat marker file (spec Part 1, Option A): the
         # ``agent:step`` hook and the bridge itself write
-        # ``{"session": <thread title>, "ts": <time.time()>, "phase": ...}``
-        # here, and the per-child watcher in _run_with_liveness_guard reads
-        # it every second. A fresh marker (same session, ts within the
-        # window) touches the liveness clock, turning the guard from a
-        # max-turn wall clock into a *stall* detector: a slow-but-working
-        # model keeps the marker warm and runs to completion; a wedged one
-        # stops touching it and is killed.
+        # ``{"session": <thread title>, "ts": <time.time()>, "phase": ...,
+        #    "gen": <int>}`` here, and the per-child watcher in
+        # _run_with_liveness_guard reads it every second. A fresh marker
+        # (same session, matching generation, ts within the window) touches
+        # the liveness clock, turning the guard from a max-turn wall clock
+        # into a *stall* detector: a slow-but-working model keeps the marker
+        # warm and runs to completion; a wedged one stops touching it and is
+        # killed.
+        #
+        # The per-child generation counter (spec Part 1, Option B, 2026-08-30)
+        # scopes the marker to ONE live child. The hook (gateway process)
+        # writes the marker for ANY session that resolves to a mesh thread —
+        # including the operator's own gateway session, which the mesh hook
+        # also streams. Without a generation, the operator's long-running
+        # gateway session would keep the marker warm and keep a mesh child
+        # alive (or, conversely, the mesh child's marker could be clobbered
+        # by the gateway's writes). The bridge bumps a fresh generation on
+        # every child spawn (and retry); the hook only refreshes the marker
+        # when its gen matches, so a child's heartbeat is scoped to that
+        # child's lifetime and a long-running gateway session can't kill a
+        # mesh child mid-turn.
         #
         # File mtime is authoritative (survives a write being swapped out
-        # of the page cache between reads); the JSON "ts" is informational.
+        # of the page cache between reads); the JSON "ts" and "gen" are
+        # informational but "gen" is the scope key.
         self.turn_alive_file = os.path.expanduser(
             os.getenv(
                 "HERMES_TURN_ALIVE_FILE",
                 "~/.hermes/.reticulum-turn-alive",
             )
         )
+        self._turn_alive_gen = 0
+        self._turn_alive_lock = __import__("threading").Lock()
         self.source_tag = source_tag
         self.extra_args = extra_args or []
         self.model = model or os.getenv("HERMES_MODEL", "").strip() or None
@@ -168,6 +185,24 @@ class HermesClient:
 
     # ── Liveness-heartbeat marker (spec Part 1, Option A) ────────────
 
+    def bump_turn_alive_gen(self) -> int:
+        """Advance the per-child generation and return it.
+
+        Call before spawning (or resuming) a child so the child's liveness
+        window is scoped to its own lifetime. The hook (gateway process)
+        only refreshes the marker when its ``gen`` matches the current
+        generation, so a long-running gateway session (the operator's own
+        Hermes) can no longer keep a mesh child's liveness clock warm — and
+        a mesh child's marker can't be clobbered by the gateway's writes.
+        """
+        with self._turn_alive_lock:
+            self._turn_alive_gen += 1
+            return self._turn_alive_gen
+
+    def current_turn_alive_gen(self) -> int:
+        with self._turn_alive_lock:
+            return self._turn_alive_gen
+
     def write_turn_alive_marker(self, phase: str = "model") -> None:
         """Write the "still working" marker for this mesh thread.
 
@@ -179,6 +214,8 @@ class HermesClient:
         raises.
         """
         try:
+            with self._turn_alive_lock:
+                gen = self._turn_alive_gen
             tmp = self.turn_alive_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(
@@ -186,6 +223,7 @@ class HermesClient:
                         "session": self.session_name,
                         "ts": time.time(),
                         "phase": phase,
+                        "gen": gen,
                     },
                     f,
                 )
@@ -204,12 +242,13 @@ class HermesClient:
             logger.debug("could not clear turn-alive marker: %s", exc)
 
     def _marker_alive(self) -> bool:
-        """True if the marker file is fresh for *this* session.
+        """True if the marker file is fresh for *this* child.
 
         Freshness is judged on file **mtime** (not the JSON ``ts``): mtime
         survives a read racing the writer's temp-file swap, and it's what
-        the watcher polls every second. Scoped to this child's session —
-        a different bridge turn's hook firing must NOT keep this child
+        the watcher polls every second. Scoped to this child's session AND
+        generation — a different bridge turn's hook firing, or the operator's
+        own gateway session writing its own marker, must NOT keep this child
         alive.
         """
         if not self.liveness_timeout:
@@ -225,7 +264,14 @@ class HermesClient:
                 marker = json.load(f)
         except (OSError, ValueError):
             return False
-        return marker.get("session") == self.session_name
+        if marker.get("session") != self.session_name:
+            return False
+        # Generation scope: the marker must have been written for the CURRENT
+        # child. A stale marker from a previous child (or the gateway's own
+        # session) has a different gen and must not count as liveness.
+        if marker.get("gen") != self.current_turn_alive_gen():
+            return False
+        return True
 
     def steer(self, text: str) -> None:
         """Queue steering text to be injected as a prefix to the next prompt."""
@@ -680,6 +726,12 @@ class HermesClient:
             # only starts (and the clock only starts) once we hold the lock.
             self._deny_veto = False
             with self._turn_lock:
+                # Spec Part 1, Option B: advance the per-child generation
+                # before spawning so the hook's refreshes are scoped to THIS
+                # child's lifetime, and the initial phase="model" marker
+                # (written inside _run_with_liveness_guard) carries the new
+                # gen — not a stale one from a previous child.
+                self.bump_turn_alive_gen()
                 result = self._run_with_liveness_guard(cmd)
             if result is not None and self._guard_killed and not self._deny_veto:
                 if self._guard_kill_worth_retrying(
@@ -712,6 +764,9 @@ class HermesClient:
                         cmd += ["-m", model]
                     cmd.extend(self.extra_args)
                     with self._turn_lock:
+                        # Fresh generation for the retry child — the hook
+                        # must not be scoped to the dead first child.
+                        self.bump_turn_alive_gen()
                         result = self._run_with_liveness_guard(cmd)
                 else:
                     # The child ran a *full* window before the guard fired:
