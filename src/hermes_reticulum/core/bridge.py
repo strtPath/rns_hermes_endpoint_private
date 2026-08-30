@@ -23,12 +23,6 @@ import LXMF
 import RNS
 
 from hermes_reticulum.core.adapter import prepare_reply, split_message
-from hermes_reticulum.core.downlink import (
-    MIN_CHUNK_INTERVAL_MS,
-    DownlinkTracker,
-    downlink_tracker,
-    sequence_chunks,
-)
 from hermes_reticulum.core.profiler import ChannelMetrics, ChannelProfiler
 
 logger = logging.getLogger("hermes_reticulum.bridge")
@@ -212,17 +206,7 @@ class LXMFBridge:
         # Channel profiler for adaptive responses
         self.profiler = ChannelProfiler()
 
-        # Downlink reliability: chunk sequencing, first-hop receipt logging,
-        # and per-recipient burst pacing.
-        self.downlink = DownlinkTracker()
-
-        # Monotonic counter for outbound chunk sequence ids (per-recipient
-        # tags are derived from this; keeps journalctl correlation stable).
-        self._chunk_seq = 0
-        self._chunk_seq_lock = threading.Lock()
-        # seq -> monotonic dispatch time is tracked in self.downlink
-
-        # Thread pool for message processing
+        # Thread pool for non-blocking message processing
         self._pool: ThreadPoolExecutor | None = None
 
     @property
@@ -268,21 +252,12 @@ class LXMFBridge:
                 "Push reply to %s: %d chars → %d parts (max=%d)",
                 recipient_hex[:16], len(text), len(parts), max_chars,
             )
-            # Tag multi-part pushes so the recipient can spot gaps.
-            with self._chunk_seq_lock:
-                self._chunk_seq += 1
-                push_id = self._chunk_seq
-            parts = sequence_chunks(parts, f"p{push_id}")
         ok = False
-        # Burst pacing floor: 500ms between chunks to the same recipient.
-        # This is the minimum that keeps ordering clean on tcp_default and
-        # gives the rnode's LoRa radio a chance to drain between packets.
-        # (The old code slept a flat 0.5s here for the same reason; the
-        # per-profile send_delay_ms was for uplink-response shaping, which
-        # is a different path in _process_and_reply.)
         for i, part in enumerate(parts):
             if i > 0:
-                self.downlink.pace_wait(recipient_hex, MIN_CHUNK_INTERVAL_MS)
+                # LoRa profiles get a pause between posts; TCP doesn't care
+                # but 500ms is harmless and keeps ordering clean.
+                time.sleep(0.5)
             if self.send_reply(recipient_hex, part, source_identity):
                 ok = True
         return ok
@@ -360,50 +335,6 @@ class LXMFBridge:
         if self.destination:
             self.destination.announce()
             logger.info("Announced destination %s", self.address)
-
-    def _on_outbound(self, lxm, seq: int, recipient_hex: str):
-        """
-        LXMF-level delivery callback for one outbound chunk.
-
-        Fires on the RNS event-loop thread with the LXMessage once it
-        reaches a terminal state: DELIVERED (first-hop signed proof),
-        SENT/PROPAGATED (out on the network), or FAILED. Logs the
-        outcome with elapsed time since dispatch so journalctl shows,
-        per chunk: dispatched → acked/failed after N seconds.
-        """
-        from hermes_reticulum.core.downlink import receipt_label
-
-        state = getattr(lxm, "state", None)
-        try:
-            import LXMF
-            name = LXMF.LXMessage.states[state]
-        except (KeyError, TypeError, IndexError, AttributeError):
-            name = f"state_{state}"
-
-        # Elapsed since dispatch (tracker records it in next_seq).
-        with self.downlink._lock:
-            entry = self.downlink._outbound.get(seq)
-        dispatched_at = entry[1] if entry else getattr(lxm, "_hermes_dispatched_at", None)
-        elapsed = (time.monotonic() - dispatched_at) if dispatched_at else None
-        elapsed_s = f"{elapsed:.1f}s" if elapsed is not None else "?"
-
-        # Map LXMessage state → outcome label.
-        import LXMF
-        if state == getattr(LXMF.LXMessage, "DELIVERED", None):
-            outcome = "delivered"
-        elif state == getattr(LXMF.LXMessage, "SENT", None):
-            outcome = "propagated"
-        elif state == getattr(LXMF.LXMessage, "FAILED", None):
-            outcome = "failed"
-        else:
-            outcome = "unknown"
-
-        self.downlink.note_outcome(seq, outcome)
-
-        logger.info(
-            "Downlink ack seq=%d → %s state=%s after %s",
-            seq, recipient_hex[:8], name, elapsed_s,
-        )
 
     def _on_lxmf_message(self, message):
         """
@@ -542,7 +473,7 @@ class LXMFBridge:
                 "delivery",
             )
 
-            # Create the LXMF message.
+            # Create and dispatch the LXMF message
             lxm = LXMF.LXMessage(
                 dest,
                 self.destination,
@@ -550,20 +481,11 @@ class LXMFBridge:
                 desired_method=LXMF.LXMessage.DIRECT,
                 include_ticket=True,
             )
-
-            # Register a first-hop delivery callback so we log the real
-            # ack outcome (DELIVERED / PROPAGATED / FAILED) per chunk
-            # instead of the old fire-and-forget "dispatched" line.
-            seq = self.downlink.next_seq(recipient_hex)
-            lxm.register_delivery_callback(
-                lambda msg, _s=seq, _r=recipient_hex: self._on_outbound(msg, _s, _r)
-            )
-
             self.router.handle_outbound(lxm)
 
             logger.info(
-                "Reply dispatched to %s seq=%d (%d bytes)",
-                recipient_hex[:16], seq, len(text.encode("utf-8")),
+                "Reply dispatched to %s (%d bytes)",
+                recipient_hex[:16], len(text.encode("utf-8")),
             )
             return True
 
@@ -592,29 +514,10 @@ class LXMFBridge:
         self.start()
         self.announce()
 
-        # Set up signal handlers for graceful shutdown.
-        #
-        # SIGTERM/SIGINT arrive while we're blocked in the `time.sleep(1)`
-        # loop below (Python signals are only delivered between bytecodes).
-        # The old handler only set `self._running = False` and relied on the
-        # loop to notice, but the RNS/LXMF C-level event-loop threads keep
-        # the process alive and the loop is not the right thing to rely on —
-        # `systemctl stop/restart` hung (see
-        # references/stop-restart-sigterm-hang.md).
-        #
-        # Fix: call `RNS.exit(0)` from the handler. That unwinds RNS cleanly
-        # (Transport.detach_interfaces + exit_handler, identity save, log
-        # detach) and then `os._exit(0)` — the process actually terminates on
-        # SIGTERM, which is what systemd's stop phase needs.
+        # Set up signal handlers for graceful shutdown
         def _handle_signal(signum, frame):
-            logger.info("Signal %s received, shutting down (RNS.exit)...", signum)
-            try:
-                RNS.exit(0)
-            except Exception:
-                # RNS may already be mid-shutdown or not fully initialised;
-                # force-terminate as a last resort.
-                logger.exception("RNS.exit failed during signal handling")
-                os._exit(1)
+            logger.info("Signal %s received, shutting down...", signum)
+            self._running = False
 
         signal.signal(signal.SIGTERM, _handle_signal)
         signal.signal(signal.SIGINT, _handle_signal)
