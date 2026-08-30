@@ -54,9 +54,28 @@ def _deny_veto(hermes) -> None:
     - legacy ack-then-veto: ControlServer POST /step kind='gate' → on_deny
     - pre-exec: the mesh-tool-gate plugin refuses the dangerous tool and
       the model's turn is then aborted.
+
+    Idempotency / loop guard: a veto only makes sense when a hermes child is
+    actually in-flight. If the child is already gone (an operator denial that
+    lands late, or a re-fired gate with no live turn), there is nothing to
+    abort — acting on it would re-open the same gate and spin a kill/retry
+    loop. So: only log + stop when a child is running; otherwise no-op.
     """
+    if not hermes.is_running():
+        logging.getLogger("hermes_reticulum.cli").debug(
+            "mesh denied tool but no in-flight child — ignoring "
+            "(stop_requested=%s guard_killed=%s deny_veto=%s)",
+            getattr(hermes, "_stop_requested", None),
+            getattr(hermes, "_guard_killed", None),
+            getattr(hermes, "_deny_veto", None),
+        )
+        return
     logging.getLogger("hermes_reticulum.cli").info(
-        "mesh denied tool — aborting in-flight child"
+        "mesh denied tool — aborting in-flight child "
+        "(stop_requested=%s guard_killed=%s deny_veto=%s)",
+        getattr(hermes, "_stop_requested", None),
+        getattr(hermes, "_guard_killed", None),
+        getattr(hermes, "_deny_veto", None),
     )
     hermes.stop()
 
