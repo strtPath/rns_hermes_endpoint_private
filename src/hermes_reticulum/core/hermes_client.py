@@ -778,7 +778,8 @@ class HermesClient:
                     logger.warning(
                         "Liveness guard killed the child after a full "
                         "%.0fms window — model was slow, not wedged; "
-                        "skipping retry (would re-burn the window)"
+                        "skipping retry (would re-burn the window)",
+                        getattr(self, "_last_run_ms", 0.0),
                     )
                     result = (
                         f"⏱️ Turn ran past the liveness window "
@@ -827,7 +828,13 @@ class HermesClient:
             for line in stream:
                 parts.append(line)
                 _touch()
-            stream.close()
+            # Real subprocess.PIPE file objects have .close(); test mocks may
+            # pass plain iterators, which don't.
+            if hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001 — cleanup must not raise
+                    pass
 
         def _watchdog():
             if not self.liveness_timeout:

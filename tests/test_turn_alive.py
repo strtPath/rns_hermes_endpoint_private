@@ -23,11 +23,14 @@ def make_client(liveness_timeout=2):
     return c
 
 
-def _write_marker(path, session, phase="tool", age=0.0):
+def _write_marker(path, session, phase="tool", age=0.0, gen=None):
     """Write a marker file, backdating its mtime by ``age`` seconds."""
+    payload = {"session": session, "ts": time.time(), "phase": phase}
+    if gen is not None:
+        payload["gen"] = gen
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"session": session, "ts": time.time(), "phase": phase}, f)
+        json.dump(payload, f)
     os.replace(tmp, path)
     if age:
         then = time.time() - age
@@ -114,23 +117,27 @@ class TestGuardWithMarker(unittest.TestCase):
     def tearDown(self):
         self.dir.cleanup()
 
-    def _write_child(self, body):
+    def _write_child(self, body, gen=None):
         child = os.path.join(self.dir.name, "child.py")
         with open(child, "w", encoding="utf-8") as f:
             f.write(
                 "import time, json, os, sys\n"
                 "marker = %r\n"
                 "sess = %r\n"
+                "gen = %r\n"
                 "def beat(s):\n"
+                "    payload = {'session': s, 'ts': time.time(), "
+                "'phase': 'tool'}\n"
+                "    if gen is not None:\n"
+                "        payload['gen'] = gen\n"
                 "    with open(marker + '.tmp', 'w') as fh:\n"
-                "        json.dump({'session': s, 'ts': time.time(), "
-                "'phase': 'tool'}, fh)\n"
+                "        json.dump(payload, fh)\n"
                 "    os.replace(marker + '.tmp', marker)\n"
                 "\n"
                 "%s\n"
                 "print('child-done')\n"
                 "sys.exit(0)\n"
-                % (self.marker, "mesh-guard-test", body)
+                % (self.marker, "mesh-guard-test", gen, body)
             )
         return child
 
@@ -144,6 +151,10 @@ class TestGuardWithMarker(unittest.TestCase):
         so the marker is continuously fresh. The test child mimics that by
         re-beating the marker before the long silent sleep — the same way
         the hook would beat it in production."""
+        # The test drives _run_with_liveness_guard directly (no chat()), so
+        # the generation is never bumped — it stays at its initial 0. The
+        # child must therefore beat the marker with gen=0 to match.
+        child_gen = self.client.current_turn_alive_gen()
         child = self._write_child(
             "beat(sess)\n"
             "# Sleep 3s total (longer than liveness_timeout=2s), but beat\n"
@@ -154,12 +165,13 @@ class TestGuardWithMarker(unittest.TestCase):
             "beat(sess)\n"
             "time.sleep(1)\n"
             "beat(sess)\n"
-            "time.sleep(1)\n"
+            "time.sleep(1)\n",
+            gen=child_gen,
         )
         # Beat once more right before the run so the marker is fresh when
         # the child begins (in production the bridge does this via the
         # spawn-time start marker; the hook maintains it from there).
-        _write_marker(self.marker, "mesh-guard-test", age=0.0)
+        _write_marker(self.marker, "mesh-guard-test", age=0.0, gen=child_gen)
         start = time.monotonic()
         reply = self.client._run_with_liveness_guard(
             [sys.executable, child]

@@ -504,20 +504,25 @@ class LXMFBridge:
         if self._pool:
             self._pool.shutdown(wait=False)
 
-        # Reticulum handles cleanup internally
+    def _clean_exit(self):
+        # RNS C-level event-loop threads outlive the Python loop; force-exit after stop().
+        try:
+            self.stop()
+            RNS.exit(0)
+        except Exception:
+            os._exit(0)
 
     def run_forever(self):
-        """
-        Start the bridge and block until interrupted.
-        Convenience method for standalone operation.
-        """
+        """Start the bridge and block until interrupted."""
         self.start()
         self.announce()
 
-        # Set up signal handlers for graceful shutdown
+        # Signal handler returns immediately; teardown runs on a daemon thread
+        # so RNS.exit() can't deadlock against the C event loop holding the GIL.
         def _handle_signal(signum, frame):
             logger.info("Signal %s received, shutting down...", signum)
             self._running = False
+            threading.Thread(target=self._clean_exit, daemon=True).start()
 
         signal.signal(signal.SIGTERM, _handle_signal)
         signal.signal(signal.SIGINT, _handle_signal)

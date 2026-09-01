@@ -45,7 +45,7 @@ logger = logging.getLogger("hermes_reticulum.control_server")
 # Default port for the local control endpoint (override via env/args).
 DEFAULT_CONTROL_PORT = 8471
 TOKEN_FILE_NAME = "control_token"
-DEFAULT_APPROVAL_TIMEOUT = 120.0  # seconds to wait for /approve or /deny
+DEFAULT_APPROVAL_TIMEOUT = float(os.getenv("HERMES_MESH_APPROVAL_TIMEOUT", "900"))
 
 
 # ──────────────────────────────────────────────────────────────────────
