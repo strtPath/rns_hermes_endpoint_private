@@ -1,30 +1,4 @@
-"""Local HTTP control endpoint for the Hermes-Reticulum bridge.
-
-Bridges the two sides of the system:
-
-  * Hermes Agent hooks (``agent:step``, running inside the gateway process)
-    POST tool-step events here.
-  * The mesh (via slash commands handled by :mod:`commands`) drives
-    ``approve`` / ``deny`` / ``stop`` / ``steer`` here.
-
-Security model
---------------
-- Binds to 127.0.0.1 only (configurable, never expose it).
-- Every request must carry the shared token, either as
-  ``?token=...`` (query) or the ``X-Hermes-Token`` header.
-- The token is generated at bridge startup and written to a 0600 file
-  under the Reticulum storage dir; the hook reads it from there.
-
-Approval gate
--------------
-:func:`request_approval` blocks (in the hook's thread) until the operator
-answers via ``/approve`` or ``/deny`` on the mesh (or the timeout elapses).
-The hook calls it only for *risky* tool steps, so non-risky tools never
-add latency.
-
-The server runs on its own thread with a daemon thread-pool; it never
-blocks the bridge's message thread.
-"""
+"""Local HTTP control endpoint for the Hermes-Reticulum bridge."""
 
 from __future__ import annotations
 
@@ -42,15 +16,13 @@ from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("hermes_reticulum.control_server")
 
-# Default port for the local control endpoint (override via env/args).
+
 DEFAULT_CONTROL_PORT = 8471
 TOKEN_FILE_NAME = "control_token"
 DEFAULT_APPROVAL_TIMEOUT = float(os.getenv("HERMES_MESH_APPROVAL_TIMEOUT", "900"))
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Risk classification (deny-by-default gate for risky tools)
-# ──────────────────────────────────────────────────────────────────────
+
 
 # Tools that are read-only or harmless — they never gate.
 SAFE_TOOLS = {
@@ -96,9 +68,7 @@ def classify_tool(name: str) -> str:
     return "unknown"
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Control server
-# ──────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class ControlState:
@@ -118,19 +88,7 @@ class ControlState:
 
 
 class ControlServer:
-    """Threaded local HTTP server for tool-step events and control ops.
-
-    Usage::
-
-        ctrl = ControlServer(token="...", storage_path="~/.lxmf/storage")
-        ctrl.start()
-        ...
-        ctrl.stop()
-
-    The hook POSTs to ``/step``; mesh commands call
-    :meth:`answer_approval` / :meth:`queue_steer` directly (same process),
-    or POST to ``/approve`` / ``/deny`` / ``/steer`` (for external drivers).
-    """
+    """Threaded local HTTP server for tool-step events and control ops."""
 
     def __init__(
         self,
@@ -167,22 +125,10 @@ class ControlServer:
         self._token_path: Optional[Path] = None
         if storage_path:
             self._persist_token(storage_path)
-        # Bounded work queue for *mesh-bound* side effects (tool pushes,
-        # full-step chunks, "gate opened" notices). These are fired from the
-        # HTTP handler thread; if a mesh peer is offline/slow they can block
-        # for a long time, which would wedge the request thread — and, for
-        # the hook's blocking gate POST, the *gateway* event loop that called
-        # it. So we enqueue and return immediately; a single dedicated
-        # worker drains the queue (FIFO → preserves message order), and the
-        # approval *wait* (request_approval's event.wait) is NOT moved here —
-        # it stays inline because it's the only thing the hook's gate must
-        # actually block on.
-        # Bounded (256) so a flood can't grow memory unboundedly; when full we
-        # drop + log (a lost "🔧 tool" push is cosmetic, a wedged bridge is not).
+        # Bounded so a flood can't grow memory unboundedly; drop + log when full.
         self._relay_q: "queue.Queue" = queue.Queue(maxsize=256)
         self._relay_worker: Optional[threading.Thread] = None
 
-    # ── token ────────────────────────────────────────────────────────
 
     def _persist_token(self, storage_path: str) -> None:
         base = Path(storage_path).expanduser()
@@ -198,7 +144,6 @@ class ControlServer:
     def token_path(self) -> Optional[Path]:
         return self._token_path
 
-    # ── lifecycle ────────────────────────────────────────────────────
 
     def start(self) -> bool:
         if self._thread is not None:
@@ -242,7 +187,6 @@ class ControlServer:
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
-    # ── mesh relay queue (offload blocking mesh sends) ───────────────
 
     def _start_relay_worker(self) -> None:
         if self._relay_worker is not None:
@@ -290,8 +234,6 @@ class ControlServer:
                 getattr(fn, "__name__", fn),
             )
 
-    # ── approval gate API (used by the hook via POST /step, and by
-    # mesh commands in-process) ───────────────────────────────────────
 
     def request_approval(
         self,
@@ -356,7 +298,6 @@ class ControlServer:
     def turn_recap(self, session_name: str) -> list[ToolStep]:
         return list(self.state.turn_steps.get(session_name, []))
 
-    # ── HTTP plumbing ────────────────────────────────────────────────
 
     def _handle_post(self, path: str, body: dict, token_ok: bool) -> tuple[int, str]:
         st = self.state
@@ -367,8 +308,7 @@ class ControlServer:
             session = body.get("session", "")
             if not session:
                 return 400, "missing session"
-            # The hook already decided this tool is risky (it only POSTs
-            # risky steps for the gate; safe steps come as kind='report').
+            # Hook only POSTs risky steps for the gate; safe steps come as kind='report'.
             kind = body.get("kind", "gate")
             name = body.get("tool", "tool")
             args = body.get("args")
@@ -378,42 +318,28 @@ class ControlServer:
                             is_error=is_error)
             self.record_step(session, step)
             if kind == "gate":
-                # Block until /approve or /deny (or timeout). On deny the
-                # operator wants this turn aborted, so the bridge kills
-                # its in-flight hermes child immediately.
+                # Offload the mesh push; approval wait stays inline (hook blocks on it).
                 if self.on_gate_open is not None:
-                    # "gate opened" is a mesh push (blocking LXMF send) →
-                    # offload it so it can't wedge the request thread while
-                    # the approval wait below runs inline. Pass the tool
-                    # label; command/description stay empty for the ack
-                    # gate (the /gate/notify pre-exec path fills them).
+                    # Mesh push → offload; command/description empty for ack gate.
                     self.relay(self.on_gate_open, session, name, "", "")
                 decision = self.request_approval(session, name)
                 if decision == "deny" and self.on_deny is not None:
-                    # on_deny vetoes the turn (kills the hermes child) —
-                    # fast and in-process, safe inline; still offload so a
-                    # misbehaving callback can't block the reply.
+                    # Veto kills the hermes child; offload so a bad callback can't block.
                     self.relay(self.on_deny, session)
                 return 200, decision
-            # kind == "report": fire the live "💻 tool" mesh push OFF the
-            # request thread. The hook POSTs this and does NOT block on its
-            # reply, so returning immediately is safe and keeps the gateway
-            # loop (for the hook) unblocked.
+            # kind == "report": fire-and-forget mesh push; hook doesn't block on reply.
             if self.on_step is not None:
                 self.relay(self.on_step, session, step)
             return 200, "ok"
 
         if path == "/step/full":
-            # Step-through mode: the hook POSTs the full tool call + full
-            # output as a pre-formatted text body.  We chunk it into
-            # multiple LXMF posts (user-approved bandwidth cost).
+            # Step-through: chunk full tool output into multiple LXMF posts.
             session = body.get("session", "")
             text = body.get("body", "")
             if not session or not text:
                 return 400, "missing session/body"
             if self.on_full_step is not None:
-                # Chunking + multiple LXMF sends is the *most* blocking path
-                # (a 32KB step is ~21 posts × 0.5s). Offload it entirely.
+                # Most blocking path (32KB ≈ 21 posts × 0.5s) → offload entirely.
                 self.relay(self.on_full_step, session, text)
             else:
                 logger.warning(
@@ -428,17 +354,10 @@ class ControlServer:
             return (200, "ok") if ok else (409, "no pending approval")
 
         if path == "/gate/notify":
-            # Pre-execution gate from the in-process pre_tool_call plugin
-            # (mesh-tool-gate). The plugin has ALREADY run Hermes' own
-            # detect_dangerous_command, so by the time we're here the command
-            # is confirmed dangerous. We open an approval gate for this
-            # session, push the command to the mesh operator, and RETURN the
-            # verdict in the HTTP response (the plugin then blocks on the
-            # result). Reuses the existing /approve //deny resolution + on_gate
-            # push, so the operator's UX is identical to the ack-then-veto
-            # gate. Distinct from /step's kind='gate' (that path also fires
-            # on_deny to kill the hermes child — wrong for a pre-exec block,
-            # where we just refuse the tool and the model sees the reason).
+            # Pre-exec gate from mesh-tool-gate plugin. Command already confirmed
+            # dangerous by Hermes' detect_dangerous_command. Returns verdict in
+            # HTTP response (plugin blocks on it). Distinct from /step kind='gate':
+            # no on_deny here — we refuse the tool, model sees the reason.
             session = body.get("session", "")
             if not session:
                 return 400, "missing session"
@@ -446,7 +365,7 @@ class ControlServer:
             command = body.get("command", "")
             description = body.get("description", "")
             if self.on_gate_open is not None:
-                # Signature: (session, tool, command, description).
+                # (session, tool, command, description) — real values from pre-exec path.
                 self.relay(
                     self.on_gate_open, session, name, command, description
                 )
