@@ -86,6 +86,8 @@ class ControlState:
     _decisions: dict[str, str] = field(default_factory=dict)
     # session_name -> steering text queued for the next turn
     steer_text: dict[str, str] = field(default_factory=dict)
+    # session_name -> cumulative tool call count (session-scoped, never cleared)
+    session_tool_count: dict[str, int] = field(default_factory=dict)
 
 
 class ControlServer:
@@ -295,6 +297,7 @@ class ControlServer:
         st = self.state
         st.last_step[session_name] = step
         st.turn_steps.setdefault(session_name, []).append(step)
+        st.session_tool_count[session_name] = st.session_tool_count.get(session_name, 0) + 1
 
     def clear_turn(self, session_name: str) -> None:
         self.state.turn_steps.pop(session_name, None)
@@ -302,6 +305,9 @@ class ControlServer:
 
     def turn_recap(self, session_name: str) -> list[ToolStep]:
         return list(self.state.turn_steps.get(session_name, []))
+
+    def session_tool_total(self, session_name: str) -> int:
+        return self.state.session_tool_count.get(session_name, 0)
 
     def status_payload(self) -> dict[str, Any]:
         """Assemble the /status health dict for mesh self-diagnosis."""

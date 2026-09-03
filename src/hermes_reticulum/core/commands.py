@@ -18,6 +18,7 @@ required.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -66,23 +67,40 @@ def _cmd_status(ctx: CommandContext, args: str) -> str | None:
         "📊 Bridge status",
         f"  Model:      {h.get_model()}",
         session_line,
-        f"  Running:    {'yes' if h.is_running() else 'no'}",
-        f"  Hard cap:   {h.timeout}s",
-        f"  Liveness:   {h.liveness_timeout}s" + (" (off)" if not h.liveness_timeout else ""),
     ]
+    cs = ctx.control_server
+    # Bridge service health (uptime from the control endpoint)
+    if cs is not None:
+        uptime_s = time.monotonic() - cs._started
+        if uptime_s < 60:
+            uptime_str = f"up {int(uptime_s)}s"
+        elif uptime_s < 3600:
+            m, s = divmod(int(uptime_s), 60)
+            uptime_str = f"up {m}m{s:02d}s"
+        else:
+            h_uptime, rem = divmod(int(uptime_s), 3600)
+            m, s = divmod(rem, 60)
+            uptime_str = f"up {h_uptime}h{m:02d}m"
+        lines.append(f"  Bridge:     {uptime_str}")
+    else:
+        lines.append("  Bridge:     (control endpoint not wired)")
+    lines.append(f"  Turn:       {'in-flight' if h.is_running() else 'idle'}")
+    lines.append(f"  Hard cap:   {h.timeout}s")
+    lines.append(
+        f"  Liveness:   {h.liveness_timeout}s"
+        + (" (off)" if not h.liveness_timeout else "")
+    )
     total_tokens, msg_count, sid = h.session_token_stats()
     if sid:
         lines.append(f"  Tokens:     {total_tokens:,} across {msg_count} turns this session")
     else:
-        lines.append("  Tokens:     (session not persisted yet)")
-    cs = ctx.control_server
+        lines.append("  Tokens:      (not tracked by bridge)")
     if cs is not None:
         pending = cs.has_pending_approval(h.session_name)
-        steps = len(cs.turn_recap(h.session_name))
-        lines.append(
-            f"  Tools:      {steps} this turn"
-            + (" | ⏸️ AWAITING /approve or /deny" if pending else "")
-        )
+        total = cs.session_tool_total(h.session_name)
+        turn = len(cs.turn_recap(h.session_name))
+        suffix = " | ⏸️ AWAITING /approve or /deny" if pending else ""
+        lines.append(f"  Tools:      {total} this session ({turn} this turn){suffix}")
     return "\n".join(lines)
 
 

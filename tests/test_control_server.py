@@ -372,5 +372,112 @@ class TestStatusHttpEndpoint(unittest.TestCase):
         self.assertEqual(body.decode("utf-8"), "ok")
 
 
+class TestSessionToolCounter(unittest.TestCase):
+    """session_tool_total is cumulative across turns; clear_turn only resets per-turn."""
+
+    def test_increments_per_record_step(self):
+        s = ControlServer(port=0)
+        s.record_step("mesh-1", ToolStep(name="web_search"))
+        s.record_step("mesh-1", ToolStep(name="read_file"))
+        self.assertEqual(s.session_tool_total("mesh-1"), 2)
+        self.assertEqual(s.session_tool_total("other"), 0)
+
+    def test_not_reset_by_clear_turn(self):
+        s = ControlServer(port=0)
+        s.record_step("mesh-1", ToolStep(name="web_search"))
+        s.record_step("mesh-1", ToolStep(name="terminal"))
+        self.assertEqual(s.session_tool_total("mesh-1"), 2)
+        s.clear_turn("mesh-1")
+        # Per-turn resets, but session total persists
+        self.assertEqual(s.turn_recap("mesh-1"), [])
+        self.assertEqual(s.session_tool_total("mesh-1"), 2)
+        s.record_step("mesh-1", ToolStep(name="write_file"))
+        self.assertEqual(len(s.turn_recap("mesh-1")), 1)
+        self.assertEqual(s.session_tool_total("mesh-1"), 3)
+
+
+class TestCmdStatusOutput(unittest.TestCase):
+    """_cmd_status renders Bridge:, Turn:, Tools:, Tokens: lines correctly."""
+
+    def setUp(self):
+        self.cs = ControlServer(port=0)
+        # Record 3 tool calls so session total > turn total
+        self.cs.record_step("test-sesh", ToolStep(name="web_search"))
+        self.cs.record_step("test-sesh", ToolStep(name="read_file"))
+        self.cs.record_step("test-sesh", ToolStep(name="terminal"))
+        self.cs.clear_turn("test-sesh")  # turn now empty, session still 3
+
+    def _make_ctx(self, is_running=False, token_stats=(0, 0, None)):
+        """Build a CommandContext with a stub HermesClient."""
+        from hermes_reticulum.core.commands import CommandContext
+        from hermes_reticulum.core.model_command import ModelCommandHandler
+
+        h = _FakeHermesClient(
+            session_name="test-sesh",
+            model="gpt-4o",
+            is_running=is_running,
+            token_stats=token_stats,
+        )
+        mh = ModelCommandHandler(h, None)  # None mesh_client for test
+        return CommandContext(
+            hermes=h,
+            model_handler=mh,
+            control_server=self.cs,
+        )
+
+    def test_bridge_line_shows_up(self):
+        ctx = self._make_ctx()
+        from hermes_reticulum.core.commands import _cmd_status
+        out = _cmd_status(ctx, "")
+        self.assertIn("Bridge:", out)
+        self.assertIn("up ", out)  # uptime string present
+
+    def test_turn_line_not_running(self):
+        ctx = self._make_ctx()
+        from hermes_reticulum.core.commands import _cmd_status
+        out = _cmd_status(ctx, "")
+        self.assertIn("Turn:", out)
+        self.assertNotIn("Running:", out)
+        self.assertIn("idle", out)
+
+    def test_tools_line_format(self):
+        ctx = self._make_ctx()
+        from hermes_reticulum.core.commands import _cmd_status
+        out = _cmd_status(ctx, "")
+        self.assertIn("Tools:", out)
+        # Session total = 3, turn = 0 (cleared in setUp)
+        self.assertIn("3 this session (0 this turn)", out)
+
+    def test_tokens_not_tracked(self):
+        ctx = self._make_ctx(token_stats=(0, 0, None))
+        from hermes_reticulum.core.commands import _cmd_status
+        out = _cmd_status(ctx, "")
+        self.assertIn("not tracked by bridge", out)
+        self.assertNotIn("session not persisted", out)
+
+
+class _FakeHermesClient:
+    """Minimal stub for testing _cmd_status without a real HermesClient."""
+
+    def __init__(self, session_name="test", model="gpt-4o",
+                 is_running=False, token_stats=(0, 0, None)):
+        self.session_name = session_name
+        self._model = model
+        self._running = is_running
+        self._token_stats = token_stats
+        self._resume_id = None
+        self.timeout = 600
+        self.liveness_timeout = 300
+
+    def get_model(self):
+        return self._model
+
+    def is_running(self):
+        return self._running
+
+    def session_token_stats(self):
+        return self._token_stats
+
+
 if __name__ == "__main__":
     unittest.main()
