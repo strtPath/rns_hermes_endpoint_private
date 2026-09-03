@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 
 # Ensure project src is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../src"))
@@ -258,6 +259,117 @@ class TestRelayOffload(unittest.TestCase):
         s.record_step("mesh-z", ToolStep(name="web_search"))
         elapsed = time.time() - start
         self.assertLess(elapsed, 1.0)
+
+
+class TestStatusPayloadInProcess(unittest.TestCase):
+    """Exercise ControlServer.status_payload() without an HTTP hop."""
+
+    def setUp(self):
+        self.server = ControlServer(port=0)  # not started; in-process API
+
+    def test_has_exactly_the_four_keys(self):
+        p = self.server.status_payload()
+        self.assertEqual(set(p), {"model", "session", "uptime", "acl"})
+        self.assertEqual(
+            set(p["session"]),
+            {"running", "active_sessions", "pending_approvals"},
+        )
+
+    def test_model_null_until_wired(self):
+        self.assertIsNone(self.server.status_payload()["model"])
+        self.server._model = "gpt-4o"
+        self.assertEqual(self.server.status_payload()["model"], "gpt-4o")
+
+    def test_uptime_is_positive_and_increases(self):
+        time.sleep(0.02)  # let some monotonic time elapse past __init__
+        t1 = self.server.status_payload()["uptime"]
+        self.assertIsInstance(t1, float)
+        self.assertGreater(t1, 0.0)
+        time.sleep(0.02)
+        t2 = self.server.status_payload()["uptime"]
+        self.assertGreater(t2, t1)
+
+    def test_session_reports_pending_gate(self):
+        def wait_gate():
+            self.server.request_approval("mesh-st", "terminal", timeout=5)
+
+        t = threading.Thread(target=wait_gate)
+        t.start()
+        time.sleep(0.2)
+        try:
+            self.assertTrue(self.server.has_pending_approval("mesh-st"))
+            s = self.server.status_payload()["session"]
+            self.assertTrue(s["running"])
+            self.assertIn("mesh-st", s["pending_approvals"])
+            self.assertIn("mesh-st", s["active_sessions"])
+        finally:
+            self.server.answer_approval("mesh-st", approve=True)
+            t.join(timeout=6)
+        self.assertFalse(self.server.status_payload()["session"]["running"])
+
+    def test_acl_mode_reflects_env(self):
+        with mock.patch.dict(os.environ, {"HERMES_RETICUM_ALLOW_ALL": "true"}):
+            self.assertEqual(self.server.status_payload()["acl"], "open")
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_RETICUM_ALLOW_ALL": "false",
+             "HERMES_RETICUM_ALLOWED_USERS": "aa" * 16},
+        ):
+            self.assertEqual(self.server.status_payload()["acl"], "allowlist")
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_RETICUM_ALLOW_ALL": "false",
+             "HERMES_RETICUM_ALLOWED_USERS": ""},
+        ):
+            self.assertEqual(self.server.status_payload()["acl"], "closed")
+
+
+class TestStatusHttpEndpoint(unittest.TestCase):
+    """GET /status over a real ThreadingHTTPServer (ephemeral port)."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Bind port 0 → OS picks a free port; then read it back.
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.port = s.getsockname()[1]
+        cls.server = ControlServer(port=cls.port)
+        assert cls.server.start(), "control server failed to start"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def _get(self, path, token=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        if token is not None:
+            url += f"?token={token}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.headers.get("Content-Type"), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Content-Type"), e.read()
+
+    def test_status_happy_path(self):
+        code, ctype, body = self._get("/status", token=self.server._token)
+        self.assertEqual(code, 200)
+        self.assertEqual(ctype, "application/json")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(set(payload), {"model", "session", "uptime", "acl"})
+        self.assertIn("running", payload["session"])
+        self.assertIn("pending_approvals", payload["session"])
+
+    def test_status_requires_token(self):
+        self.assertEqual(self._get("/status")[0], 401)
+        self.assertEqual(self._get("/status", token="WRONG")[0], 401)
+
+    def test_health_unchanged(self):
+        code, ctype, body = self._get("/health", token=self.server._token)
+        self.assertEqual(code, 200)
+        self.assertIn("text/plain", ctype)
+        self.assertEqual(body.decode("utf-8"), "ok")
 
 
 if __name__ == "__main__":

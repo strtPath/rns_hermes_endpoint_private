@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -127,6 +129,10 @@ class ControlServer:
         # Bounded so a flood can't grow memory unboundedly; drop + log when full.
         self._relay_q: "queue.Queue" = queue.Queue(maxsize=256)
         self._relay_worker: Optional[threading.Thread] = None
+        # /status payload: monotonic start (uptime) + model id the bridge
+        # serves (null until the CLI wires it through).
+        self._started = time.monotonic()
+        self._model: Optional[str] = None
 
 
     def _persist_token(self, storage_path: str) -> None:
@@ -297,6 +303,37 @@ class ControlServer:
     def turn_recap(self, session_name: str) -> list[ToolStep]:
         return list(self.state.turn_steps.get(session_name, []))
 
+    def status_payload(self) -> dict[str, Any]:
+        """Assemble the /status health dict for mesh self-diagnosis."""
+        started = getattr(self, "_started", None)
+        return {
+            "model": self._model,
+            "session": {
+                "running": bool(
+                    self.state.turn_steps
+                    or self.state._pending
+                    or self.state.steer_text
+                ),
+                "active_sessions": sorted(
+                    set(self.state.turn_steps)
+                    | set(self.state._pending)
+                    | set(self.state.steer_text)
+                ),
+                "pending_approvals": sorted(self.state._pending.keys()),
+            },
+            "uptime": (
+                round(time.monotonic() - started, 3)
+                if started is not None else 0.0
+            ),
+            "acl": self._acl_mode(),
+        }
+
+    def _acl_mode(self) -> str:
+        allow_all = os.getenv("HERMES_RETICUM_ALLOW_ALL", "true").lower()
+        if allow_all in ("true", "1", "yes"):
+            return "open"
+        allowed_raw = os.getenv("HERMES_RETICUM_ALLOWED_USERS", "").strip()
+        return "allowlist" if allowed_raw else "closed"
 
     def _handle_post(self, path: str, body: dict, token_ok: bool) -> tuple[int, str]:
         if not token_ok:
@@ -428,10 +465,27 @@ def _make_handler(server: ControlServer):
                 )
                 self.close_connection = True
 
+        def _send_json(self, code: int, obj: dict) -> None:
+            data = json.dumps(obj, default=str).encode("utf-8")
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/health":
                 self._send(200, "ok" if ctrl.running else "down")
+                return
+            if parsed.path == "/status":
+                if not self._token_ok():
+                    self._send(401, "unauthorized")
+                    return
+                self._send_json(200, ctrl.status_payload())
                 return
             self._send(404, "not found")
 
