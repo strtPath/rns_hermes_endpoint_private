@@ -5,7 +5,6 @@ Bridges LXMF messages into the Hermes gateway event loop so that
 the agent can process them like any other messaging platform.
 """
 
-import asyncio
 import logging
 import os
 
@@ -60,7 +59,6 @@ class ReticulumPlatformAdapter:
         self._hermes_client = None
         self._acl = None
         self._handle_message = None  # gateway callback
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = False
 
     def connect(self) -> bool:

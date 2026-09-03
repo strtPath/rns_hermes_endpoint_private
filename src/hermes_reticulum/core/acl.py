@@ -12,6 +12,9 @@ import os
 
 logger = logging.getLogger("hermes_reticulum.acl")
 
+# RNS truncated hash: 16 bytes = 32 hex chars.
+RNS_TRUNCATED_HASH_HEX_LEN = 32
+
 
 class AccessControl:
     """
@@ -48,17 +51,24 @@ class AccessControl:
         )
 
     @staticmethod
-    def _parse_hash_set(raw: str) -> set[str]:
+    def _normalize_hash(h: str) -> str:
+        """Lowercase and strip colons/spaces from a hex hash."""
+        return h.strip().lower().replace(" ", "").replace(":", "")
+
+    @classmethod
+    def _parse_hash_set(cls, raw: str) -> set[str]:
         """Parse comma-separated hex hashes into a normalized set."""
         if not raw.strip():
             return set()
         hashes = set()
         for h in raw.split(","):
-            h = h.strip().lower().replace(" ", "").replace(":", "")
-            if h and len(h) == 32:  # RNS truncated hash = 16 bytes = 32 hex chars
+            h = cls._normalize_hash(h)
+            if h and len(h) == RNS_TRUNCATED_HASH_HEX_LEN:
                 hashes.add(h)
             elif h:
-                logger.warning("Ignoring invalid hash in ACL: %s (expected 32 hex chars)", h)
+                logger.warning(
+                    "Ignoring invalid hash in ACL: %s (expected 32 hex chars)", h
+                )
         return hashes
 
     def is_allowed(self, sender_hash: str) -> bool:
@@ -72,7 +82,7 @@ class AccessControl:
             True if the sender is permitted.
         """
         # Normalize
-        normalized = sender_hash.lower().replace(":", "").replace(" ", "")
+        normalized = self._normalize_hash(sender_hash)
 
         # Blocklist takes priority
         if normalized in self.blocked_users:

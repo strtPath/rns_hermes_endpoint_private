@@ -30,7 +30,11 @@ def _load_dotenv():
         from dotenv import load_dotenv
 
         # Look for .env in CWD and project root
-        for candidate in [Path.cwd() / ".env", Path(__file__).resolve().parent.parent.parent / ".env"]:
+        candidates = [
+            Path.cwd() / ".env",
+            Path(__file__).resolve().parent.parent.parent / ".env",
+        ]
+        for candidate in candidates:
             if candidate.exists():
                 load_dotenv(candidate)
                 return
@@ -174,6 +178,7 @@ def cmd_run(args):
     # own chunked 💻 message to the peer that sent the message. The bridge's
     # child is a CLI process, so the gateway's agent:step hook never fires
     # for it — this is the path that actually delivers the per-tool messages.
+
     def _step_push(text: str) -> None:
         push = mesh_push.get(hermes.session_name)
         if push is None:
@@ -327,7 +332,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--storage", "-s", help="Storage path for identity/messages (default: env RETICULUM_STORAGE)"
+        "--storage", "-s",
+        help="Storage path for identity/messages (default: env RETICULUM_STORAGE)",
     )
 
     sub = parser.add_subparsers(dest="command", help="Command to run")

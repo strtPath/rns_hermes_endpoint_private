@@ -113,17 +113,11 @@ class TestHttpEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Bind port 0 → OS picks a free port; then read it back.
-        cls.server = ControlServer(port=0)
-        # Re-bind explicitly on port 0 and capture the chosen port.
         import socket
-        from http.server import ThreadingHTTPServer
-        handler = type(cls.server)._make_handler(cls.server) if hasattr(
-            type(cls.server), "_make_handler") else None
-        # Simpler: just call start() with a real ephemeral port via socket.
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             cls.port = s.getsockname()[1]
-        cls.server.port = cls.port
+        cls.server = ControlServer(port=cls.port)
         assert cls.server.start(), "control server failed to start"
 
     @classmethod

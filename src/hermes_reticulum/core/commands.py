@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from hermes_reticulum.core.hermes_client import HermesClient
@@ -57,10 +58,14 @@ def _cmd_stop(ctx: CommandContext, args: str) -> str | None:
 
 def _cmd_status(ctx: CommandContext, args: str) -> str | None:
     h = ctx.hermes
+    session_line = (
+        f"  Session:    {h.session_name}"
+        + (f" ({h._resume_id[:12]}…)" if h._resume_id else " (unpinned)")
+    )
     lines = [
         "📊 Bridge status",
         f"  Model:      {h.get_model()}",
-        f"  Session:    {h.session_name}" + (f" ({h._resume_id[:12]}…)" if h._resume_id else " (unpinned)"),
+        session_line,
         f"  Running:    {'yes' if h.is_running() else 'no'}",
         f"  Hard cap:   {h.timeout}s",
         f"  Liveness:   {h.liveness_timeout}s" + (" (off)" if not h.liveness_timeout else ""),
@@ -194,7 +199,7 @@ def _cmd_steer(ctx: CommandContext, args: str) -> str | None:
 
 def _cmd_verbose(ctx: CommandContext, args: str) -> str | None:
     verbose = args.strip().lower() in ("on", "1", "yes", "true")
-    if verbose == "":
+    if not args.strip():
         cur = bool(ctx.state.get("verbose", False))
         return f"Verbose tool detail: {'on' if cur else 'off'} (use /verbose on|off)"
     ctx.state["verbose"] = verbose
@@ -233,7 +238,6 @@ def _cmd_steps(ctx: CommandContext, args: str) -> str | None:
         # hermes_client flag (prompt prefix) + the state file the hook polls.
         ctx.hermes.set_step_mode(True)
         try:
-            from pathlib import Path
             Path(_step_mode_file_path()).write_text("1")
         except OSError:
             pass
@@ -246,14 +250,12 @@ def _cmd_steps(ctx: CommandContext, args: str) -> str | None:
     if arg in ("off", "0", "no", "false"):
         ctx.hermes.set_step_mode(False)
         try:
-            from pathlib import Path
             Path(_step_mode_file_path()).write_text("0")
         except OSError:
             pass
         return "👁️ Step-through OFF: back to the default terse recap."
     # No arg: report current state (from the file, the source of truth)
     try:
-        from pathlib import Path
         cur = Path(_step_mode_file_path()).read_text().strip() == "1"
     except OSError:
         cur = False

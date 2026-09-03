@@ -53,7 +53,7 @@ class StepThroughManager:
         self.hold_requested = False
 
 
-    def set_mode(self, enabled: bool):
+    def set_mode(self, enabled: bool) -> None:
         with self._lock:
             self.enabled = bool(enabled)
 
@@ -65,7 +65,6 @@ class StepThroughManager:
     def is_enabled(self) -> bool:
         with self._lock:
             return self.enabled
-
 
     def request_hold(self) -> None:
         """User pressed /hold: gate the next final reply until /go."""
@@ -104,7 +103,6 @@ class StepThroughManager:
         self.hold_requested = False
         _hold_release_var.set(True)
         self._write_hold_state(False)
-
 
 
 _default_step_through = StepThroughManager()
@@ -149,19 +147,15 @@ class LXMFBridge:
         self.enforce_stamps = enforce_stamps
         self.rns_config_path = str(rns_config_path) if rns_config_path else None
 
-
         self.reticulum: RNS.Reticulum | None = None
         self.router: LXMF.LXMRouter | None = None
         self.identity: RNS.Identity | None = None
         self.destination: RNS.Destination | None = None
 
-
         self._message_handler = None
         self._running = False
 
-
         self.profiler = ChannelProfiler()
-
 
         self._pool: ThreadPoolExecutor | None = None
 
@@ -213,9 +207,7 @@ class LXMFBridge:
         """Initialize RNS, create the LXM Router, register identity."""
         logger.info("Starting Hermes for Reticulum bridge...")
 
-
         self.storage_path.mkdir(parents=True, exist_ok=True)
-
 
         self.reticulum = RNS.Reticulum(self.rns_config_path)
         logger.info("Reticulum initialized")
@@ -225,7 +217,6 @@ class LXMFBridge:
             storagepath=str(self.storage_path),
             enforce_stamps=self.enforce_stamps,
         )
-
 
         identity_path = self.storage_path / "hermes_identity"
         if identity_path.exists():
@@ -241,16 +232,13 @@ class LXMFBridge:
             self.identity.to_file(str(identity_path))
             logger.info("Created new identity at %s", identity_path)
 
-
         self.destination = self.router.register_delivery_identity(
             self.identity,
             display_name=self.display_name,
             stamp_cost=self.stamp_cost,
         )
 
-
         self.router.register_delivery_callback(self._on_lxmf_message)
-
 
         self._pool = ThreadPoolExecutor(
             max_workers=_MAX_HANDLERS,
@@ -274,7 +262,6 @@ class LXMFBridge:
     def _on_lxmf_message(self, message):
         """Callback for incoming LXMF messages (runs in RNS event loop thread)."""
         try:
-
             if hasattr(message, "content_as_string"):
                 content = message.content_as_string()
             else:
@@ -285,7 +272,6 @@ class LXMFBridge:
             source_hash_raw = (
                 src_bytes.hex() if isinstance(src_bytes, bytes) else src_bytes.hex()
             )
-
 
             sig = "valid" if message.signature_validated else "invalid/unknown"
             method_name = {
@@ -299,13 +285,10 @@ class LXMFBridge:
                 source_hash, method_name, sig, content,
             )
 
-
             metrics = ChannelMetrics.from_lxmessage(message)
             profile = self.profiler.classify(metrics)
 
-
             if self._message_handler and self._pool:
-
                 source_identity = getattr(message, "source", None)
                 self._pool.submit(
                     self._process_and_reply, source_hash_raw, content, profile, source_identity,
@@ -323,7 +306,6 @@ class LXMFBridge:
         try:
             reply = self._message_handler(source_hash, content, profile)
             if reply:
-    
                 parts = prepare_reply(reply, profile)
                 for i, part in enumerate(parts):
                     if i > 0 and profile:
@@ -344,7 +326,6 @@ class LXMFBridge:
         # source_identity may be RNS.Destination or RNS.Identity — extract Identity.
         recipient_identity = source_identity
         if recipient_identity is not None:
-
             if hasattr(recipient_identity, "identity"):
                 recipient_identity = recipient_identity.identity
         if recipient_identity is None:
@@ -354,9 +335,7 @@ class LXMFBridge:
                 logger.error("Invalid recipient hash: %s", recipient_hex)
                 return False
 
-
             recipient_identity = RNS.Identity.recall(recipient_hash)
-
 
             if recipient_identity is None:
                 logger.info(
@@ -379,7 +358,6 @@ class LXMFBridge:
             return False
 
         try:
-
             dest = RNS.Destination(
                 recipient_identity,
                 RNS.Destination.OUT,
@@ -387,7 +365,6 @@ class LXMFBridge:
                 "lxmf",
                 "delivery",
             )
-
 
             lxm = LXMF.LXMessage(
                 dest,

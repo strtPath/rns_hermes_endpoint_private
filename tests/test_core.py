@@ -2,8 +2,6 @@
 Tests for Hermes for Reticulum.
 """
 
-from unittest.mock import MagicMock
-
 import hermes_reticulum.core.hermes_client as _hc
 from hermes_reticulum.core.acl import AccessControl
 from hermes_reticulum.core.hermes_client import HermesClient, find_hermes_bin

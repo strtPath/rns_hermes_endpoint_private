@@ -51,12 +51,13 @@ class TestGuardKillFlag(unittest.TestCase):
         # we assert the branch in the real method, so call the error helper
         # logic directly: with _guard_killed True, the method must NOT call
         # _error_reply. Verify by monkey-patching the proc flow via a stub.
-        import subprocess
 
         class FakeProc:
             returncode = -9
+
             def poll(self):
                 return -9
+
             def wait(self, timeout=None):
                 pass
 
@@ -77,7 +78,9 @@ class TestTurnSerialization(unittest.TestCase):
         order = []
         with c._turn_lock:
             order.append("first")
-        t = threading.Thread(target=lambda: (c._turn_lock.acquire(), order.append("second"), c._turn_lock.release()))
+        t = threading.Thread(
+            target=lambda: (c._turn_lock.acquire(), order.append("second"), c._turn_lock.release())
+        )
         t.start()
         with c._turn_lock:
             order.append("third")

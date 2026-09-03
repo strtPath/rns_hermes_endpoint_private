@@ -18,21 +18,17 @@ logger = logging.getLogger("hermes_reticulum.profiler")
 # ═══════════════════════════════════════════════════════════════
 # Bitrate thresholds (bits per second)
 # ═══════════════════════════════════════════════════════════════
-LORA_MAX_BITRATE = 50_000       # LoRa SF12: ~250bps, SF7: ~5.5kbps
-                                  # Threshold: 50kbps separates LoRa from TCP
-TCP_MIN_BITRATE = 100_000       # Conservative minimum for TCP/Ethernet
+LORA_MAX_BITRATE = 50_000       # LoRa SF12: ~250bps, SF7: ~5.5kbps; threshold separating LoRa from TCP
 
 # ═══════════════════════════════════════════════════════════════
 # RSSI thresholds (dBm)
 # ═══════════════════════════════════════════════════════════════
 RSSI_POOR = -110                # Below this = very weak signal
-RSSI_FAIR = -95                 # Above this = acceptable signal
 
 # ═══════════════════════════════════════════════════════════════
 # SNR thresholds (dB)
 # ═══════════════════════════════════════════════════════════════
 SNR_POOR = 5                    # Below this = noisy channel
-SNR_GOOD = 10                   # Above this = clean channel
 
 
 @dataclass
@@ -75,16 +71,16 @@ class ChannelMetrics:
         hops = None
         try:
             bitrate = RNS.Transport.next_hop_interface_bitrate(src_bytes)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — optional telemetry, never fatal
+            logger.debug("bitrate lookup failed for %s: %s", source_hash[:16], e)
         try:
             hw_mtu = RNS.Transport.next_hop_interface_hw_mtu(src_bytes)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — optional telemetry, never fatal
+            logger.debug("hw_mtu lookup failed for %s: %s", source_hash[:16], e)
         try:
             hops = RNS.Transport.hops_to(src_bytes)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — optional telemetry, never fatal
+            logger.debug("hops lookup failed for %s: %s", source_hash[:16], e)
 
         return cls(
             rssi=rssi,

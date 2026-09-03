@@ -6,7 +6,6 @@ import logging
 import os
 import queue
 import secrets
-import socket
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -300,7 +299,6 @@ class ControlServer:
 
 
     def _handle_post(self, path: str, body: dict, token_ok: bool) -> tuple[int, str]:
-        st = self.state
         if not token_ok:
             return 401, "unauthorized"
 

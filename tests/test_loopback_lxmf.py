@@ -88,7 +88,7 @@ def main() -> int:
         identity.to_file(TEST_IDENTITY_FILE)
 
     # Attach to the shared RNS instance (abstract @rns/default).
-    reticulum = RNS.Reticulum()
+    RNS.Reticulum()
     print("[*] Attached to shared RNS instance.")
 
     router = LXMF.LXMRouter(storagepath=TEST_STORAGE_DIR)

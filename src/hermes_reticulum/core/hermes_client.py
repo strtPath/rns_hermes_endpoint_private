@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 logger = logging.getLogger("hermes_reticulum.hermes")
 
@@ -29,7 +30,6 @@ _STEP_DIAG_LOG = os.path.expanduser(
 def _diag(msg: str) -> None:
     """Append a one-line diagnostic to the step log (best-effort, never raises)."""
     try:
-        Path = __import__("pathlib").Path
         p = Path(_STEP_DIAG_LOG)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as f:
@@ -141,14 +141,14 @@ class HermesClient:
             )
         )
         self._turn_alive_gen = 0
-        self._turn_alive_lock = __import__("threading").Lock()
+        self._turn_alive_lock = threading.Lock()
         self.source_tag = source_tag
         self.extra_args = extra_args or []
         self.model = model or os.getenv("HERMES_MODEL", "").strip() or None
         self.session_name = os.getenv(
             "HERMES_SESSION_NAME", f"mesh-{source_tag}"
         )
-        self._model_lock = __import__("threading").Lock()
+        self._model_lock = threading.Lock()
         self._resume_id: str | None = None
         self._process: subprocess.Popen | None = None
         self._stop_requested = False
@@ -160,7 +160,7 @@ class HermesClient:
         # Serialize turns per model: two bridge turns must not race the same
         # local model (they would queue on the GPU and look dead to the
         # liveness guard). One turn at a time per HermesClient instance.
-        self._turn_lock = __import__("threading").Lock()
+        self._turn_lock = threading.Lock()
         # Steering text queued by /steer — injected as a prefix to the
         # *next* prompt (next hermes chat invocation), then cleared.
         self._steer_pending: str | None = None
@@ -303,10 +303,9 @@ class HermesClient:
         """Step mode: prefer the state file (source of truth) so the hook and
         the CLI-side watcher always agree, then fall back to the flag."""
         try:
-            from pathlib import Path
             if Path(self._step_mode_file_path()).read_text().strip() == "1":
                 self._step_mode = True
-        except (OSError, Exception):
+        except OSError:
             pass
         return self._step_mode
 
@@ -497,9 +496,6 @@ class HermesClient:
         Returns a list of ``{"name": str, "is_error": bool, "preview": str}``
         for the most recent ``limit`` tool messages (oldest first).
         """
-        import json
-        import sqlite3
-
         sid = self._resume_id or self._resolve_session_id()
         if not sid:
             return []
@@ -540,7 +536,9 @@ class HermesClient:
                     out.append({
                         "name": name,
                         "is_error": False,
-                        "preview": str(call["function"].get("arguments", ""))[:120],
+                        "preview": str(
+                            call["function"].get("arguments", "")
+                        )[:120],
                     })
         return out[-limit:]
 
@@ -558,9 +556,6 @@ class HermesClient:
         Returns the most recently active session whose title matches
         exactly, or None if no such session exists.
         """
-        import os
-        import sqlite3
-
         db_path = os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
@@ -601,8 +596,6 @@ class HermesClient:
         Sets self._resume_id (the concrete session ID to resume) or None.
         """
         if new_session:
-            import time
-
             self.session_name = f"mesh-{self.source_tag}-{int(time.time())}"
             self._resume_id = None
             logger.info("Session reset — new thread: %s", self.session_name)
@@ -1127,8 +1120,6 @@ class HermesClient:
         the session has not been persisted yet (e.g. before the first
         turn completes) or the DB is unreadable.
         """
-        import sqlite3
-
         sid = self._resume_id
         if not sid:
             sid = self._resolve_session_id()
@@ -1167,8 +1158,6 @@ class HermesClient:
         and clear the pinned ID — the next `chat()` call opens a brand-new
         thread with no prior context. This is what the `/new` command triggers.
         """
-        import time
-
         self.session_name = f"mesh-{self.source_tag}-{int(time.time())}"
         self._resume_id = None
         logger.info("Session reset — new thread: %s", self.session_name)

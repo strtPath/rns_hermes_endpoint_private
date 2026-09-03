@@ -25,8 +25,8 @@ def register(ctx):
     )
 
     def validate_config(config) -> bool:
-        """Validate that the platform config is usable."""
-        return True  # Minimal config needed — everything has defaults
+        """Config is always usable — every field has a default."""
+        return True
 
     def is_connected(config) -> bool:
         """Check if the adapter is currently connected."""

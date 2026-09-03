@@ -234,7 +234,7 @@ class ModelCommandHandler:
             "  /model reset    — clear the pin, use hermes default"
         )
 
-    def _persist(self):
+    def _persist(self) -> None:
         """Write the active model to disk (caller holds self._lock)."""
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
