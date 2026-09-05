@@ -86,6 +86,10 @@ class ControlState:
     _decisions: dict[str, str] = field(default_factory=dict)
     # session_name -> free-text deny reason (from /deny <reason>), if any
     _deny_reasons: dict[str, str] = field(default_factory=dict)
+    # session_name -> True when the operator explicitly answered the gate.
+    # Distinguishes explicit deny (model sees "denied by user") from timeout
+    # (model sees "timed out without user response").
+    _answered: dict[str, bool] = field(default_factory=dict)
     # session_name -> steering text queued for the next turn
     steer_text: dict[str, str] = field(default_factory=dict)
     # session_name -> cumulative tool call count (session-scoped, never cleared)
@@ -292,6 +296,7 @@ class ControlServer:
         st._decisions[session_name] = "approve" if approve else "deny"
         if not approve:
             st._deny_reasons[session_name] = reason
+        st._answered[session_name] = True
         st._pending[session_name].set()
         return True
 
@@ -430,8 +435,15 @@ class ControlServer:
             # operator's /deny reason, when given) so the plugin can block
             # with the gateway-aligned message and let the model continue.
             deny_reason = self.state._deny_reasons.pop(session, "")
-            if decision == "deny" and deny_reason:
-                return 200, json.dumps({"verdict": "deny", "reason": deny_reason})
+            answered = self.state._answered.pop(session, False)
+            if decision == "deny":
+                if answered and deny_reason:
+                    return 200, json.dumps({"verdict": "deny", "reason": deny_reason})
+                elif answered:
+                    return 200, "deny"
+                else:
+                    # Timeout — no explicit operator answer
+                    return 200, "timeout"
             return 200, decision
 
         if path == "/stop":

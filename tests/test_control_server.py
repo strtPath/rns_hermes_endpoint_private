@@ -323,7 +323,7 @@ class TestGateNotifyEndpoint(unittest.TestCase):
         self.assertEqual(denied, [])
 
     def test_gate_notify_timeout_denies(self):
-        """Timeout → deny-by-default, without needing an explicit answer."""
+        """Timeout → timeout verdict, without needing an explicit answer."""
         result = {}
         self.server.approval_timeout = 0.3
 
@@ -341,7 +341,7 @@ class TestGateNotifyEndpoint(unittest.TestCase):
         t.start()
         t.join(timeout=6)
         self.assertEqual(result.get("code"), 200)
-        self.assertEqual(result.get("body"), "deny")
+        self.assertEqual(result.get("body"), "timeout")
         self.assertFalse(self.server.has_pending_approval("mesh-test-789"))
 
 
