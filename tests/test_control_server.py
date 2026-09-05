@@ -249,8 +249,13 @@ class TestGateNotifyEndpoint(unittest.TestCase):
         self.assertEqual(result.get("code"), 200)
         self.assertEqual(result.get("body"), "approve")
 
-    def test_gate_notify_deny_path(self):
-        """A deny decision returns 'deny' and (Fix 4) fires on_deny."""
+    def test_gate_notify_deny_does_not_fire_on_deny(self):
+        """A deny decision returns 'deny' and does NOT fire on_deny.
+
+        Stage 2: Fix 4 (on_deny relay) is reverted — the mesh /deny now
+        matches Telegram gateway behavior: block the tool, tell the model
+        why, and let it continue. It must NOT kill the hermes child.
+        """
         denied = []
         self.server.on_deny = lambda session: denied.append(session)
         result = {}
@@ -273,11 +278,49 @@ class TestGateNotifyEndpoint(unittest.TestCase):
         t.join(timeout=6)
         self.assertEqual(result.get("code"), 200)
         self.assertEqual(result.get("body"), "deny")
-        # on_deny (offloaded via relay) must eventually fire → turn killed.
-        deadline = time.time() + 3
-        while not denied and time.time() < deadline:
+        # on_deny must NOT fire (we block + continue, not kill).
+        deadline = time.time() + 0.5
+        while time.time() < deadline:
             time.sleep(0.05)
-        self.assertEqual(denied, ["mesh-test-456"])
+        self.assertEqual(denied, [])
+
+    def test_gate_notify_deny_with_reason_returns_json(self):
+        """A deny with a reason returns a JSON body carrying the reason.
+
+        The plugin parses {"verdict": "deny", "reason": "..."} and surfaces
+        the operator's /deny <reason> in the BLOCKED message to the model.
+        """
+        denied = []
+        self.server.on_deny = lambda session: denied.append(session)
+        result = {}
+
+        def run():
+            code, body = self._post("/gate/notify", {
+                "session": "mesh-test-reason",
+                "tool": "terminal",
+                "command": "chmod 777 /etc/passwd",
+                "description": "sensitive chmod",
+            })
+            result["code"] = code
+            result["body"] = body
+
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.2)
+        self.assertTrue(self.server.has_pending_approval("mesh-test-reason"))
+        self.assertTrue(
+            self.server.answer_approval("mesh-test-reason", approve=False, reason="stop doing that")
+        )
+        t.join(timeout=6)
+        self.assertEqual(result.get("code"), 200)
+        payload = json.loads(result.get("body") or "{}")
+        self.assertEqual(payload["verdict"], "deny")
+        self.assertEqual(payload["reason"], "stop doing that")
+        # on_deny still must NOT fire.
+        deadline = time.time() + 0.5
+        while time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(denied, [])
 
     def test_gate_notify_timeout_denies(self):
         """Timeout → deny-by-default, without needing an explicit answer."""

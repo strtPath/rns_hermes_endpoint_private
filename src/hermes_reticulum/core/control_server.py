@@ -84,6 +84,8 @@ class ControlState:
     _pending: dict[str, threading.Event] = field(default_factory=dict)
     # session_name -> decision for pending approval ("approve" | "deny")
     _decisions: dict[str, str] = field(default_factory=dict)
+    # session_name -> free-text deny reason (from /deny <reason>), if any
+    _deny_reasons: dict[str, str] = field(default_factory=dict)
     # session_name -> steering text queued for the next turn
     steer_text: dict[str, str] = field(default_factory=dict)
     # session_name -> cumulative tool call count (session-scoped, never cleared)
@@ -275,12 +277,21 @@ class ControlServer:
             return "deny"  # timeout → deny-by-default
         return decision or "deny"
 
-    def answer_approval(self, session_name: str, approve: bool) -> bool:
-        """Resolve a pending gate. Returns True if a gate was pending."""
+    def answer_approval(
+        self, session_name: str, approve: bool, reason: str = ""
+    ) -> bool:
+        """Resolve a pending gate. Returns True if a gate was pending.
+
+        ``reason`` (an optional free-text from ``/deny <reason>``) is stored
+        so the /gate/notify handler can relay it back to the plugin, which
+        surfaces it in the BLOCKED message to the model.
+        """
         st = self.state
         if session_name not in st._pending:
             return False
         st._decisions[session_name] = "approve" if approve else "deny"
+        if not approve:
+            st._deny_reasons[session_name] = reason
         st._pending[session_name].set()
         return True
 
@@ -398,8 +409,7 @@ class ControlServer:
             # Pre-exec gate from mesh-tool-gate plugin. Command already confirmed
             # dangerous by Hermes' detect_dangerous_command. Returns verdict in
             # HTTP response (plugin blocks on it). Distinct from /step kind='gate':
-            # — a deny here kills the turn (fires on_deny) so the model stops
-            # instead of trying another approach.
+            # no on_deny here — we refuse the tool, model sees the reason.
             session = body.get("session", "")
             if not session:
                 return 400, "missing session"
@@ -415,9 +425,13 @@ class ControlServer:
                 session, name,
                 on_wait=lambda: None,
             )
-            if decision == "deny" and self.on_deny is not None:
-                # Veto kills the hermes child; offload so a bad callback can't block.
-                self.relay(self.on_deny, session)
+            # Restore the pre-Fix-4 behavior: a deny does NOT kill the turn.
+            # Instead we refuse the tool and return the verdict (plus the
+            # operator's /deny reason, when given) so the plugin can block
+            # with the gateway-aligned message and let the model continue.
+            deny_reason = self.state._deny_reasons.pop(session, "")
+            if decision == "deny" and deny_reason:
+                return 200, json.dumps({"verdict": "deny", "reason": deny_reason})
             return 200, decision
 
         if path == "/stop":

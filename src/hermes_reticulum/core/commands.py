@@ -196,7 +196,10 @@ def _cmd_deny(ctx: CommandContext, args: str) -> str | None:
     session = ctx.hermes.session_name
     if not session:
         return "No active mesh session."
-    if cs.answer_approval(session, approve=False):
+    reason = args.strip().strip('"')
+    if cs.answer_approval(session, approve=False, reason=reason):
+        if reason:
+            return f"⛔ Denied — {reason}."
         return "⛔ Denied — aborting this turn."
     return "No pending approval to deny."
 
