@@ -188,6 +188,120 @@ class TestHttpEndpoint(unittest.TestCase):
             self.assertEqual(e.code, 401)
 
 
+class TestGateNotifyEndpoint(unittest.TestCase):
+    """/gate/notify pre-exec gate (mesh-tool-gate plugin path)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.port = s.getsockname()[1]
+        cls.server = ControlServer(port=cls.port)
+        assert cls.server.start(), "control server failed to start"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def _post(self, path, body):
+        url = f"http://127.0.0.1:{self.port}{path}?token={self.server._token}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode("utf-8")
+
+    def test_gate_notify_opens_gate_and_approves(self):
+        """POST /gate/notify fires on_gate_open, marks pending, and a
+        subsequent approve resolves it to 'approve'."""
+        opened = []
+
+        def on_open(session, tool, command, description):
+            opened.append((session, tool, command, description))
+
+        self.server.on_gate_open = on_open
+        result = {}
+
+        def run():
+            code, body = self._post("/gate/notify", {
+                "session": "mesh-test-123",
+                "tool": "terminal",
+                "command": "rm -rf /",
+                "description": "dangerous rm",
+            })
+            result["code"] = code
+            result["body"] = body
+
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.2)
+        # on_gate_open fired with the resolved mesh thread name + real values.
+        self.assertEqual(opened, [
+            ("mesh-test-123", "terminal", "rm -rf /", "dangerous rm")
+        ])
+        self.assertTrue(self.server.has_pending_approval("mesh-test-123"))
+        self.assertTrue(self.server.answer_approval("mesh-test-123", approve=True))
+        t.join(timeout=6)
+        self.assertEqual(result.get("code"), 200)
+        self.assertEqual(result.get("body"), "approve")
+
+    def test_gate_notify_deny_path(self):
+        """A deny decision returns 'deny' and (Fix 4) fires on_deny."""
+        denied = []
+        self.server.on_deny = lambda session: denied.append(session)
+        result = {}
+
+        def run():
+            code, body = self._post("/gate/notify", {
+                "session": "mesh-test-456",
+                "tool": "terminal",
+                "command": "dd if=/dev/sda",
+                "description": "dd to raw device",
+            })
+            result["code"] = code
+            result["body"] = body
+
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.2)
+        self.assertTrue(self.server.has_pending_approval("mesh-test-456"))
+        self.assertTrue(self.server.answer_approval("mesh-test-456", approve=False))
+        t.join(timeout=6)
+        self.assertEqual(result.get("code"), 200)
+        self.assertEqual(result.get("body"), "deny")
+        # on_deny (offloaded via relay) must eventually fire → turn killed.
+        deadline = time.time() + 3
+        while not denied and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(denied, ["mesh-test-456"])
+
+    def test_gate_notify_timeout_denies(self):
+        """Timeout → deny-by-default, without needing an explicit answer."""
+        result = {}
+        self.server.approval_timeout = 0.3
+
+        def run():
+            code, body = self._post("/gate/notify", {
+                "session": "mesh-test-789",
+                "tool": "terminal",
+                "command": "chmod 777 /etc",
+                "description": "sensitive chmod",
+            })
+            result["code"] = code
+            result["body"] = body
+
+        t = threading.Thread(target=run)
+        t.start()
+        t.join(timeout=6)
+        self.assertEqual(result.get("code"), 200)
+        self.assertEqual(result.get("body"), "deny")
+        self.assertFalse(self.server.has_pending_approval("mesh-test-789"))
+
+
 class TestRelayOffload(unittest.TestCase):
     """Lock in the relay offload: record_step must return without waiting for
     the mesh callback, and the relay worker must actually run it.

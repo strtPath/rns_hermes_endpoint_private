@@ -398,7 +398,8 @@ class ControlServer:
             # Pre-exec gate from mesh-tool-gate plugin. Command already confirmed
             # dangerous by Hermes' detect_dangerous_command. Returns verdict in
             # HTTP response (plugin blocks on it). Distinct from /step kind='gate':
-            # no on_deny here — we refuse the tool, model sees the reason.
+            # — a deny here kills the turn (fires on_deny) so the model stops
+            # instead of trying another approach.
             session = body.get("session", "")
             if not session:
                 return 400, "missing session"
@@ -414,6 +415,9 @@ class ControlServer:
                 session, name,
                 on_wait=lambda: None,
             )
+            if decision == "deny" and self.on_deny is not None:
+                # Veto kills the hermes child; offload so a bad callback can't block.
+                self.relay(self.on_deny, session)
             return 200, decision
 
         if path == "/stop":
