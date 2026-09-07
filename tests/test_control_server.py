@@ -636,5 +636,51 @@ class _FakeHermesClient:
         return self._token_stats
 
 
+class TestCommandDispatcherAliases(unittest.TestCase):
+    """/a and /d must route to the same handlers as /approve and /deny."""
+
+    def _make_ctx(self):
+        from hermes_reticulum.core.commands import CommandContext
+        from hermes_reticulum.core.model_command import ModelCommandHandler
+
+        h = _FakeHermesClient(session_name="test-alias", model="gpt-4o")
+        # ModelCommandHandler tries to load a persisted model pin and call
+        # set_model() on the client; stub both so we don't touch real state.
+        with mock.patch.object(ModelCommandHandler, "_load", return_value=None):
+            mh = ModelCommandHandler(h, None)
+        return CommandContext(
+            hermes=h,
+            model_handler=mh,
+            control_server=ControlServer(port=0),
+        )
+
+    def test_a_routes_to_approve(self):
+        from hermes_reticulum.core.commands import CommandDispatcher
+
+        ctx = self._make_ctx()
+        d = CommandDispatcher(ctx)
+        # With no gate pending, /a must reach the approve handler (not None).
+        result = d.handle("/a")
+        self.assertIsNotNone(result)
+        self.assertIn("No pending approval", result)
+
+    def test_d_routes_to_deny(self):
+        from hermes_reticulum.core.commands import CommandDispatcher
+
+        ctx = self._make_ctx()
+        d = CommandDispatcher(ctx)
+        result = d.handle("/d")
+        self.assertIsNotNone(result)
+        self.assertIn("No pending approval", result)
+
+    def test_full_words_still_work(self):
+        from hermes_reticulum.core.commands import CommandDispatcher
+
+        ctx = self._make_ctx()
+        d = CommandDispatcher(ctx)
+        self.assertIn("No pending approval", d.handle("/approve") or "")
+        self.assertIn("No pending approval", d.handle("/deny") or "")
+
+
 if __name__ == "__main__":
     unittest.main()

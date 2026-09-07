@@ -361,35 +361,36 @@ class CommandDispatcher:
         args = parts[1] if len(parts) > 1 else ""
 
         # Normalize aliases (e.g. "/model" vs "model").
-        if command in ("model", "m"):
+        word = command.lstrip("/")
+        if word in ("model", "m"):
             command = "/model"
-        elif command in ("new",):
+        elif word in ("new",):
             command = "/new"
-        elif command in ("help", "commands"):
+        elif word in ("help", "commands"):
             command = "/help"
-        elif command in ("stop",):
+        elif word in ("stop",):
             command = "/stop"
-        elif command in ("approve", "a"):
+        elif word in ("approve", "a"):
             command = "/approve"
-        elif command in ("deny", "d"):
+        elif word in ("deny", "d"):
             command = "/deny"
-        elif command in ("steer",):
+        elif word in ("steer",):
             command = "/steer"
-        elif command in ("verbose",):
+        elif word in ("verbose",):
             command = "/verbose"
-        elif command in ("tools", "t"):
+        elif word in ("tools", "t"):
             command = "/tools"
-        elif command in ("status", "s"):
+        elif word in ("status", "s"):
             command = "/status"
-        elif command in ("pause", "p"):
+        elif word in ("pause", "p"):
             command = "/pause"
-        elif command in ("resume",):
+        elif word in ("resume",):
             command = "/resume"
-        elif command in ("retry", "r"):
+        elif word in ("retry", "r"):
             command = "/retry"
-        elif command in ("usage", "u"):
+        elif word in ("usage", "u"):
             command = "/usage"
-        elif command in ("version", "v"):
+        elif word in ("version", "v"):
             command = "/version"
 
         handler = COMMANDS.get(command)
