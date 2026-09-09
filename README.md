@@ -265,6 +265,43 @@ This is the primary scenario: **field hardware with no internet**, talking to an
 
 NomadNet, custom Python scripts using the [LXMF](https://github.com/markqvist/lxmf) library, or any Reticulum node configured for LXMF delivery can interact with the same bridge address. No Sideband-specific features are required.
 
+## Deployment
+
+### Pre-execution gate and timeout configuration
+
+The bridge includes a pre-execution approval gate: when the agent
+attempts a dangerous command, the operator on the mesh is prompted to
+`/approve` or `/deny` before the tool runs. The gate waits up to
+`MESH_GATE_TIMEOUT` seconds (default 900) for the operator's verdict.
+
+**This requires a matching Hermes setting.** The `pre_tool_call` hook
+that implements the gate runs on a worker thread with its own timeout,
+controlled by `plugins.hook_callback_timeout` in your Hermes
+`config.yaml` (default 30s). If this value is **shorter** than
+`MESH_GATE_TIMEOUT`, the hook times out and **blocks the tool before the
+operator's verdict arrives** — your `/approve` is too late, and the tool
+is fail-closed blocked even though you approved it.
+
+Set `plugins.hook_callback_timeout` to **at least** your
+`MESH_GATE_TIMEOUT` value:
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  hook_callback_timeout: 900   # must be >= MESH_GATE_TIMEOUT
+```
+
+| Setting | Where | Purpose |
+|---------|-------|---------|
+| `MESH_GATE_TIMEOUT` | bridge `.env` | How long the gate waits for your verdict (default 900s) |
+| `HERMES_MESH_APPROVAL_TIMEOUT` | bridge `.env` | Control-server-side gate wait (default 900s) |
+| `plugins.hook_callback_timeout` | Hermes `config.yaml` | Hook worker timeout — must be ≥ the above |
+
+If any of these are out of sync, the shortest one wins, and the tool is
+blocked before your verdict is processed.
+
+Full details: [docs/pre-tool-callback-timeout-issue.md](docs/pre-tool-callback-timeout-issue.md).
+
 ## Development
 
 ```bash
