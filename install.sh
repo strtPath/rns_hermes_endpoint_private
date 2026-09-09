@@ -123,18 +123,49 @@ if [[ ! -f "$ENV_FILE" && -f "$SCRIPT_DIR/config/env.example" ]]; then
     echo "    → Edit $ENV_FILE to customize"
 fi
 
+# ─── Copy plugins to ~/.hermes/plugins/ ───
+echo ""
+echo "Setting up Hermes plugins..."
+
+HERMES_PLUGINS_DIR="${HOME}/.hermes/plugins"
+mkdir -p "$HERMES_PLUGINS_DIR"
+
+# Reticulum adapter plugin (progress bubbles, step-through)
+RETICULUM_PLUGIN_SRC="$SCRIPT_DIR/src/hermes_reticulum/plugin"
+if [[ -d "$RETICULUM_PLUGIN_SRC" ]]; then
+    if [[ ! -d "$HERMES_PLUGINS_DIR/reticulum" ]]; then
+        cp -r "$RETICULUM_PLUGIN_SRC" "$HERMES_PLUGINS_DIR/reticulum"
+        echo "  ✓ Copied reticulum plugin to $HERMES_PLUGINS_DIR/reticulum/"
+    else
+        echo "  ✓ Reticulum plugin already at $HERMES_PLUGINS_DIR/reticulum/ (skipping)"
+    fi
+fi
+
+# Mesh tool gate plugin (pre-execution approval gate)
+GATE_PLUGIN_SRC="$SCRIPT_DIR/src/hermes_reticulum/mesh-tool-gate"
+if [[ -d "$GATE_PLUGIN_SRC" ]]; then
+    if [[ ! -d "$HERMES_PLUGINS_DIR/mesh-tool-gate" ]]; then
+        cp -r "$GATE_PLUGIN_SRC" "$HERMES_PLUGINS_DIR/mesh-tool-gate"
+        echo "  ✓ Copied mesh-tool-gate plugin to $HERMES_PLUGINS_DIR/mesh-tool-gate/"
+    else
+        echo "  ✓ mesh-tool-gate plugin already at $HERMES_PLUGINS_DIR/mesh-tool-gate/ (skipping)"
+    fi
+fi
+
 # ─── Done ───
 echo ""
 echo "═══ Installation complete! ═══"
 echo ""
 echo "Next steps:"
 echo "  1. Review and edit .env for your setup"
-echo "  2. Start the bridge:  hermes-reticulum run"
-echo "  3. Note the LXMF address printed on startup"
-echo "  4. Add this address as a contact in Sideband (Android)"
+echo "  2. Set plugins.hook_callback_timeout in ~/.hermes/config.yaml"
+echo "     to at least your MESH_GATE_TIMEOUT value (default: 900)."
+echo "     Without this, your /approve verdicts arrive after the hook"
+echo "     already blocked the tool (fail-closed)."
+echo "  3. Restart the Hermes gateway"
+echo "  4. Start the bridge:  hermes-reticulum run"
+echo "  5. Note the LXMF address printed on startup"
+echo "  6. Add this address as a contact in Sideband (Android)"
 echo ""
-echo "For Hermes gateway integration:"
-echo "  1. Copy plugin/ to ~/.hermes/plugins/reticulum/"
-echo "  2. Restart the Hermes gateway"
-echo "  3. Run 'hermes gateway status' to verify"
+echo "See README.md → Deployment for timeout configuration details."
 echo ""

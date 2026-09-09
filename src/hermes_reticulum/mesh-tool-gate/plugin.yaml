@@ -1,0 +1,16 @@
+name: mesh-tool-gate
+version: "1.0.0"
+kind: standalone
+description: >
+  Pre-execution approve/deny gate for the Reticulum/LXMF mesh bridge.
+  Runs in-process on the pre_tool_call hook (before any tool dispatches) and
+  reuses Hermes' OWN dangerous-command detection (tools/approval.py:
+  detect_hardline_command + detect_dangerous_command) so it blocks exactly
+  what Hermes already blocks by default — no duplicated patterns, no drift.
+  Hardline (no-recovery) commands are blocked outright; dangerous commands
+  escalate to a human approve/deny over the mesh control server (fail-closed
+  on timeout/no-answer); safe tools proceed silently (their output is still
+  streamed by the separate mesh-tool-events hook on agent:step).
+author: "strtPath"
+hooks:
+  - pre_tool_call

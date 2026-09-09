@@ -48,3 +48,6 @@ docs/
 *.egg-info/
 .venv/
 
+# Backup files
+*.bak
+
