@@ -38,6 +38,9 @@ class CommandContext:
     model_handler: ModelCommandHandler
     # ControlServer instance (None until the CLI wires it).
     control_server: ControlServer | None = None
+    # The running LXMFBridge (None in tests). Loosely typed to avoid an
+    # import cycle; handlers use getattr. Used for /status liveness state.
+    bridge: object | None = None
     # Free-form bag for handlers that need to stash cross-call state.
     state: dict = field(default_factory=dict)
 
@@ -55,6 +58,22 @@ def _cmd_stop(ctx: CommandContext, args: str) -> str | None:
     if killed:
         return "⛔ Stopped the running Hermes process."
     return "Nothing to stop — no active process."
+
+
+def _append_liveness(lines: list, ctx: CommandContext) -> None:
+    """Append the bridge-level liveness (Tier 4.5) line to /status output."""
+    bridge = getattr(ctx, "bridge", None)
+    lv = getattr(bridge, "liveness", None)
+    if lv is None:
+        lines.append("  Watchdog:   (not started — foreground/dev)")
+        return
+    snap = lv.snapshot()
+    if snap["rns_healthy"]:
+        age = snap.get("last_tick_age_s")
+        age_str = f"{int(age)}s ago" if age is not None else "never"
+        lines.append(f"  Watchdog:   ✓ RNS alive (heartbeat {age_str})")
+    else:
+        lines.append("  Watchdog:   ✗ RNS not responsive (systemd will restart)")
 
 
 def _cmd_status(ctx: CommandContext, args: str) -> str | None:
@@ -84,6 +103,20 @@ def _cmd_status(ctx: CommandContext, args: str) -> str | None:
         lines.append(f"  Bridge:     {uptime_str}")
     else:
         lines.append("  Bridge:     (control endpoint not wired)")
+    # Preflight health
+    from hermes_reticulum.core.preflight import run_preflight
+    hermes_bin = getattr(h, "hermes_bin", None)
+    pf = run_preflight(hermes_bin=hermes_bin)
+    if pf.ok:
+        lines.append("  Preflight:  ✓ ok")
+    else:
+        err_count = len(pf.errors)
+        warn_count = len(pf.warnings)
+        lines.append(f"  Preflight:  ✗ {err_count} error(s), {warn_count} warning(s)")
+        for e in pf.errors:
+            lines.append(f"    ✗ {e}")
+    # Bridge-level liveness (Tier 4.5): RNS-wedge watchdog state.
+    _append_liveness(lines, ctx)
     lines.append(f"  Turn:       {'in-flight' if h.is_running() else 'idle'}")
     lines.append(f"  Hard cap:   {h.timeout}s")
     lines.append(
@@ -417,10 +450,12 @@ def build_dispatcher(
     hermes: HermesClient,
     model_handler: ModelCommandHandler,
     control_server: ControlServer | None = None,
+    bridge=None,
 ) -> CommandDispatcher:
     ctx = CommandContext(
         hermes=hermes,
         model_handler=model_handler,
         control_server=control_server,
+        bridge=bridge,
     )
     return CommandDispatcher(ctx)

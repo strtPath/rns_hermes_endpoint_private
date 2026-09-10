@@ -5,7 +5,7 @@ parity with the Hermes **Telegram** gateway, so the mesh endpoint is a first-cla
 way to talk to the agent, not a degraded one. This is a living doc — update the
 Status column as we land items._
 
-_Last updated: 2026-08-22. Owner: Holo + user._
+_Last updated: 2026-09-09. Owner: Holo + user._
 
 ---
 
@@ -37,7 +37,10 @@ the gap, grouped into four tiers by effort/value:
 | 1.2 | **Model responsiveness guard** | ✅ done | Liveness watchdog: kills `hermes` if zero stdout+stderr output for `HERMES_LIVENESS_TIMEOUT` (default 180s). `/stop` command kills manually. Pairs with slow 27b — threshold is configurable. |
 | 1.3 | **`/model` runtime discovery** | ✅ done | `model_command.py` now reads models from `config.yaml` at runtime (no hardcoded catalog). *(verified this session.)* |
 | 1.4 | **`/new`, `/help`, `/commands`** | ✅ done | `CommandDispatcher` in `commands.py`; `/new` confirmed via log `Session reset — new thread: mesh-reticulum-<ts>`. *(verified this session.)* |
-| 1.5 | **Startup loud-fail on missing `hermes`** | ⚠️ partial | `find_hermes_bin()` raises `RuntimeError`; service unit now pins `PATH`. Add a clear, actionable startup message + a `/status`-style check. |
+| 1.5 | **Startup loud-fail on missing `hermes`** | ✅ done | `core/preflight.py` — `run_preflight()` checks binary (+`--version`), storage, config, plugins. CLI `run` logs all checks; missing binary → `sys.exit(1)` before RNS starts. Mesh `/status` shows `Preflight: ✓ ok` or `✗ N error(s)` with the error lines. CLI `status` subcommand renders the full preflight. |
+| 1.6 | **SIGTERM clean exit** | ✅ done | `_handle_signal()` → daemon thread → `_clean_exit()`: `stop()` → `RNS.exit(0)`, `os._exit(0)` last resort. Verified: `kill -TERM` exits within 3s (was: indefinite hang). Commit `36d94bb`. |
+| 1.7 | **Downlink acks / RSSI/SNR profiler** | ⚠️ partial | `1322e89` landed but was reverted (`1d71cf3`, `e67652f`) — the SIGTERM piece was split into 1.6. Acks + profiler remain open. See `docs/mesh-bridge-findings-2026-08-29-downlink-burst-loss-and-recap-replay.md`. |
+| 1.8 | **Liveness heartbeat (generation-scoped)** | ✅ done | Per-child generation counter; marker requires session match + gen match + mtime. Slow-but-working child stays warm; genuinely wedged child still killed. Commit `a154d7c`. |
 
 ---
 
@@ -77,40 +80,40 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | `/model` lists all providers | ⏸️ backlog | Currently only surfaces `custom_providers` (HecateV). Should also list `fallback_providers` (e.g. the OpenRouter entry) and the top-level default, grouped by provider. Requires `set_model` to pin **provider + model** (not just model name) so the pin survives and targets the right provider. |
 
 **High value — do next (cheap + closes real pain):**
-| Command | Description | Why it matters for mesh |
-|---------|-------------|-------------------------|
-| `/status` | Session, model, token, context info | Self-diagnosis over mesh (also Tier 4) |
-| `/stop` | Kill running background processes | Escapes a hung 27b run (pairs with 1.2) |
-| `/pause` | Global emergency stop (`/pause off` resumes) | Mesh-specific safety valve |
-| `/approve` / `/deny` | Approve/deny pending dangerous commands | The gateway's approval model over mesh |
-| `/retry` | Resend last message | Cheap, useful when a reply garbles |
-| `/whoami` | Show slash-command access level | Debugging ACL over mesh |
-| `/usage` | Token usage / rate limits | Observability |
-| `/version` | Hermes version | Trivial, good for `/help` |
+| Command | Status | Why it matters for mesh |
+|---------|--------|-------------------------|
+| `/status` | ✅ done | Self-diagnosis over mesh (also Tier 4.3) |
+| `/stop` | ✅ done | Escapes a hung 27b run (pairs with 1.2 liveness guard) |
+| `/pause` | ✅ done | Mesh-specific safety valve |
+| `/approve` / `/deny` | ✅ done | The gateway's approval model over mesh |
+| `/retry` | ✅ done | Cheap, useful when a reply garbles |
+| `/whoami` | ⏸️ deferred | Debugging ACL over mesh (needs ACL access-level plumbing) |
+| `/usage` | ✅ done | Observability |
+| `/version` | ✅ done | Trivial, good for `/help` |
 
 **Session control — medium value:**
-| Command | Description |
-|---------|-------------|
-| `/resume [name]` | Resume a named session (complements `/new`) |
-| `/branch [name]` (alias `/fork`) | Branch the current session |
-| `/compress` (alias `/compact`) | Compress context; `--preview` to preview |
-| `/undo [N]` | Back up N user turns and re-prompt |
-| `/title [name]` | Title the current session |
-| `/sessions` | Browse/resume previous sessions |
-| `/background` (alias `/bg`, `/btw`) | Run a prompt in the background |
-| `/queue` (alias `/q`) | Queue a prompt without interrupting |
-| `/steer` | Inject a message after next tool call |
-| `/agents` (alias `/tasks`) | Show active agents / running tasks |
-| `/loop` (alias `/proactive`) | Re-run a prompt on interval |
-| `/goal` | Standing goal across turns |
-| `/heartbeat` (alias `/hb`) | Recurring prompt when idle |
-| `/restart` | Gracefully restart the gateway after draining |
-| `/save` | Export conversation (json/md/html) |
-| `/refine` | Save lessons to memory/skills |
-| `/moa` | Mixture-of-Agents preset |
-| `/subgoal` | Manage extra criteria on active goal |
-| `/sethome` (alias `/set-home`) | Set chat as home channel |
-| `/start` | Acknowledge platform start pings |
+| Command | Status | Description |
+|---------|--------|-------------|
+| `/resume [name]` | ⬜ open | Resume a named session (complements `/new`) |
+| `/branch [name]` (alias `/fork`) | ⬜ open | Branch the current session |
+| `/compress` (alias `/compact`) | ⬜ open | Compress context; `--preview` to preview |
+| `/undo [N]` | ⬜ open | Back up N user turns and re-prompt |
+| `/title [name]` | ⬜ open | Title the current session |
+| `/sessions` | ⬜ open | Browse/resume previous sessions |
+| `/background` (alias `/bg`, `/btw`) | ⬜ open | Run a prompt in the background |
+| `/queue` (alias `/q`) | ⬜ open | Queue a prompt without interrupting |
+| `/steer` | ✅ done | Inject a message after next tool call |
+| `/agents` (alias `/tasks`) | ⬜ open | Show active agents / running tasks |
+| `/loop` (alias `/proactive`) | ⬜ open | Re-run a prompt on interval |
+| `/goal` | ⬜ open | Standing goal across turns |
+| `/heartbeat` (alias `/hb`) | ⬜ open | Recurring prompt when idle |
+| `/restart` | ⬜ open | Gracefully restart the gateway after draining |
+| `/save` | ⬜ open | Export conversation (json/md/html) |
+| `/refine` | ⬜ open | Save lessons to memory/skills |
+| `/moa` | ⬜ open | Mixture-of-Agents preset |
+| `/subgoal` | ⬜ open | Manage extra criteria on active goal |
+| `/sethome` (alias `/set-home`) | ⬜ open | Set chat as home channel |
+| `/start` | ⬜ open | Acknowledge platform start pings |
 
 **Config / display — lower priority for mesh (UI-leaning, but not cli_only):**
 | Command | Description |
@@ -182,10 +185,11 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 |---|------|--------|-------|
 | 4.1 | **Redaction before PR** | ✅ done for our commit | PII/model-names/hashes scrubbed; `model_command.py` no longer hardcodes the catalog. Upstream PR uses the clean branch. |
 | 4.2 | **Config-driven, deployment-agnostic** | ✅ done | Models discovered from `config.yaml`; no deployment specifics in code. |
-| 4.3 | **`/status` health endpoint** | ⬜ add | Model + session + uptime + ACL mode — so we can self-diagnose over the mesh. |
+| 4.3 | **`/status` health endpoint** | ✅ done | `GET /status` on control server (commit `4ce5db8`): model + session + uptime + ACL mode. Bridge `/status` also shows `Bridge: up Xh Ym` + session-cumulative tool total (commit `cc232e8`). |
 | 4.4 | **Structured logging of commands** | ⚠️ partial | Commands log to journal (`Command from <id>: /new`) but not to the session DB. Consider a lightweight audit log. |
-| 4.5 | **Watchdog / auto-restart** | ⬜ | systemd `Restart=` + a liveness ping so a dead bridge is caught. (Matches the CamoFox health-check pattern.) |
-| 4.6 | **CI on the fork** | ⬜ | A lint/import check on the private fork before PR. |
+| 4.5 | **Watchdog / auto-restart** | ✅ done | **Option 3b** (see `docs/mesh-bridge-findings-2026-09-09-watchdog-option-1-archived.md` for why Option 1 was shelved). `core/bridge_liveness.py` `BridgeLiveness` runs a daemon thread in the bridge that probes RNS liveness (`RNS.Transport.interface_last_jobs`, refreshed every 5s) and pings systemd's watchdog (`sd_notify(WATCHDOG=1)`) each tick; on a stale probe it stops pinging so systemd kills + `Restart=on-failure` restarts. Also writes an idle-heartbeat marker (`~/.hermes/.reticulum-idle-heartbeat`, mtime-authoritative) for `/status` + post-mortem. Service files flipped to `Type=notify` + `NotifyAccess=all` + `WatchdogSec=90` (same unit — no new service). `/status` shows `Watchdog: ✓ RNS alive (heartbeat Xs ago)` / `✗ RNS not responsive`. Env: `HERMES_BRIDGE_LIVENESS_INTERVAL` (30s), `HERMES_BRIDGE_RNS_PROBE_MAX_AGE` (30s), `HERMES_BRIDGE_HEARTBEAT_FILE`. 10 tests in `TestBridgeLiveness`; end-to-verified against a live RNS daemon (probe `False` pre-RNS → `True` post-RNS, pings flow). Catches: RNS-wedged-but-process-alive, and total process freeze. |
+| 4.6 | **CI on the fork** | ⬜ open | Lint/import check before PR. Currently manual. |
+| 4.7 | **Pre-execution approval gate** | ✅ done | `mesh-tool-gate` `pre_tool_call` plugin in repo (commit `f8b0c69`): risky tools POST to `/gate/notify` pre-execution; verdict rendered over LXMF. Session-name mismatch fixed (`6d5d0a1`); `/deny` aligned to Telegram block-and-continue (`63e753f`); timeout vs explicit deny distinguished (`c80645a`). Alias normalization fixed (`4a2fd06`). Three-timeout alignment documented (590/600). |
 
 ---
 
@@ -206,14 +210,13 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 
 ## Build order (value × effort)
 
-1. **Tier 1** — fix continuity (1.1) + add the responsiveness guard (1.2).
-2. **Tier 2 high-value batch** — `/status`, `/stop`, `/pause`, `/approve`/`/deny`,
-   `/retry`, `/whoami`, `/usage`, `/version`. All are thin handlers on the
-   existing `CommandDispatcher`.
-3. **Tier 3** — tool-call / clarify / accept-deny rendering over plain text.
-4. **Tier 4** — `/status` health, watchdog, CI.
+1. ~~**Tier 1** — fix continuity (1.1) + add the responsiveness guard (1.2).~~ ✅ done
+2. ~~**Tier 2 high-value batch** — `/status`, `/stop`, `/pause`, `/approve`/`/deny`,
+   `/retry`, `/whoami`, `/usage`, `/version`.~~ ✅ done (all except `/whoami` — deferred)
+3. **Tier 3** — tool-call / clarify / accept-deny rendering over plain text. (Tool-call visibility landed via step-watcher; clarify/accept-deny rendering still open.)
+4. **Tier 4** — CI (4.6). (4.3 health endpoint ✅, 4.5 watchdog ✅, 4.7 pre-exec gate ✅.)
 5. **Tier 2 fuller session control** — the full non-`cli_only` session set
-   (`/resume`, `/branch`, `/compress`, `/undo`, `/queue`, `/steer`, `/background`,
+   (`/resume`, `/branch`, `/compress`, `/undo`, `/queue`, `/background`,
    `/sessions`, …) once the core batch is stable.
 6. **Tier 5 — Voice & media** — voice-out first (5.1), then a spike on voice-in
    (5.2). See the transport constraints below before committing to 5.2.

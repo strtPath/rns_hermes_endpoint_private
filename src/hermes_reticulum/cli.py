@@ -22,6 +22,7 @@ from hermes_reticulum.core.commands import build_dispatcher
 from hermes_reticulum.core.control_server import ControlServer
 from hermes_reticulum.core.hermes_client import HermesClient
 from hermes_reticulum.core.model_command import ModelCommandHandler
+from hermes_reticulum.core.preflight import run_preflight
 
 
 def _load_dotenv():
@@ -99,6 +100,31 @@ def cmd_run(args):
 
     # Initialize components
     acl = AccessControl()
+
+    # Preflight: check hermes binary, storage, config, plugins.
+    # Log results; do NOT exit — HermesClient will raise its own
+    # RuntimeError if the binary is genuinely missing.
+    pf = run_preflight(hermes_bin=hermes_bin, storage=storage)
+    if pf.ok:
+        logger.info("Preflight: all checks passed")
+        for c in pf.checks:
+            logger.debug("  %s", c)
+    else:
+        logger.error("Preflight FAILED:")
+        for line in pf.render().split("\n"):
+            if line.strip():
+                logger.error("  %s", line.strip())
+        # Let HermesClient raise its own error — but only if the binary
+        # is the blocker. If storage/config are the only issues, the
+        # bridge can still start (identity gets created, config uses
+        # defaults).
+        if "Hermes binary" in pf.render() and "✗" in pf.render():
+            sys.exit(1)
+    for w in pf.warnings:
+        logger.warning("Preflight: %s", w)
+    for c in pf.checks:
+        logger.info("Preflight: %s", c)
+
     hermes = HermesClient(hermes_bin=hermes_bin, timeout=timeout)
 
     # /model command handler (mirrors the Telegram gateway's /model).
@@ -193,16 +219,18 @@ def cmd_run(args):
             "tool streaming disabled (recap fallback still works)."
         )
 
-    # Generic slash-command dispatcher — adds /model, /new, /help, /commands.
-    # Add more in core/commands.py (COMMANDS dict); no cli.py changes needed.
-    dispatcher = build_dispatcher(hermes, model_cmd, ctrl)
-
+    # Build the bridge first so the dispatcher can expose liveness state
+    # (Tier 4.5). run_forever() is called at the end.
     bridge = LXMFBridge(
         display_name=display_name,
         storage_path=storage,
         stamp_cost=stamp_cost,
         rns_config_path=rns_config,
     )
+
+    # Generic slash-command dispatcher — adds /model, /new, /help, /commands.
+    # Add more in core/commands.py (COMMANDS dict); no cli.py changes needed.
+    dispatcher = build_dispatcher(hermes, model_cmd, ctrl, bridge=bridge)
 
     # Wire up: LXMF message → ACL check → command dispatch → profile → Hermes → reply
     def handle_message(source_hash: str, content: str, profile=None) -> str | None:
@@ -303,6 +331,14 @@ def cmd_status(args):
     print(f"  Storage:   {storage}")
     print(f"  Identity:  {'found' if os.path.exists(identity_path) else 'not created yet'}")
     print(f"  ACL mode:  {acl.mode}")
+    print()
+
+    # Preflight check
+    pf = run_preflight(storage=storage)
+    print("  Preflight:")
+    for line in pf.render().split("\n"):
+        if line.strip():
+            print(f"  {line}")
     print()
 
     if os.path.exists(identity_path):

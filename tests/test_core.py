@@ -276,3 +276,96 @@ class TestBridgeLiveness:
         lv.start()
         lv.stop()
         lv.stop()  # must not raise or hang
+
+
+class TestPreflight:
+    """Test the preflight check module."""
+
+    def test_ok_when_binary_exists(self, monkeypatch, tmp_path):
+        from hermes_reticulum.core.preflight import run_preflight
+
+        fake_bin = tmp_path / "hermes"
+        fake_bin.write_text("#!/bin/sh\necho hermes version 0.1.0")
+        fake_bin.chmod(0o755)
+
+        monkeypatch.setenv("RETICULUM_STORAGE", str(tmp_path / "storage"))
+        monkeypatch.setenv("HERMES_CONFIG", str(tmp_path / "config.yaml"))
+
+        result = run_preflight(
+            hermes_bin=str(fake_bin),
+            storage=str(tmp_path / "storage"),
+            config_yaml=str(tmp_path / "config.yaml"),
+            check_plugins=False,
+        )
+        # Binary found and ran
+        assert result.checks, "should have at least one check"
+        # No hard errors (storage dir doesn't exist → warning, not error)
+        for e in result.errors:
+            assert "binary" not in e.lower()
+
+    def test_error_when_binary_missing(self, monkeypatch, tmp_path):
+        from hermes_reticulum.core.preflight import run_preflight
+
+        result = run_preflight(
+            hermes_bin=str(tmp_path / "nonexistent"),
+            storage=str(tmp_path / "storage"),
+            config_yaml=str(tmp_path / "config.yaml"),
+            check_plugins=False,
+        )
+        assert result.ok is False
+        assert any("does not exist" in e for e in result.errors)
+
+    def test_render_includes_errors(self, monkeypatch, tmp_path):
+        from hermes_reticulum.core.preflight import PreflightResult
+
+        result = PreflightResult(ok=False)
+        result.errors.append("Test error one")
+        result.warnings.append("Test warning one")
+        rendered = result.render()
+        assert "Test error one" in rendered
+        assert "Test warning one" in rendered
+        assert "cannot start" in rendered
+
+    def test_render_ok_only_checks(self):
+        from hermes_reticulum.core.preflight import PreflightResult
+
+        result = PreflightResult(ok=True)
+        result.checks.append("Hermes binary: /usr/bin/hermes")
+        rendered = result.render()
+        assert "Hermes binary" in rendered
+        assert "cannot start" not in rendered
+
+    def test_storage_warning_when_missing(self, monkeypatch, tmp_path):
+        from hermes_reticulum.core.preflight import run_preflight
+
+        result = run_preflight(
+            hermes_bin="/usr/bin/hermes",
+            storage=str(tmp_path / "does_not_exist"),
+            config_yaml=str(tmp_path / "config.yaml"),
+            check_plugins=False,
+        )
+        assert any("does_not_exist" in w for w in result.warnings)
+
+    def test_config_warning_when_missing(self, monkeypatch, tmp_path):
+        from hermes_reticulum.core.preflight import run_preflight
+
+        result = run_preflight(
+            hermes_bin="/usr/bin/hermes",
+            storage=str(tmp_path),
+            config_yaml=str(tmp_path / "no_such_config.yaml"),
+            check_plugins=False,
+        )
+        assert any("config not found" in w for w in result.warnings)
+
+    def test_plugin_warning_when_missing(self, monkeypatch, tmp_path):
+        from hermes_reticulum.core.preflight import run_preflight
+
+        # Point HOME at tmp_path so ~/.hermes/plugins doesn't exist
+        monkeypatch.setenv("HOME", str(tmp_path))
+        result = run_preflight(
+            hermes_bin="/usr/bin/hermes",
+            storage=str(tmp_path / "storage"),
+            config_yaml=str(tmp_path / "config.yaml"),
+            check_plugins=True,
+        )
+        assert any("mesh-tool-gate" in w for w in result.warnings)
