@@ -73,7 +73,7 @@ max-turn wall clock:
 Restarted 2026-08-28 09:36 EDT via `systemctl --user restart
 hermes-reticulum.service`. Clean shutdown of the old PID, new PID up at
 09:36:33. Control endpoint on 127.0.0.1:8471, liveness guard 600s, LXMF
-address `<<redacted>>` re-announced, identity preserved
+address `<redacted>` re-announced, identity preserved
 from `~/.lxmf/storage/hermes_identity`.
 
 ## Known gaps / follow-ups
