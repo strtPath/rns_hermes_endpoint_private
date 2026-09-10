@@ -48,6 +48,11 @@ def run_preflight(
     if hermes_bin is None:
         from hermes_reticulum.core.hermes_client import find_hermes_bin
         hermes_bin = find_hermes_bin()
+    elif not os.path.isabs(hermes_bin) and not os.path.isfile(hermes_bin):
+        # Bare name (e.g. "hermes") or relative path — resolve via PATH,
+        # exactly as HermesClient/find_hermes_bin do, before judging it.
+        from hermes_reticulum.core.hermes_client import find_hermes_bin
+        hermes_bin = find_hermes_bin() or hermes_bin
 
     if hermes_bin is None:
         result.errors.append(
