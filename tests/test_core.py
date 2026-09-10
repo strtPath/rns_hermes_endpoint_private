@@ -172,3 +172,107 @@ class TestVersion:
     def test_version_importable(self):
         from hermes_reticulum import __version__
         assert __version__ == "0.1.0"
+
+
+class TestBridgeLiveness:
+    """Test the Tier 4.5 bridge liveness proxy (Option 3b)."""
+
+    def _lv(self, tmp_path, healthy=True, interval=60.0):
+        from hermes_reticulum.core import bridge_liveness as bl
+
+        sent = []
+        lv = bl.BridgeLiveness(
+            heartbeat_file=str(tmp_path / "hb"),
+            interval=interval,
+            rns_probe=lambda: healthy,
+            notify=lambda msg: sent.append(msg) or True,
+        )
+        return lv, sent
+
+    def test_start_pings_ready_and_watchdog(self, tmp_path):
+        import os
+        lv, sent = self._lv(tmp_path, healthy=True)
+        lv.start()
+        # READY=1 on start, WATCHDOG=1 on the first (unconditional) tick.
+        assert sent == ["READY=1", "WATCHDOG=1"]
+        assert os.path.exists(str(tmp_path / "hb"))
+        lv.stop()
+
+    def test_tick_healthy_writes_marker_and_pings(self, tmp_path):
+        import os
+        import json
+        lv, sent = self._lv(tmp_path, healthy=True)
+        lv.start()
+        sent.clear()
+        lv._tick(healthy=True)
+        assert sent == ["WATCHDOG=1"]
+        assert os.path.exists(str(tmp_path / "hb"))
+        data = json.loads((tmp_path / "hb").read_text())
+        assert "ts" in data and "pid" in data
+        lv.stop()
+
+    def test_tick_unhealthy_stops_pinging(self, tmp_path):
+        import os
+        lv, sent = self._lv(tmp_path, healthy=True)
+        lv.start()
+        # Remove marker to prove a bad tick does NOT re-create it.
+        os.unlink(str(tmp_path / "hb"))
+        sent.clear()
+        lv._tick(healthy=False)
+        assert sent == []  # no WATCHDOG ping
+        assert not os.path.exists(str(tmp_path / "hb"))  # no marker write
+        lv.stop()
+
+    def test_snapshot_reports_state(self, tmp_path):
+        lv, _ = self._lv(tmp_path, healthy=True)
+        lv.start()
+        snap = lv.snapshot()
+        assert snap["rns_healthy"] is True
+        assert snap["last_tick_age_s"] is not None
+        assert snap["last_tick_age_s"] < 5
+        assert snap["marker_age_s"] is not None
+        lv.stop()
+
+    def test_sd_notify_no_socket_returns_false(self, monkeypatch):
+        monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+        from hermes_reticulum.core.bridge_liveness import sd_notify
+        assert sd_notify("WATCHDOG=1") is False
+
+    def test_sd_notify_sends_to_socket(self, tmp_path, monkeypatch):
+        import socket
+        monkeypatch.setenv("NOTIFY_SOCKET", str(tmp_path / "notify.sock"))
+        recv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        recv.bind(str(tmp_path / "notify.sock"))
+        try:
+            from hermes_reticulum.core.bridge_liveness import sd_notify
+            assert sd_notify("WATCHDOG=1") is True
+            data, _ = recv.recvfrom(64)
+            assert data == b"WATCHDOG=1"
+        finally:
+            recv.close()
+
+    def test_default_probe_fresh(self, monkeypatch):
+        import RNS
+        import time
+        monkeypatch.setattr(RNS.Transport, "interface_last_jobs", time.time())
+        from hermes_reticulum.core.bridge_liveness import default_rns_probe
+        assert default_rns_probe() is True
+
+    def test_default_probe_stale(self, monkeypatch):
+        import RNS
+        import time
+        monkeypatch.setattr(RNS.Transport, "interface_last_jobs", time.time() - 9999)
+        from hermes_reticulum.core.bridge_liveness import default_rns_probe
+        assert default_rns_probe() is False
+
+    def test_default_probe_never_set(self, monkeypatch):
+        import RNS
+        monkeypatch.setattr(RNS.Transport, "interface_last_jobs", 0.0)
+        from hermes_reticulum.core.bridge_liveness import default_rns_probe
+        assert default_rns_probe() is False
+
+    def test_stop_is_idempotent(self, tmp_path):
+        lv, _ = self._lv(tmp_path, healthy=True)
+        lv.start()
+        lv.stop()
+        lv.stop()  # must not raise or hang

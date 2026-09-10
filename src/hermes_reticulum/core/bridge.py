@@ -13,6 +13,7 @@ import LXMF
 import RNS
 
 from hermes_reticulum.core.adapter import prepare_reply, split_message
+from hermes_reticulum.core.bridge_liveness import BridgeLiveness
 from hermes_reticulum.core.profiler import ChannelMetrics, ChannelProfiler
 
 logger = logging.getLogger("hermes_reticulum.bridge")
@@ -158,6 +159,10 @@ class LXMFBridge:
         self.profiler = ChannelProfiler()
 
         self._pool: ThreadPoolExecutor | None = None
+
+        # Bridge-level liveness proxy (Tier 4.5). Started in run_forever()
+        # after start()/announce(); probes RNS and pings systemd's watchdog.
+        self.liveness: BridgeLiveness | None = None
 
     @property
     def address(self) -> str | None:
@@ -393,6 +398,9 @@ class LXMFBridge:
         logger.info("Shutting down Hermes for Reticulum bridge...")
         self._running = False
 
+        if self.liveness:
+            self.liveness.stop()
+
         if self._pool:
             self._pool.shutdown(wait=False)
 
@@ -408,6 +416,12 @@ class LXMFBridge:
         """Start the bridge and block until interrupted."""
         self.start()
         self.announce()
+
+        # Liveness proxy (Tier 4.5): probes RNS and pings systemd's
+        # watchdog. Started after announce() so the bridge is fully up
+        # before the first READY/WATCHDOG.
+        self.liveness = BridgeLiveness()
+        self.liveness.start()
 
         # Signal handler returns immediately; teardown runs on a daemon thread
         # so RNS.exit() can't deadlock against the C event loop holding the GIL.

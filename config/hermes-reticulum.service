@@ -5,7 +5,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+WatchdogSec=90
 User=hermes
 Group=hermes
 WorkingDirectory=/opt/rns_hermes_endpoint

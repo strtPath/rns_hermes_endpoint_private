@@ -4,7 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+WatchdogSec=90
 WorkingDirectory=/opt/rns_hermes_endpoint
 Environment=HOME=/opt/rns_hermes_endpoint
 EnvironmentFile=/opt/rns_hermes_endpoint/.env
