@@ -5,7 +5,7 @@ parity with the Hermes **Telegram** gateway, so the mesh endpoint is a first-cla
 way to talk to the agent, not a degraded one. This is a living doc — update the
 Status column as we land items._
 
-_Last updated: 2026-09-09. Owner: Holo + user._
+_Last updated: 2026-09-12. Owner: Holo + user._
 
 ---
 
@@ -39,7 +39,7 @@ the gap, grouped into four tiers by effort/value:
 | 1.4 | **`/new`, `/help`, `/commands`** | ✅ done | `CommandDispatcher` in `commands.py`; `/new` confirmed via log `Session reset — new thread: mesh-reticulum-<ts>`. *(verified this session.)* |
 | 1.5 | **Startup loud-fail on missing `hermes`** | ✅ done | `core/preflight.py` — `run_preflight()` checks binary (+`--version`), storage, config, plugins. CLI `run` logs all checks; missing binary → `sys.exit(1)` before RNS starts. Mesh `/status` shows `Preflight: ✓ ok` or `✗ N error(s)` with the error lines. CLI `status` subcommand renders the full preflight. |
 | 1.6 | **SIGTERM clean exit** | ✅ done | `_handle_signal()` → daemon thread → `_clean_exit()`: `stop()` → `RNS.exit(0)`, `os._exit(0)` last resort. Verified: `kill -TERM` exits within 3s (was: indefinite hang). Commit `36d94bb`. |
-| 1.7 | **Downlink acks / RSSI/SNR profiler** | ⚠️ partial | `1322e89` landed but was reverted (`1d71cf3`, `e67652f`) — the SIGTERM piece was split into 1.6. Acks + profiler remain open. See `docs/mesh-bridge-findings-2026-08-29-downlink-burst-loss-and-recap-replay.md`. |
+| 1.7 | **Downlink acks / RSSI/SNR profiler** | ✅ acks done / ⬜ profiler | **Downlink acks (v2)** re-landed 2026-09-12 (commit `b07bc90`): per-chunk `register_delivery_callback`, `[p<N> i/N]` sequence tagging, 500ms pacing (failed-send-safe), ack-timeout sweep (`HERMES_DOWNLINK_ACK_TIMEOUT_S`, default 300s). Live-verified on TCP: `Downlink ack seq=1 → ... state=delivered (DELIVERED)` in 1s. A–F regression fixes documented in `docs/mesh-bridge-findings-2026-09-12-reminder-tool-calls-never-arrived.md`. **RSSI/SNR profiler** (reading `RNS.Transport.local_client_rssi_cache`) still open — separate concern, needs a real RNode radio to populate the cache. |
 | 1.8 | **Liveness heartbeat (generation-scoped)** | ✅ done | Per-child generation counter; marker requires session match + gen match + mtime. Slow-but-working child stays warm; genuinely wedged child still killed. Commit `a154d7c`. |
 
 ---
