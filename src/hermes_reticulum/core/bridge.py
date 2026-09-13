@@ -14,6 +14,11 @@ import RNS
 
 from hermes_reticulum.core.adapter import prepare_reply, split_message
 from hermes_reticulum.core.bridge_liveness import BridgeLiveness
+from hermes_reticulum.core.downlink import (
+    DownlinkTracker,
+    MIN_CHUNK_INTERVAL_MS,
+    sequence_chunks,
+)
 from hermes_reticulum.core.profiler import ChannelMetrics, ChannelProfiler
 
 logger = logging.getLogger("hermes_reticulum.bridge")
@@ -157,6 +162,7 @@ class LXMFBridge:
         self._running = False
 
         self.profiler = ChannelProfiler()
+        self.downlink = DownlinkTracker()
 
         self._pool: ThreadPoolExecutor | None = None
 
@@ -186,7 +192,12 @@ class LXMFBridge:
         chunk: bool = True,
         max_chars: int = STEP_CHUNK_CHARS,
     ) -> bool:
-        """Push a proactive LXMF message, optionally split into multiple posts."""
+        """Push a proactive LXMF message, optionally split into multiple posts.
+
+        Multi-part pushes are tagged with ``[p<N> i/N]`` so recipients can
+        spot a dropped tail without protocol changes. Pacing is enforced
+        between successful sends (a failed send does not consume budget).
+        """
         if not text:
             return False
         parts = split_message(text, max_chars) if chunk else [text]
@@ -195,11 +206,14 @@ class LXMFBridge:
                 "Push reply to %s: %d chars → %d parts (max=%d)",
                 recipient_hex[:16], len(text), len(parts), max_chars,
             )
+            tag = self.downlink.next_push_tag()
+            parts = sequence_chunks(parts, tag)
         ok = False
         for i, part in enumerate(parts):
             if i > 0:
-
-                time.sleep(0.5)
+                # Pace *before* the send; record_send inside send_reply
+                # updates the clock only on success.
+                self.downlink.pace_wait(recipient_hex, MIN_CHUNK_INTERVAL_MS)
             if self.send_reply(recipient_hex, part, source_identity):
                 ok = True
         return ok
@@ -323,7 +337,13 @@ class LXMFBridge:
             )
 
     def send_reply(self, recipient_hex: str, text: str, source_identity=None) -> bool:
-        """Send an LXMF text message to a recipient. Returns True if dispatched."""
+        """Send an LXMF text message to a recipient. Returns True if dispatched.
+
+        Registers a per-chunk delivery callback so we can observe first-hop
+        acks (DELIVERED) vs propagation (SENT) vs silent loss (timeout sweep
+        in DownlinkTracker). A failed send does NOT advance the pacing clock
+        (record_send is only called after a successful handle_outbound).
+        """
         if not self.router or not self.destination:
             logger.error("Bridge not started — cannot send reply")
             return False
@@ -362,6 +382,10 @@ class LXMFBridge:
             )
             return False
 
+        # Allocate the seq BEFORE the send so the dispatch time is recorded
+        # even if the callback never fires (silent loss → timeout sweep).
+        seq = self.downlink.next_seq()
+
         try:
             dest = RNS.Destination(
                 recipient_identity,
@@ -378,11 +402,18 @@ class LXMFBridge:
                 desired_method=LXMF.LXMessage.DIRECT,
                 include_ticket=True,
             )
+            lxm.register_delivery_callback(
+                lambda msg, _s=seq, _r=recipient_hex: self._on_outbound(_s, _r, msg)
+            )
             self.router.handle_outbound(lxm)
 
+            # Success: record the pacing clock and the recipient for the seq.
+            self.downlink.record_send(recipient_hex)
+            self.downlink.register_dispatch(seq, recipient_hex)
+
             logger.info(
-                "Reply dispatched to %s (%d bytes)",
-                recipient_hex[:16], len(text.encode("utf-8")),
+                "Reply dispatched to %s seq=%d (%d bytes)",
+                recipient_hex[:16], seq, len(text.encode("utf-8")),
             )
             return True
 
@@ -392,6 +423,27 @@ class LXMFBridge:
                 recipient_hex[:16], e, exc_info=True,
             )
             return False
+
+    def _on_outbound(self, seq: int, recipient_hex: str, lxm) -> None:
+        """LXMF delivery callback (fires on the RNS event-loop thread).
+
+        Maps LXMessage state → outcome, logs the ack, and records it in the
+        tracker. Idempotent: a second invocation (delivery receipt +
+        propagation receipt, or a re-queue) is a no-op on the counter
+        (seq already popped by the first note_outcome).
+        """
+        try:
+            state = getattr(lxm, "state", None)
+            from hermes_reticulum.core.downlink import _state_name, _state_outcome
+            state_str = _state_name(state) if state is not None else "none"
+            outcome = _state_outcome(state) if state is not None else "unknown"
+            self.downlink.note_outcome(seq, outcome)
+            logger.info(
+                "Downlink ack seq=%d → %s state=%s (%s)",
+                seq, recipient_hex[:16], outcome, state_str,
+            )
+        except Exception as e:
+            logger.debug("Downlink callback error: %s", e)
 
     def stop(self):
         """Gracefully shut down the bridge."""
