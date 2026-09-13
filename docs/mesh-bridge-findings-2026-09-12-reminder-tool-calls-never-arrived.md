@@ -73,7 +73,108 @@ tool call that's invisible, same root cause (no delivery feedback).
 
 ## Open questions
 
-- Why was `1322e89` reverted on 08-30? (No commit message beyond "Revert".)
+- Why was `1322e89` reverted on 08-30? (No commit message beyond "Revert.")
 - Is the step-push path (hermes_client `_push_step` → bridge) subject to
   the profile's `send_delay_ms`? Currently no — that delay is only in
   `_process_and_reply`. Step bursts need their own pacing.
+
+## Re-land (v2) — 2026-09-12
+
+Re-landed the downlink reliability feature on branch `fix/downlink-acks-v2`
+(commit TBD), designed around each known regression candidate from the
+original `1322e89`.
+
+### A — `states[state]` index bug (FIXED)
+
+**Found:** The original `_on_outbound` did `LXMF.LXMessage.states[state]`,
+using the state *value* (e.g. `0x08`) as a list *index* into an 8-element
+list. `states[8]` → IndexError → caught → fallback `state_8`. So the
+original NEVER produced a real state name for DELIVERED.
+
+**Fix:** Hardcoded reverse map `{0x08: "DELIVERED", 0x04: "SENT", 0xFF:
+"FAILED", ...}` at module level in `downlink.py`. No list indexing.
+
+### B — Sequence tag format + block budget (VERIFIED)
+
+**Found:** `[p<N> i/N] ` prefix is ~12 chars. Block content budget is 368
+bytes (LXMF 1.1.1: `PLAIN_PACKET_MAX_CONTENT = PLAIN_PACKET_MDU -
+LXMF_OVERHEAD + DESTINATION_LENGTH`). A 1500-char STEP_CHUNK_CHARS part
+fits in ~4 blocks with the prefix.
+
+**Fix:** `sequence_chunks` in `downlink.py` truncates the *part* (not the
+prefix) if `len((prefix + part).encode('utf-8'))` would exceed 368 bytes.
+UTF-8 codepoint boundary respected.
+
+### C — `include_ticket=True` + first chunk after restart (VERIFIED)
+
+**Found:** `LXMRouter.generate_ticket` is a stored-ticket lookup (not a
+stamp burn). Tickets persist to disk via `save_available_tickets` and load
+on startup (`available_tickets` dict). The first chunk after restart has
+tickets available.
+
+**Fix:** No change needed. `include_ticket=True` stays. If ticket
+generation ever fails, LXMessage catches it internally (logged to RNS,
+message continues without ticket).
+
+### D — Pacing thread interactions (VERIFIED)
+
+**Found:** `pace_wait` sleeps on the *calling* thread. Three call paths:
+(a) bridge `_process_and_reply` thread pool — fine. (b) cli `_step_push`
+(step-watcher thread, inline in poll loop) — a 500ms sleep per step chunk
+is negligible vs the poll interval. (c) cli `_on_full_step`
+(ThreadingHTTPServer handler thread) — each request gets its own thread,
+a 500ms sleep doesn't block other requests.
+
+**Fix:** No change needed. All three paths are safe.
+
+### E — Ack timeout sweep (NEW)
+
+**Found:** The original had no timeout path. A chunk that never gets a
+first-hop ack (silent LoRa loss) never fires the callback, so its seq
+stays in `_outbound` until the 256-entry prune. "No ack" is
+indistinguishable from "acked but log scrolled off."
+
+**Fix:** Lazy sweep on each `next_seq` call in `DownlinkTracker`. Any seq
+older than `HERMES_DOWNLINK_ACK_TIMEOUT_S` (default 300s) that never got
+a callback is counted `timeout` and logged:
+`Downlink ack seq=%d → %s state=timeout (no first-hop ack within %ds)`.
+No new thread.
+
+### F — Log-format consumers (VERIFIED)
+
+**Found:** No consumers of the `Reply dispatched to` log format in
+`tests/` or `src/` (grep-verified). The new format adds `seq=%d` —
+backward-compatible (existing parsers that match `Reply dispatched to`
+still work).
+
+**Fix:** None needed.
+
+### Pacing correctness fix (FIXED)
+
+**Found:** The original `pace_wait` was called in `push_reply` *before*
+`send_reply`. If `send_reply` returned False (unknown recipient),
+`pace_wait` had already advanced `_last_send`, corrupting the pacing clock
+for the next real send.
+
+**Fix:** `record_send` is called from `send_reply` *after* a successful
+`handle_outbound`. `pace_wait` only *reads* the last send time (never
+sets it). A failed send does not consume pacing budget.
+
+### New env vars
+
+- `HERMES_CHUNK_INTERVAL_MS` (keep original name, default 500).
+- `HERMES_DOWNLINK_ACK_TIMEOUT_S` (new, default 300).
+
+### Log-line formats (for operator grep)
+
+- Dispatch: `Reply dispatched to %s seq=%d (%d bytes)`
+- Ack: `Downlink ack seq=%d → %s state=%s (%s)`
+- Timeout: `Downlink ack seq=%d → %s state=timeout (no first-hop ack within %ds)`
+
+### What we could NOT verify in this env
+
+- Real LoRa first-hop acks (no RNode radio on this box). The ack
+  state-mapping and timeout-sweep logic are unit-tested in isolation.
+  The operator should watch for `Downlink ack` lines in journalctl after
+  deploy — if they don't appear, the callback isn't firing (check the
+  LXMF delivery callback path).
