@@ -271,5 +271,188 @@ class TestSessionAdoptionCorrelation(unittest.TestCase):
         self.assertIsNone(client._resume_id)
 
 
+class TestToolRecapTurnScoping(unittest.TestCase):
+    """tool_recap() must recap only the CURRENT turn's tool calls, not the
+    session's whole history (the "prior-turns recap" bug:
+    docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, cwd TEXT, "
+            "started_at REAL, title TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT, role TEXT, tool_name TEXT, "
+            "tool_calls TEXT, tool_call_id TEXT, content TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def _add_session(self, session_id):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO sessions (id, source, cwd, started_at, title) "
+            "VALUES (?, 'reticulum', NULL, 0, 'mesh-reticulum')",
+            (session_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    def _add_msg(self, session_id, role, tool_name=None,
+                 tool_calls=None, tool_call_id=None, content=""):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO messages "
+            "(session_id, role, tool_name, tool_calls, tool_call_id, content) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, role, tool_name, tool_calls, tool_call_id, content),
+        )
+        conn.commit()
+        conn.close()
+
+    def _client(self, session_id):
+        client = make_client(source_tag="reticulum", hermes_bin="/usr/bin/true")
+        client._resume_id = session_id
+        return client
+
+    def test_tool_free_turn_gets_no_recap(self):
+        """Turn A used tools; turn B used none → turn B's recap is []."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        # Turn A: user msg + assistant tool_calls + tool result.
+        self._add_msg(sid, "user", content="turn A")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "c1", "function": {"name": "terminal", "arguments": "{\"command\": \"ls\"}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal",
+                      tool_call_id="c1", content="ok")
+        # Turn B: user msg only (no tool rows).
+        self._add_msg(sid, "user", content="turn B")
+        # Anchor at the pre-spawn MAX(id) for turn B's chat() — the end of
+        # turn A's rows (the turn B user row is written by the child, so it
+        # is above the anchor and irrelevant: it is not a tool row).
+        client = self._client(sid)
+        client._capture_turn_anchor(sid)
+        # Now simulate the child having written turn B's user row.
+        self._add_msg(sid, "user", content="turn B (child write)")
+        recap = client.tool_recap(limit=8)
+        self.assertEqual(recap, [])
+
+    def test_recap_excludes_prior_turns_tools(self):
+        """Turn B used tools; turn A's earlier tools must not appear."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        # Turn A: one tool call.
+        self._add_msg(sid, "user", content="turn A")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "a1", "function": {"name": "search_files", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="search_files",
+                      tool_call_id="a1", content="{}")
+        # Anchor for turn B — captured BEFORE the child spawns, i.e. while
+        # turn A's rows are the last ones in the session (MAX(id) = end of
+        # turn A). This mirrors chat() capturing the anchor pre-spawn.
+        client = self._client(sid)
+        client._capture_turn_anchor(sid)
+        # Turn B: its own tool call only. (arguments is a JSON-encoded
+        # string, double-escaped, exactly as hermes persists it.)
+        self._add_msg(sid, "user", content="turn B")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "b1", "function": {"name": "terminal", "arguments": "{\\"command\\": \\"pwd\\"}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal",
+                      tool_call_id="b1", content="/tmp")
+        recap = client.tool_recap(limit=8)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["terminal"])
+        self.assertNotIn("search_files", names)
+
+    def test_no_anchor_falls_back_to_session_history(self):
+        """Anchor unset (sid None at capture) → old behavior, whole session."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        self._add_msg(sid, "user", content="turn A")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "a1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        client = self._client(sid)
+        client._capture_turn_anchor(None)  # sid unknown at capture time
+        self.assertIsNone(client._turn_anchor_id)
+        recap = client.tool_recap(limit=8)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["terminal"])
+
+    def test_anchor_scoped_to_matching_sid(self):
+        """Anchor captured for session X must not filter session Y."""
+        sid_x = "20260101_000001_aaaaaa"
+        sid_y = "20260101_000002_bbbbbb"
+        self._add_session(sid_x)
+        self._add_session(sid_y)
+        self._add_msg(sid_x, "user", content="x")
+        self._add_msg(
+            sid_x, "assistant",
+            tool_calls='[{"id": "x1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid_y, "user", content="y")
+        self._add_msg(
+            sid_y, "assistant",
+            tool_calls='[{"id": "y1", "function": {"name": "read_file", "arguments": "{}"}}]',
+            content="",
+        )
+        client = self._client(sid_x)
+        client._capture_turn_anchor(sid_x)
+        # Recap for session Y with X's anchor: sid mismatch → no filter,
+        # Y's own tools show (not X's — the WHERE session_id still scopes).
+        client._resume_id = sid_y
+        client._turn_anchor_sid = sid_x
+        recap = client.tool_recap(limit=8)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["read_file"])
+
+    def test_first_turn_adopted_session_uses_first_user_boundary(self):
+        """Adopted (brand-new) session: boundary=first_user means this
+        turn's tools are included (they sit above the first user row)."""
+        sid = "20260101_000003_cccccc"
+        self._add_session(sid)
+        # The child (this turn) wrote: user row, then tool calls.
+        self._add_msg(sid, "user", content="first turn")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "f1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal",
+                      tool_call_id="f1", content="ok")
+        client = self._client(sid)
+        client._capture_turn_anchor(sid, boundary="first_user")
+        recap = client.tool_recap(limit=8)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["terminal"])
+
+
 if __name__ == "__main__":
     unittest.main()

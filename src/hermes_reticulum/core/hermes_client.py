@@ -171,6 +171,14 @@ class HermesClient:
         )
         self._turn_alive_gen = 0
         self._turn_alive_lock = threading.Lock()
+        # Turn anchor for the tool recap: the session's MAX(messages.id)
+        # taken BEFORE this turn's child spawns. The recap only counts tool
+        # rows with id > anchor, so a tool-free turn gets no footer and a
+        # tool-heavy turn never recaps prior turns' tools (see
+        # docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md).
+        # None until the first chat(); reset per turn.
+        self._turn_anchor_sid: str | None = None
+        self._turn_anchor_id: int | None = None
         self.source_tag = source_tag
         self.extra_args = extra_args or []
         self.model = model or os.getenv("HERMES_MODEL", "").strip() or None
@@ -518,16 +526,30 @@ class HermesClient:
         return reply
 
     def tool_recap(self, limit: int = 10) -> list[dict]:
-        """Recap of the last tool calls in the current mesh session.
+        """Recap of the tool calls made during the CURRENT mesh turn.
 
         Read from state.db (the same store hermes persists to), so this
         works even when the live ``agent:step`` hook is unavailable.
+        Scoped to rows with ``id > _turn_anchor_id`` (the session's
+        MAX(id) captured before this turn's child spawned), so a tool-free
+        turn returns [] (no footer) and prior turns' tools never bleed in.
+        If no anchor was captured (should not happen from chat()), fall
+        back to no filter rather than guessing.
+
         Returns a list of ``{"name": str, "is_error": bool, "preview": str}``
-        for the most recent ``limit`` tool messages (oldest first).
+        for the most recent ``limit`` tool messages of this turn (oldest
+        first).
         """
         sid = self._resume_id or self._resolve_session_id()
         if not sid:
             return []
+        if (
+            self._turn_anchor_sid == sid
+            and self._turn_anchor_id is not None
+        ):
+            anchor = self._turn_anchor_id
+        else:
+            anchor = None
         db_path = os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
@@ -539,12 +561,20 @@ class HermesClient:
             try:
                 # Tool-call messages are persisted as assistant rows with a
                 # tool_calls JSON payload; tool *results* as role='tool'.
-                rows = conn.execute(
-                    "SELECT content, tool_calls FROM messages "
-                    "WHERE session_id = ? AND role = 'assistant' "
-                    "ORDER BY id ASC",
-                    (sid,),
-                ).fetchall()
+                if anchor is not None:
+                    rows = conn.execute(
+                        "SELECT content, tool_calls FROM messages "
+                        "WHERE session_id = ? AND role = 'assistant' "
+                        "AND id > ? ORDER BY id ASC",
+                        (sid, anchor),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT content, tool_calls FROM messages "
+                        "WHERE session_id = ? AND role = 'assistant' "
+                        "ORDER BY id ASC",
+                        (sid,),
+                    ).fetchall()
             finally:
                 conn.close()
         except (sqlite3.Error, OSError) as exc:
@@ -641,6 +671,60 @@ class HermesClient:
             logger.warning("Could not snapshot sessions from state.db: %s", exc)
             return set()
 
+    def _capture_turn_anchor(
+        self, sid: str | None, boundary: str = "max"
+    ) -> None:
+        """Record this turn's recap anchor — the row-id boundary below which
+        all rows belong to PRIOR turns.
+
+        ``messages`` is session-global (the store is shared across turns), so
+        the boundary between "prior turns" and "this turn" must be captured
+        at the right moment:
+
+        - boundary="max" (default): the session's MAX(messages.id). Only
+          valid BEFORE the child spawns (chat() does this): at that point
+          the max id is the last row of prior turns, and every row the
+          child writes has an id above it. A tool-free turn then yields an
+          empty recap (no footer) and prior turns' tools never bleed in.
+        - boundary="first_user": the session's first role='user' row id.
+          Used by _adopt_new_session, where the sid only became known AFTER
+          the child ran. The session is brand-new (created by this turn), so
+          its first user row is the pre-turn boundary; every tool row of
+          this turn sits above it.
+
+        ``tool_recap()`` counts only rows with ``id > anchor``.
+
+        ``sid`` may be None (session not yet resolvable): the anchor stays
+        unset, and tool_recap() falls back to no filter (the old behavior)
+        rather than guessing. A DB error likewise leaves the anchor unset.
+        """
+        self._turn_anchor_sid = sid
+        self._turn_anchor_id = None
+        if not sid:
+            return
+        db_path = self._state_db_path()
+        if not os.path.exists(db_path):
+            return
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                if boundary == "first_user":
+                    row = conn.execute(
+                        "SELECT MIN(id) FROM messages "
+                        "WHERE session_id = ? AND role = 'user'",
+                        (sid,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT MAX(id) FROM messages WHERE session_id = ?",
+                        (sid,),
+                    ).fetchone()
+            finally:
+                conn.close()
+            self._turn_anchor_id = row[0] if row and row[0] is not None else 0
+        except (sqlite3.Error, OSError) as exc:
+            logger.debug("Could not capture turn anchor: %s", exc)
+
     def _adopt_new_session(self, turn_start: float, before: set[str]) -> None:
         """Title the session created by *this* turn with the mesh thread name.
 
@@ -716,6 +800,13 @@ class HermesClient:
             return
 
         self._resume_id = session_id
+        # The session id only became known during this turn (adoption), so
+        # the pre-spawn anchor capture in chat() had no sid. Re-capture now
+        # with the correct pre-turn boundary: this session is brand-new and
+        # was created by THIS turn, so its first user row is the pre-turn
+        # boundary — every tool row of this turn has an id above it.
+        # (MAX(id) would be wrong: it would exclude this turn's own tools.)
+        self._capture_turn_anchor(session_id, boundary="first_user")
         logger.info(
             "Created and titled mesh thread %r -> session %s",
             self.session_name, session_id[:12],
@@ -823,6 +914,11 @@ class HermesClient:
             # no -c, then adopt + title it after the run so later calls can
             # resolve it by name. See _adopt_new_session.
             adopt_before = self._session_ids()
+        # Recap anchor: capture the session's MAX(messages.id) BEFORE the
+        # child spawns so tool_recap() only counts this turn's tool rows.
+        # First turn (sid unknown until adoption) gets anchor sid=None;
+        # _adopt_new_session re-captures it once the session id is known.
+        self._capture_turn_anchor(self._resume_id)
         with self._model_lock:
             model = self.model
         if model:
