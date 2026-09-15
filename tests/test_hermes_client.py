@@ -4,8 +4,11 @@ Run with:  ./venv/bin/python -m unittest tests.test_hermes_client -v
 (bridge tests that need LXMF/RNS are excluded here — pure client logic only)
 """
 import os
+import sqlite3
 import sys
+import tempfile
 import threading
+import time
 import unittest
 
 # Ensure project src is importable
@@ -166,6 +169,106 @@ class TestChatGuardKillRetry(unittest.TestCase):
         self.assertIsInstance(result, str)
         self.assertTrue(result.startswith("❌"))
         self.assertFalse(c._guard_killed)
+
+
+class TestSessionAdoptionCorrelation(unittest.TestCase):
+    """_adopt_new_session must only ever bind a session created by THIS turn.
+
+    state.db is shared with the gateway, other bridge turns, and any local
+    ``hermes chat``. Picking "the newest session that wasn't there before" can
+    rename and pin an unrelated conversation, so later mesh messages would then
+    resume someone else's context. Adoption therefore correlates on
+    source + cwd + start time, and refuses outright when that is ambiguous.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, cwd TEXT, "
+            "started_at REAL, title TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def _add(self, session_id, started_at, source="reticulum", cwd=None):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO sessions (id, source, cwd, started_at, title) "
+            "VALUES (?, ?, ?, ?, NULL)",
+            (session_id, source, cwd, started_at),
+        )
+        conn.commit()
+        conn.close()
+
+    def _client(self):
+        client = make_client(source_tag="reticulum", hermes_bin="/usr/bin/true")
+        client.session_name = "mesh-reticulum"
+        return client
+
+    def test_adopts_the_one_session_from_this_turn(self):
+        client = self._client()
+        before = client._session_ids()
+        self._add("20260101_000001_aaaaaa", time.time() + 1)
+        client._adopt_new_session(time.time(), before)
+        self.assertEqual(client._resume_id, "20260101_000001_aaaaaa")
+
+    def test_refuses_when_more_than_one_session_appeared(self):
+        """Concurrent session creation -> adopt nothing rather than guess."""
+        client = self._client()
+        before = client._session_ids()
+        now = time.time()
+        self._add("20260101_000001_aaaaaa", now + 1)
+        self._add("20260101_000002_bbbbbb", now + 2)
+        client._adopt_new_session(now, before)
+        self.assertIsNone(client._resume_id)
+
+    def test_ignores_a_session_from_another_source(self):
+        """A gateway/other-platform session in the window is not ours."""
+        client = self._client()
+        before = client._session_ids()
+        now = time.time()
+        self._add("20260101_000001_aaaaaa", now + 1, source="telegram")
+        client._adopt_new_session(now, before)
+        self.assertIsNone(client._resume_id)
+
+    def test_adopts_when_cwd_is_null(self):
+        """Regression: Hermes leaves `cwd` NULL for `chat -q` sessions.
+
+        Filtering on cwd would then match nothing, silently breaking thread
+        continuity on every bootstrap.
+        """
+        client = self._client()
+        before = client._session_ids()
+        self._add("20260101_000001_aaaaaa", time.time() + 1, cwd=None)
+        client._adopt_new_session(time.time(), before)
+        self.assertEqual(client._resume_id, "20260101_000001_aaaaaa")
+
+    def test_ignores_a_session_that_predates_the_turn(self):
+        client = self._client()
+        before = client._session_ids()
+        self._add("20260101_000001_aaaaaa", time.time() - 3600)
+        client._adopt_new_session(time.time(), before)
+        self.assertIsNone(client._resume_id)
+
+    def test_never_adopts_a_session_already_in_the_snapshot(self):
+        """Even a matching row must be new relative to `before`."""
+        client = self._client()
+        self._add("20260101_000001_aaaaaa", time.time() + 1)  # exists up front
+        before = client._session_ids()
+        client._adopt_new_session(time.time(), before)
+        self.assertIsNone(client._resume_id)
 
 
 if __name__ == "__main__":
