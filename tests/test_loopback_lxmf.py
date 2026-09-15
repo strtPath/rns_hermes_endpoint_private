@@ -46,7 +46,7 @@ BRIDGE_LOG = os.path.expanduser(
     # BRIDGE_LOG when your checkout lives elsewhere.
     os.environ.get("BRIDGE_LOG", "~/rns_hermes_endpoint/.lxmf/reticulum.log")
 )
-FALLBACK_DEST = "00000000000000000000000000000000"  # 2026-08-26 announce
+FALLBACK_DEST = "00000000000000000000000000000000"  # placeholder; pass --dest for real discovery
 
 
 def discover_bridge_destination() -> str:
