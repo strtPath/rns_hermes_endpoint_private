@@ -8,6 +8,8 @@ the agent can process them like any other messaging platform.
 import logging
 import os
 
+from hermes_reticulum.utils import expand_path
+
 logger = logging.getLogger("hermes_reticulum.adapter")
 
 
@@ -49,7 +51,9 @@ class ReticulumPlatformAdapter:
             "display_name",
             os.getenv("RETICULUM_DISPLAY_NAME", default_name),
         )
-        self.storage_path = extra.get("storage_path", os.getenv("RETICULUM_STORAGE", None))
+        self.storage_path = expand_path(
+            extra.get("storage_path", os.getenv("RETICULUM_STORAGE", None))
+        )
         self.stamp_cost = int(extra.get("stamp_cost", os.getenv("RETICULUM_STAMP_COST", "8")))
         self.hermes_bin = extra.get("hermes_bin", os.getenv("HERMES_BIN", "hermes"))
         self.timeout = int(extra.get("timeout", os.getenv("HERMES_TIMEOUT", "300")))
