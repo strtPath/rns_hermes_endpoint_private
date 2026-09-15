@@ -60,7 +60,7 @@ Hermes for Reticulum closes that gap:
 Follow [QUICKSTART.md](QUICKSTART.md) to go from clone to first mesh message in under 10 minutes.
 
 ```bash
-git clone https://github.com/apolosan/rns_hermes_endpoint.git
+git clone https://github.com/strtPath/rns_hermes_endpoint.git
 cd rns_hermes_endpoint
 bash install.sh && source venv/bin/activate
 cp config/env.example .env   # set HERMES_BIN and allowed LXMF hashes
@@ -71,15 +71,21 @@ hermes-reticulum run           # note the LXMF address printed at startup
 
 | Item | Version / detail |
 |------|------------------|
-| Python | 3.11 or newer |
-| Hermes Agent | Installed and working (`hermes chat -q "test"`) |
+| Python | 3.11 or newer (Linux and macOS; install.sh avoids GNU-only utilities) |
+| Hermes Agent | Installed and working (`hermes chat -q "reply OK only"`). Verified against Hermes **v0.19.0**; the bridge adapts to Hermes CLI flag/schema differences automatically |
 | Bridge node (optional) | Public IP with TCP port **37428** open, if internet-connected Reticulum peers should reach you |
+
+`install.sh` does more than create the venv: it copies both Hermes plugins
+(`reticulum`, `mesh-tool-gate`) into `~/.hermes/plugins/` **and** adds them to
+`plugins.enabled` in `~/.hermes/config.yaml`. Hermes directory plugins are
+opt-in, so an install that only copied the directories would never load them.
+Restart the Hermes gateway afterwards so they activate.
 
 ## Installation
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/apolosan/rns_hermes_endpoint.git
+git clone https://github.com/strtPath/rns_hermes_endpoint.git
 cd rns_hermes_endpoint
 
 # 2. Install (creates venv and dependencies)
@@ -91,6 +97,10 @@ source venv/bin/activate
 # 4. Configure environment variables
 cp config/env.example .env
 # Edit .env for your deployment
+#   - HERMES_RETICUM_ALLOWED_USERS: LXMF hashes allowed to talk to the agent
+#     (the bridge is DENY-BY-DEFAULT; without an allowlist entry, senders are
+#      rejected — set HERMES_RETICUM_ALLOW_ALL=true only if you mean it)
+#   - HERMES_BIN: only needed if `hermes` is not on PATH
 
 # 5. Configure Reticulum (TCP Server interface)
 #    The installer copies config/reticulum.conf to ~/.reticulum/config if missing.
@@ -272,40 +282,52 @@ NomadNet, custom Python scripts using the [LXMF](https://github.com/markqvist/lx
 The bridge includes a pre-execution approval gate: when the agent
 attempts a dangerous command, the operator on the mesh is prompted to
 `/approve` or `/deny` before the tool runs. The gate waits up to
-`MESH_GATE_TIMEOUT` seconds (default 900) for the operator's verdict.
+`MESH_GATE_TIMEOUT` seconds (default 900) for the operator's verdict, and
+**fails closed** — an unanswered gate blocks the tool.
 
-**This requires a matching Hermes setting.** The `pre_tool_call` hook
-that implements the gate runs on a worker thread with its own timeout,
-controlled by `plugins.hook_callback_timeout` in your Hermes
-`config.yaml` (default 30s). If this value is **shorter** than
-`MESH_GATE_TIMEOUT`, the hook times out and **blocks the tool before the
-operator's verdict arrives** — your `/approve` is too late, and the tool
-is fail-closed blocked even though you approved it.
-
-Set `plugins.hook_callback_timeout` to **at least** your
-`MESH_GATE_TIMEOUT` value:
-
-```yaml
-# ~/.hermes/config.yaml
-plugins:
-  hook_callback_timeout: 900   # must be >= MESH_GATE_TIMEOUT
-```
+Because Hermes invokes `pre_tool_call` hooks **synchronously** (see
+`hermes_cli/plugins.py::invoke_hook`), there is no separate hook worker and,
+on the Hermes builds we verified (v0.19.0), **no `plugins.hook_callback_timeout`
+setting exists**. The gate simply blocks the turn for up to
+`MESH_GATE_TIMEOUT` seconds while it waits for your reply. Meanwhile the
+bridge's liveness guard keeps the child turn alive during the wait, so a long
+gate does not trip it.
 
 | Setting | Where | Purpose |
 |---------|-------|---------|
 | `MESH_GATE_TIMEOUT` | bridge `.env` | How long the gate waits for your verdict (default 900s) |
 | `HERMES_MESH_APPROVAL_TIMEOUT` | bridge `.env` | Control-server-side gate wait (default 900s) |
-| `plugins.hook_callback_timeout` | Hermes `config.yaml` | Hook worker timeout — must be ≥ the above |
+| `HERMES_MESH_CONTROL_URL` | bridge `.env` / plugin env | Where the gate plugin posts `/gate/notify` (default `http://127.0.0.1:8471`) |
 
-If any of these are out of sync, the shortest one wins, and the tool is
-blocked before your verdict is processed.
+If your Hermes build *does* expose a hook timeout that is shorter than
+`MESH_GATE_TIMEOUT`, the shorter value wins and the tool is blocked before your
+verdict arrives — so raise it to at least `MESH_GATE_TIMEOUT`. Verify what your
+build supports with `hermes config get plugins` before relying on it.
 
 Full details: [docs/pre-tool-callback-timeout-issue.md](docs/pre-tool-callback-timeout-issue.md).
+
+### Clean replies on the mesh (turn off reasoning recap)
+
+Hermes renders a "Reasoning" recap panel and, in some environments, a scanner
+notice line. With `display.show_reasoning: true` (the Hermes default) those
+appear in the child's output and are forwarded verbatim to the mesh — so a
+LoRa/Sideband client receives box-drawing art before the actual answer.
+
+For a mesh deployment, disable the recap in `~/.hermes/config.yaml`:
+
+```yaml
+display:
+  show_reasoning: false
+```
+
+This is a Hermes display setting, not a bridge setting. If you would rather
+keep reasoning on your local CLI, run the bridge with a dedicated Hermes
+profile (`HERMES_HOME`) that has `show_reasoning: false`.
 
 ## Development
 
 ```bash
-git clone https://github.com/apolosan/rns_hermes_endpoint.git
+git clone https://github.com/strtPath/rns_hermes_endpoint.git
 cd rns_hermes_endpoint
 
 python -m venv venv
@@ -339,3 +361,4 @@ MIT
 - [LXMF](https://github.com/markqvist/lxmf) — messaging protocol
 - [Sideband](https://github.com/markqvist/Sideband) — LXMF client (one of many)
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) — AI agent
+- [rns_hermes_endpoint](https://github.com/apolosan/rns_hermes_endpoint) — the original project this bridge was forked from

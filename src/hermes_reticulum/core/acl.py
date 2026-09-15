@@ -21,8 +21,8 @@ class AccessControl:
     Controls which LXMF senders can interact with the Hermes agent.
 
     Configuration via environment variables:
-      - HERMES_RETICUM_ALLOW_ALL=true      → open mode (default)
-      - HERMES_RETICUM_ALLOWED_USERS=hex1,hex2 → allowlist
+      - HERMES_RETICUM_ALLOW_ALL=true      → open mode (opt-in; NOT the default)
+      - HERMES_RETICUM_ALLOWED_USERS=hex1,hex2 → allowlist (default mode)
       - HERMES_RETICUM_BLOCKED_USERS=hex1,hex2 → blocklist
     """
 
@@ -31,8 +31,10 @@ class AccessControl:
 
     def _load_config(self):
         """Load ACL config from environment variables."""
-        # Allow-all mode
-        allow_all = os.getenv("HERMES_RETICUM_ALLOW_ALL", "true").lower()
+        # Allow-all mode — FAIL CLOSED. Default is deny-by-default (allowlist
+        # mode), matching README/env.example. Open mode must be opted into
+        # explicitly with HERMES_RETICUM_ALLOW_ALL=true.
+        allow_all = os.getenv("HERMES_RETICUM_ALLOW_ALL", "false").lower()
         self.allow_all = allow_all in ("true", "1", "yes")
 
         # Allowlist

@@ -48,7 +48,9 @@ echo ""
 PYTHON=""
 for candidate in python3.13 python3.12 python3.11 python3; do
     if command -v "$candidate" &>/dev/null; then
-        version=$("$candidate" --version 2>&1 | grep -oP '\d+\.\d+')
+        # Portable version extraction (BSD/macOS grep has no -P).
+        # `python3 --version` prints e.g. "Python 3.14.7" → take field 2, keep major.minor.
+        version=$("$candidate" --version 2>&1 | awk 'NR==1{print $2}' | cut -d. -f1,2)
         major=$(echo "$version" | cut -d. -f1)
         minor=$(echo "$version" | cut -d. -f2)
         if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
@@ -130,26 +132,121 @@ echo "Setting up Hermes plugins..."
 HERMES_PLUGINS_DIR="${HOME}/.hermes/plugins"
 mkdir -p "$HERMES_PLUGINS_DIR"
 
-# Reticulum adapter plugin (progress bubbles, step-through)
-RETICULUM_PLUGIN_SRC="$SCRIPT_DIR/src/hermes_reticulum/plugin"
+# Reticulum gateway platform plugin. This is a directory-plugin shim that
+# bootstraps sys.path to the bridge venv (Hermes and the bridge normally run on
+# different interpreters), so we must (re)write venv_path.txt on every install.
+RETICULUM_PLUGIN_SRC="$SCRIPT_DIR/plugins/reticulum"
+RETICULUM_PLUGIN_DST="$HERMES_PLUGINS_DIR/reticulum"
 if [[ -d "$RETICULUM_PLUGIN_SRC" ]]; then
-    if [[ ! -d "$HERMES_PLUGINS_DIR/reticulum" ]]; then
-        cp -r "$RETICULUM_PLUGIN_SRC" "$HERMES_PLUGINS_DIR/reticulum"
-        echo "  ✓ Copied reticulum plugin to $HERMES_PLUGINS_DIR/reticulum/"
-    else
-        echo "  ✓ Reticulum plugin already at $HERMES_PLUGINS_DIR/reticulum/ (skipping)"
-    fi
+    rm -rf "$RETICULUM_PLUGIN_DST"
+    cp -r "$RETICULUM_PLUGIN_SRC" "$RETICULUM_PLUGIN_DST"
+    # Two roots: the venv (normal installs) and the repo src/ (editable
+    # installs, whose .pth finder is not run when sys.path is patched).
+    {
+        printf '%s\n' "$VENV_DIR"
+        printf '%s\n' "$SCRIPT_DIR/src"
+    } > "$RETICULUM_PLUGIN_DST/venv_path.txt"
+    echo "  ✓ Installed reticulum plugin to $RETICULUM_PLUGIN_DST/"
+    echo "    → bridge venv for the shim: $VENV_DIR"
 fi
 
-# Mesh tool gate plugin (pre-execution approval gate)
+# Mesh tool gate plugin (pre-execution approval gate). Always refresh so
+# upgrades actually take effect.
 GATE_PLUGIN_SRC="$SCRIPT_DIR/src/hermes_reticulum/mesh-tool-gate"
 if [[ -d "$GATE_PLUGIN_SRC" ]]; then
-    if [[ ! -d "$HERMES_PLUGINS_DIR/mesh-tool-gate" ]]; then
-        cp -r "$GATE_PLUGIN_SRC" "$HERMES_PLUGINS_DIR/mesh-tool-gate"
-        echo "  ✓ Copied mesh-tool-gate plugin to $HERMES_PLUGINS_DIR/mesh-tool-gate/"
-    else
-        echo "  ✓ mesh-tool-gate plugin already at $HERMES_PLUGINS_DIR/mesh-tool-gate/ (skipping)"
-    fi
+    rm -rf "$HERMES_PLUGINS_DIR/mesh-tool-gate"
+    cp -r "$GATE_PLUGIN_SRC" "$HERMES_PLUGINS_DIR/mesh-tool-gate"
+    echo "  ✓ Installed mesh-tool-gate plugin to $HERMES_PLUGINS_DIR/mesh-tool-gate/"
+fi
+
+# ─── Enable the plugins in ~/.hermes/config.yaml ───
+# Hermes directory plugins are OPT-IN: a plugin only loads when its name is
+# listed under `plugins.enabled` in config.yaml. Copying the directories is
+# NOT enough — without this step both plugins install silently and never run.
+echo ""
+echo "Enabling Hermes plugins..."
+
+HERMES_CONFIG="${HOME}/.hermes/config.yaml"
+mkdir -p "${HOME}/.hermes"
+
+PY_FOR_YAML=""
+if [[ -x "${VENV_DIR}/bin/python" ]]; then
+    PY_FOR_YAML="${VENV_DIR}/bin/python"
+elif command -v python3 &>/dev/null; then
+    PY_FOR_YAML="$(command -v python3)"
+fi
+
+if [[ -n "$PY_FOR_YAML" ]]; then
+    "$PY_FOR_YAML" - "$HERMES_CONFIG" <<'PYEOF'
+import os
+import shutil
+import sys
+import time
+
+path = sys.argv[1]
+targets = ["mesh-tool-gate", "reticulum"]
+
+# Fast path: no `plugins:` key at all (the common fresh-install case). Append a
+# plain block so the rest of the user's config.yaml (comments included) is
+# left byte-for-byte untouched.
+text = ""
+if os.path.isfile(path):
+    with open(path) as f:
+        text = f.read()
+
+has_plugins_key = any(
+    line.lstrip().startswith("plugins:") for line in text.splitlines()
+)
+
+if not has_plugins_key:
+    block = "\nplugins:\n  enabled:\n" + "".join(f"    - {t}\n" for t in targets)
+    with open(path, "a") as f:
+        f.write(block)
+    print(f"  ✓ Added plugins.enabled to {path}: {', '.join(targets)}")
+    raise SystemExit(0)
+
+# Slow path: a `plugins:` key exists — round-trip through YAML (comments in
+# that file will not survive, hence the backup).
+try:
+    import yaml
+except Exception:
+    print("  ⚠ PyYAML unavailable — add these to plugins.enabled manually: "
+          + ", ".join(targets))
+    raise SystemExit(0)
+
+try:
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception as e:
+    print(f"  ⚠ Could not parse {path} ({e}) — enable plugins manually: "
+          + ", ".join(targets))
+    raise SystemExit(0)
+
+if not isinstance(cfg, dict):
+    cfg = {}
+plugins = cfg.get("plugins")
+if not isinstance(plugins, dict):
+    plugins = {}
+enabled = plugins.get("enabled")
+if not isinstance(enabled, list):
+    enabled = []
+
+added = [t for t in targets if t not in enabled]
+if not added:
+    print(f"  ✓ Plugins already enabled in {path}")
+    raise SystemExit(0)
+
+enabled.extend(added)
+plugins["enabled"] = enabled
+cfg["plugins"] = plugins
+shutil.copy2(path, f"{path}.bak.{time.strftime('%Y%m%d_%H%M%S')}")
+with open(path, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+print(f"  ✓ Enabled plugins in {path}: {', '.join(added)} (backup written)")
+PYEOF
+else
+    echo "  ⚠ No Python found to update config.yaml."
+    echo "    Add 'mesh-tool-gate' and 'reticulum' to plugins.enabled manually."
 fi
 
 # ─── Done ───
@@ -157,15 +254,15 @@ echo ""
 echo "═══ Installation complete! ═══"
 echo ""
 echo "Next steps:"
-echo "  1. Review and edit .env for your setup"
-echo "  2. Set plugins.hook_callback_timeout in ~/.hermes/config.yaml"
-echo "     to at least your MESH_GATE_TIMEOUT value (default: 900)."
-echo "     Without this, your /approve verdicts arrive after the hook"
-echo "     already blocked the tool (fail-closed)."
-echo "  3. Restart the Hermes gateway"
-echo "  4. Start the bridge:  hermes-reticulum run"
-echo "  5. Note the LXMF address printed on startup"
-echo "  6. Add this address as a contact in Sideband (Android)"
+echo "  1. Review and edit .env for your setup."
+echo "     The bridge is DENY-BY-DEFAULT: set HERMES_RETICUM_ALLOWED_USERS to the"
+echo "     LXMF hashes allowed to talk to the agent (or set"
+echo "     HERMES_RETICUM_ALLOW_ALL=true to open it to any mesh peer)."
+echo "  2. Restart the Hermes gateway so the newly enabled plugins load."
+echo "  3. Start the bridge:  hermes-reticulum run"
+echo "  4. Note the LXMF address printed on startup"
+echo "  5. Add this address as a contact in Sideband (Android)"
 echo ""
-echo "See README.md → Deployment for timeout configuration details."
+echo "Note: the pre-execution gate waits MESH_GATE_TIMEOUT seconds (default 900)"
+echo "for your /approve verdict and fails closed on timeout. See README.md."
 echo ""

@@ -1,6 +1,6 @@
 [Unit]
 Description=Hermes for Reticulum — AI agent bridge on the mesh network
-Documentation=https://github.com/apolosan/rns_hermes_endpoint
+Documentation=https://github.com/strtPath/rns_hermes_endpoint
 After=network-online.target
 Wants=network-online.target
 

@@ -20,6 +20,7 @@ from hermes_reticulum.core.downlink import (
     sequence_chunks,
 )
 from hermes_reticulum.core.profiler import ChannelMetrics, ChannelProfiler
+from hermes_reticulum.utils import expand_path
 
 logger = logging.getLogger("hermes_reticulum.bridge")
 
@@ -148,7 +149,9 @@ class LXMFBridge:
             rns_config_path: Path to Reticulum config directory (None = default).
         """
         self.display_name = display_name
-        self.storage_path = Path(storage_path or os.path.expanduser("~/.lxmf/storage"))
+        self.storage_path = Path(
+            expand_path(storage_path or "~/.lxmf/storage")
+        )
         self.stamp_cost = stamp_cost
         self.enforce_stamps = enforce_stamps
         self.rns_config_path = str(rns_config_path) if rns_config_path else None

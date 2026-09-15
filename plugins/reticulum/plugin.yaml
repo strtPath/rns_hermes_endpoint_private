@@ -1,0 +1,12 @@
+name: reticulum
+version: "1.0.0"
+kind: platform
+description: >
+  Registers Reticulum/LXMF as a native Hermes gateway platform, so mesh
+  traffic (RNode, Sideband, NomadNet, custom LXMF clients) is dispatched to
+  the agent like any other messaging platform. The adapter starts an LXM
+  Router, converts incoming LXMF messages into gateway MessageEvents, and
+  sends replies back over LXMF. This directory is a thin shim: the real
+  implementation lives in the hermes_reticulum package inside the bridge
+  venv (see __init__.py for the sys.path bootstrap).
+author: "strtPath"

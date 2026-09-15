@@ -23,6 +23,7 @@ from hermes_reticulum.core.control_server import ControlServer
 from hermes_reticulum.core.hermes_client import HermesClient
 from hermes_reticulum.core.model_command import ModelCommandHandler
 from hermes_reticulum.core.preflight import run_preflight
+from hermes_reticulum.utils import expand_path
 
 
 def _load_dotenv():
@@ -92,10 +93,10 @@ def cmd_run(args):
 
     # Build configuration from env / args
     display_name = args.display_name or os.getenv("RETICULUM_DISPLAY_NAME", "Hermes for Reticulum")
-    storage = args.storage or os.getenv("RETICULUM_STORAGE", None)
+    storage = expand_path(args.storage or os.getenv("RETICULUM_STORAGE", None))
     stamp_cost = args.stamp_cost or int(os.getenv("RETICULUM_STAMP_COST", "8"))
-    rns_config = args.rns_config or os.getenv("RETICULUM_CONFIG", None)
-    hermes_bin = args.hermes_bin or os.getenv("HERMES_BIN", "hermes")
+    rns_config = expand_path(args.rns_config or os.getenv("RETICULUM_CONFIG", None))
+    hermes_bin = expand_path(args.hermes_bin or os.getenv("HERMES_BIN", "hermes"))
     timeout = args.timeout or int(os.getenv("HERMES_TIMEOUT", "300"))
 
     # Initialize components
@@ -307,7 +308,7 @@ def cmd_address(args):
     """Print the LXMF delivery address of the existing identity."""
     setup_logging(False)
 
-    storage = args.storage or os.getenv("RETICULUM_STORAGE", os.path.expanduser("~/.lxmf/storage"))
+    storage = expand_path(args.storage or os.getenv("RETICULUM_STORAGE") or "~/.lxmf/storage")
     identity_path = os.path.join(storage, "hermes_identity")
 
     if not os.path.exists(identity_path):
@@ -322,7 +323,7 @@ def cmd_status(args):
     """Show bridge status."""
     setup_logging(False)
 
-    storage = args.storage or os.getenv("RETICULUM_STORAGE", os.path.expanduser("~/.lxmf/storage"))
+    storage = expand_path(args.storage or os.getenv("RETICULUM_STORAGE") or "~/.lxmf/storage")
     identity_path = os.path.join(storage, "hermes_identity")
     acl = AccessControl()
 

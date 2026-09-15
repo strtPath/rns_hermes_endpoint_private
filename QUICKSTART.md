@@ -32,13 +32,15 @@ hermes chat -q "reply with OK only"
 ## 1. Clone and install
 
 ```bash
-git clone https://github.com/apolosan/rns_hermes_endpoint.git
+git clone https://github.com/strtPath/rns_hermes_endpoint.git
 cd rns_hermes_endpoint
 bash install.sh
 source venv/bin/activate
 ```
 
-`install.sh` creates the virtual environment, installs the package, prepares `~/.lxmf/storage`, and copies `config/reticulum.conf` to `~/.reticulum/config` when it does not exist yet.
+`install.sh` creates the virtual environment, installs the package, prepares `~/.lxmf/storage`, copies `config/reticulum.conf` to `~/.reticulum/config` when it does not exist yet, installs both Hermes plugins into `~/.hermes/plugins/`, and adds them to `plugins.enabled` in `~/.hermes/config.yaml`.
+
+Hermes directory plugins only load when enabled, so **restart the Hermes gateway** after install before the bridge's plugins take effect.
 
 ## 2. Configure environment
 
@@ -145,9 +147,11 @@ Confirm on the client side that your sender hash appears in `HERMES_RETICUM_ALLO
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `hermes: command not found` | Hermes not on PATH | Set `HERMES_BIN` in `.env` |
-| Message ignored | Sender not allowlisted | Add client hash to `HERMES_RETICUM_ALLOWED_USERS` |
+| Message ignored | Sender not allowlisted (the bridge is deny-by-default) | Add client hash to `HERMES_RETICUM_ALLOWED_USERS`, or set `HERMES_RETICUM_ALLOW_ALL=true` |
 | Client won't connect | No Reticulum path or blocked port | Check mesh peers, IP, port 37428, firewall, LoRa links |
 | LXMF identity error | Corrupted local identity store | Delete `~/.lxmf/storage` **only** if you can regenerate contacts |
+| Bridge receives messages but you get no AI reply | Agent process failing (bad Hermes flags, no model configured, timeout) | Run `hermes chat -q "reply OK only"` yourself; check the bridge log for `Hermes exited with code` |
+| `unrecognized arguments: --create-if-missing` in the bridge log | Hermes build older/newer than the bridge assumed | Already handled automatically on v0.19.0; if you see it, update the bridge (`git pull` + re-run `install.sh`) |
 
 ## Next steps
 

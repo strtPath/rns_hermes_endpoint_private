@@ -6,6 +6,7 @@ Supports two modes:
   2. Future: direct Python import when Hermes is importable
 """
 
+import functools
 import json
 import logging
 import os
@@ -17,6 +18,34 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger("hermes_reticulum.hermes")
+
+
+@functools.lru_cache(maxsize=16)
+def hermes_chat_supports_flag(hermes_bin: str, flag: str) -> bool:
+    """Whether this ``hermes`` build's ``chat`` subcommand accepts *flag*.
+
+    Flag sets differ across Hermes versions, and an unrecognized flag makes
+    ``hermes chat`` exit non-zero with a usage error — which would silently
+    break every agent call (the bridge would then return no AI reply at all).
+    ``--create-if-missing`` is one such flag: it is NOT present in Hermes
+    v0.19.0. Probe once per interpreter and cache the result.
+
+    Fails closed to ``False`` (omit the flag) so an unknown build still runs.
+    """
+    try:
+        proc = subprocess.run(
+            [hermes_bin, "chat", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001 — never let the probe break a turn
+        # Includes OSError/SubprocessError and any monkeypatched-Popen oddity:
+        # if we cannot prove the flag exists, omit it (fail closed).
+        logger.debug("hermes chat --help probe failed for %s: %s", hermes_bin, exc)
+        return False
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return flag in output
 
 # Where the CLI-side tool watcher writes its diagnostic log. The hook's
 # ~/.hermes/logs/mesh-tool-events.log is the gateway's; this one proves the
@@ -569,7 +598,10 @@ class HermesClient:
                 row = conn.execute(
                     "SELECT id FROM sessions "
                     "WHERE title = ? "
-                    "ORDER BY last_activity_at DESC LIMIT 1",
+                    # NOTE: 'last_activity_at' does not exist in every Hermes
+                    # schema (v0.19.0 has 'started_at'); ordering by a missing
+                    # column raises and silently breaks thread resumption.
+                    "ORDER BY started_at DESC LIMIT 1",
                     (self.session_name,),
                 ).fetchone()
             finally:
@@ -584,6 +616,110 @@ class HermesClient:
             logger.warning("Could not query state.db for %r: %s",
                            self.session_name, exc)
         return None
+
+    # ── Session creation compatibility (Hermes builds without
+    #    --create-if-missing, e.g. v0.19.0) ────────────────────────────────
+
+    def _state_db_path(self) -> str:
+        return os.path.expanduser(
+            os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
+        )
+
+    def _session_ids(self) -> set[str]:
+        """Snapshot of all session ids, used to detect the session a fresh
+        (no ``-c``) run creates."""
+        db_path = self._state_db_path()
+        if not os.path.exists(db_path):
+            return set()
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                return {row[0] for row in conn.execute("SELECT id FROM sessions")}
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("Could not snapshot sessions from state.db: %s", exc)
+            return set()
+
+    def _adopt_new_session(self, turn_start: float, before: set[str]) -> None:
+        """Title the session created by *this* turn with the mesh thread name.
+
+        Compatibility shim for Hermes builds that lack ``--create-if-missing``:
+        the first turn runs with no ``-c`` (creating an untitled session), then
+        we find that session and rename it via
+        ``hermes sessions rename <id> <name>``. Later turns resume it by name.
+
+        Correlation — the session MUST be attributable to this invocation.
+        ``state.db`` is shared with the gateway and with any local
+        ``hermes chat``, so "the newest session that wasn't here before" is NOT
+        safe: a session created elsewhere during our run would be renamed and
+        pinned, and later mesh messages would resume an unrelated conversation,
+        mixing context between senders. So a candidate must satisfy ALL of:
+
+          * ``started_at >= turn_start``    — created during this turn
+          * ``source == self.source_tag``   — matches our ``--source`` flag
+          * absent from ``before``          — extra guard against clock skew
+
+        ``cwd`` is deliberately NOT used: Hermes leaves it ``NULL`` for
+        sessions created by ``chat -q`` (verified against v0.19.0), so
+        filtering on it matches nothing.
+
+        If that does not identify exactly one session, we adopt nothing. An
+        unpinned thread costs only continuity; pinning the wrong session
+        corrupts the conversation. Callers hold the turn lock across
+        spawn+adopt, so concurrent turns on this client cannot interleave.
+        """
+        db_path = self._state_db_path()
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE started_at >= ? AND source = ? "
+                    "ORDER BY started_at ASC",
+                    (turn_start, self.source_tag),
+                ).fetchall()
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("Could not query state.db to adopt a session: %s", exc)
+            return
+
+        candidates = [row[0] for row in rows if row[0] not in before]
+        if len(candidates) != 1:
+            logger.warning(
+                "Refusing to adopt a session for %r: expected exactly 1 session "
+                "created by this turn (source=%r), found %d — leaving the "
+                "thread unpinned rather than risk resuming an unrelated "
+                "conversation.",
+                self.session_name, self.source_tag, len(candidates),
+            )
+            return
+
+        session_id = candidates[0]
+        try:
+            proc = subprocess.run(
+                [self.hermes_bin, "sessions", "rename", session_id, self.session_name],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not rename session %s: %s", session_id, exc)
+            return
+        if proc.returncode != 0:
+            logger.warning(
+                "hermes sessions rename failed (rc=%s): %s",
+                proc.returncode,
+                (proc.stderr or proc.stdout or "").strip()[:200],
+            )
+            return
+
+        self._resume_id = session_id
+        logger.info(
+            "Created and titled mesh thread %r -> session %s",
+            self.session_name, session_id[:12],
+        )
 
     def _ensure_session(self, new_session: bool) -> None:
         """
@@ -674,10 +810,19 @@ class HermesClient:
             self.source_tag,
             "-Q",  # quiet — suppress banner/spinner
         ]
+        adopt_before: set[str] | None = None
         if self._resume_id:
             cmd += ["--resume", self._resume_id]
-        else:
+        elif hermes_chat_supports_flag(self.hermes_bin, "--create-if-missing"):
             cmd += ["-c", self.session_name, "--create-if-missing"]
+        elif self._resolve_session_id():
+            cmd += ["-c", self.session_name]
+        else:
+            # Not pinned, no titled session exists yet, and this Hermes build
+            # has no --create-if-missing (v0.19.0). Start a fresh session with
+            # no -c, then adopt + title it after the run so later calls can
+            # resolve it by name. See _adopt_new_session.
+            adopt_before = self._session_ids()
         with self._model_lock:
             model = self.model
         if model:
@@ -719,6 +864,10 @@ class HermesClient:
             # only starts (and the clock only starts) once we hold the lock.
             self._deny_veto = False
             with self._turn_lock:
+                # Timestamp the turn BEFORE spawning: it bounds which sessions
+                # this invocation can possibly have created (see
+                # _adopt_new_session).
+                turn_start = time.time()
                 # Spec Part 1, Option B: advance the per-child generation
                 # before spawning so the hook's refreshes are scoped to THIS
                 # child's lifetime, and the initial phase="model" marker
@@ -726,6 +875,14 @@ class HermesClient:
                 # gen — not a stale one from a previous child.
                 self.bump_turn_alive_gen()
                 result = self._run_with_liveness_guard(cmd)
+                if adopt_before is not None:
+                    # The run above started a brand-new untitled session (this
+                    # build has no --create-if-missing). Adopt it WHILE STILL
+                    # holding the turn lock: state.db is shared, so releasing
+                    # the lock first would let a concurrent turn create its own
+                    # session inside the spawn→adopt window, and we could pin
+                    # the wrong conversation.
+                    self._adopt_new_session(turn_start, adopt_before)
             if result is not None and self._guard_killed and not self._deny_veto:
                 if self._guard_kill_worth_retrying(
                     getattr(self, "_last_run_ms", 0.0)
@@ -752,7 +909,11 @@ class HermesClient:
                     if self._resume_id:
                         cmd += ["--resume", self._resume_id]
                     elif not self._resolve_session_id():
-                        cmd += ["-c", self.session_name, "--create-if-missing"]
+                        cmd += ["-c", self.session_name]
+                        if hermes_chat_supports_flag(
+                            self.hermes_bin, "--create-if-missing"
+                        ):
+                            cmd.append("--create-if-missing")
                     if model:
                         cmd += ["-m", model]
                     cmd.extend(self.extra_args)
