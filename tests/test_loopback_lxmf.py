@@ -42,7 +42,9 @@ import LXMF
 TEST_IDENTITY_FILE = os.path.expanduser("~/.lxmf/testloopback_identity")
 TEST_STORAGE_DIR = os.path.expanduser("~/.lxmf/testloopback_storage")
 BRIDGE_LOG = os.path.expanduser(
-    "~/rns_hermes_endpoint/.lxmf/reticulum.log"
+    # Default assumes a standard clone at ~/rns_hermes_endpoint; override with
+    # BRIDGE_LOG when your checkout lives elsewhere.
+    os.environ.get("BRIDGE_LOG", "~/rns_hermes_endpoint/.lxmf/reticulum.log")
 )
 FALLBACK_DEST = "00000000000000000000000000000000"  # 2026-08-26 announce
 

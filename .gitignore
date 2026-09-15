@@ -41,8 +41,8 @@ htmlcov/
 # Logs
 *.log
 
-# Project documentation (local notes, not versioned)
-docs/
+# Generated at install time by install.sh (points the plugin shim at the venv)
+plugins/reticulum/venv_path.txt
 
 # Build artifacts
 *.egg-info/
