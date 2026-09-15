@@ -50,15 +50,21 @@ def register(ctx):
 
         return extra if extra else None
 
-    # Build the platform entry
+    # Build the platform entry. The plugin context OWNS PlatformEntry
+    # construction: ctx.register_platform(name, label, adapter_factory,
+    # check_fn, **entry_kwargs) builds the dataclass itself and sets
+    # source="plugin" / plugin_name for us. So pass plain kwargs — do NOT
+    # construct a PlatformEntry here (that raises TypeError: the first
+    # positional arg is `name: str`, and unknown keys such as optional_env
+    # are not PlatformEntry fields).
     try:
-        from gateway.platform_registry import PlatformEntry
+        from gateway.platform_registry import PlatformEntry  # noqa: F401
     except ImportError:
         # If running standalone (not inside gateway), skip registration
         logger.debug("Not running inside Hermes gateway — skipping platform registration")
         return
 
-    ctx.register_platform(PlatformEntry(
+    ctx.register_platform(
         name="reticulum",
         label="Reticulum (LXMF)",
         adapter_factory=lambda cfg: ReticulumPlatformAdapter(cfg),
@@ -67,10 +73,8 @@ def register(ctx):
         is_connected=is_connected,
         env_enablement_fn=env_enablement,
         required_env=[],
-        optional_env=["RETICULUM_DISPLAY_NAME", "RETICULUM_STORAGE", "RETICULUM_STAMP_COST"],
         install_hint="pip install hermes-reticulum",
         emoji="🛜",
-        source="plugin",
         max_message_length=1024,
         pii_safe=True,
         platform_hint=(
@@ -82,6 +86,6 @@ def register(ctx):
         cron_deliver_env_var="RETICULUM_HOME_CHANNEL",
         allowed_users_env="HERMES_RETICUM_ALLOWED_USERS",
         allow_all_env="HERMES_RETICUM_ALLOW_ALL",
-    ))
+    )
 
     logger.info("Reticulum/LXMF platform registered")
