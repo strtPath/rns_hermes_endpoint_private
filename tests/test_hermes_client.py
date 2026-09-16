@@ -289,6 +289,37 @@ class TestStepWatcherRefreshesMarker(unittest.TestCase):
         else:
             pass  # no marker at all: also acceptable (nothing to refresh)
 
+    def test_no_marker_refresh_on_unrelated_rows(self):
+        # Review hardening: MAX(id) advances for ANY new session row, so a
+        # blind refresh would let user/system/text-only rows keep a stalled
+        # child alive until the hard cap. Only actual tool activity may warm
+        # the heartbeat. A text-only assistant row and a user row must NOT
+        # write a phase="tool" marker.
+        client = self._client()
+        sid = "sess-3"
+        # Seed at id 1.
+        self._add_row(sid, "user", content="hi")
+        stop_evt = threading.Event()
+        t = threading.Thread(
+            target=client._run_step_watcher, args=(sid, stop_evt), daemon=True
+        )
+        t.start()
+        time.sleep(0.3)
+        # Unrelated rows: a text-only assistant reply + another user row.
+        self._add_row(sid, "assistant", content="just text, no tool calls")
+        self._add_row(sid, "user", content="and more")
+        time.sleep(1.5)
+        stop_evt.set()
+        t.join(timeout=5)
+        # No tool activity → no phase="tool" marker was written.
+        if os.path.exists(client.turn_alive_file):
+            with open(client.turn_alive_file, encoding="utf-8") as f:
+                import json as _json
+                marker = _json.load(f)
+            self.assertNotEqual(marker.get("phase"), "tool")
+        else:
+            pass  # no marker at all: correct
+
 
 class TestMarkerScopingDiag(unittest.TestCase):
     def test_no_marker_logs_true_stall(self):

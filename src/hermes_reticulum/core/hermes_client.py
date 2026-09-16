@@ -484,14 +484,6 @@ class HermesClient:
                 continue
             if last_id is None or last_id <= last_pushed:
                 continue
-            # New tool rows for this turn: the model is making real progress.
-            # Refresh the turn-alive marker so the liveness guard (which
-            # polls _marker_alive) sees a fresh heartbeat scoped to THIS
-            # child (session + gen). The gateway agent:step hook never fires
-            # for a CLI child, so without this the marker is only the single
-            # phase="model" write at spawn and a working turn with no stdout
-            # bytes hits the liveness wall clock and gets killed. Best-effort.
-            self.write_turn_alive_marker(phase="tool")
             # New rows since the last push — fetch the tail (all roles) and
             # extract tool calls (assistant rows) + their results
             # (role='tool' rows, linked by tool_call_id).
@@ -511,8 +503,13 @@ class HermesClient:
                 _diag(f"step-watcher fetch error: {e}")
                 continue
             results_by_cid: dict = {}
+            saw_tool_activity = False
             for rid, role, tool_calls, tool_name, content, tool_call_id in rows:
                 if role == "tool" and tool_call_id:
+                    # A tool RESULT row: the model's last call ran. This is
+                    # real tool progress — mark it (heartbeat below) and keep
+                    # the result for the assistant row that issued it.
+                    saw_tool_activity = True
                     results_by_cid[tool_call_id] = content or ""
                 elif role == "assistant" and tool_calls:
                     try:
@@ -521,6 +518,8 @@ class HermesClient:
                         continue
                     if not isinstance(calls, list):
                         continue
+                    if calls:
+                        saw_tool_activity = True
                     for call in calls:
                         if not isinstance(call, dict) or "function" not in call:
                             continue
@@ -534,6 +533,17 @@ class HermesClient:
                         )
                         self._push_step(cname, cargs, result_text, is_error)
                         pushed += 1
+            # Only refresh the liveness marker if this batch actually contained
+            # tool activity. MAX(id) advances for ANY new row in the session
+            # (user, system, text-only assistant, tool), so a blind refresh on
+            # last_id > last_pushed would let unrelated rows keep a stalled
+            # child alive until the hard cap. A working turn emits tool rows;
+            # only those should warm the heartbeat. The gateway agent:step hook
+            # never fires for a CLI child, so this in-process refresh is what
+            # keeps a working -q turn's marker fresh (scoped by session + gen).
+            # Best-effort: a write failure degrades to the bytes-only guard.
+            if saw_tool_activity:
+                self.write_turn_alive_marker(phase="tool")
             last_pushed = last_id
         _diag(f"step-watcher stop sid={sid} pushed={pushed}")
 
