@@ -171,6 +171,151 @@ class TestChatGuardKillRetry(unittest.TestCase):
         self.assertFalse(c._guard_killed)
 
 
+class TestTurnHardCap(unittest.TestCase):
+    def test_default_is_6_hours(self):
+        os.environ.pop("HERMES_TURN_HARD_CAP", None)
+        c = make_client()
+        self.assertEqual(c.turn_hard_cap, 21600)
+
+    def test_env_override(self):
+        os.environ["HERMES_TURN_HARD_CAP"] = "1800"
+        try:
+            c = make_client()
+            self.assertEqual(c.turn_hard_cap, 1800)
+        finally:
+            os.environ.pop("HERMES_TURN_HARD_CAP", None)
+
+    def test_zero_disables(self):
+        os.environ["HERMES_TURN_HARD_CAP"] = "0"
+        try:
+            c = make_client()
+            self.assertEqual(c.turn_hard_cap, 0)
+        finally:
+            os.environ.pop("HERMES_TURN_HARD_CAP", None)
+
+
+class TestStepWatcherRefreshesMarker(unittest.TestCase):
+    """The step watcher must refresh the turn-alive marker each time it sees
+    new tool rows, so a working turn with no stdout bytes doesn't hit the
+    liveness wall clock. Regression: the gateway agent:step hook never fires
+    for a CLI child, so without this the marker is only the one spawn write."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+            "tool_calls TEXT, tool_name TEXT, content TEXT, tool_call_id TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def _client(self):
+        client = make_client(hermes_bin="/usr/bin/true")
+        client.session_name = "mesh-test"
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+        client._push_callback = None  # no push; marker refresh is what we test
+        return client
+
+    def _add_row(self, sid, role, tool_calls=None, tool_name=None,
+                 content=None, tool_call_id=None):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, tool_name, "
+            "content, tool_call_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (sid, role, tool_calls, tool_name, content, tool_call_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_marker_written_when_new_tool_rows_appear(self):
+        client = self._client()
+        sid = "sess-1"
+        # Seed: one user message already present (id 1).
+        self._add_row(sid, "user", content="hi")
+        stop_evt = threading.Event()
+        # Run the watcher in a thread; let it run briefly.
+        t = threading.Thread(
+            target=client._run_step_watcher, args=(sid, stop_evt), daemon=True
+        )
+        t.start()
+        time.sleep(0.3)
+        # Now a tool batch appears (assistant tool_call + tool result).
+        self._add_row(
+            sid, "assistant",
+            tool_calls='[{"id":"c1","function":{"name":"terminal","arguments":{}}}]',
+        )
+        self._add_row(sid, "tool", tool_name="terminal", content="ok", tool_call_id="c1")
+        time.sleep(1.5)
+        stop_evt.set()
+        t.join(timeout=5)
+        # The marker should now exist and be scoped to this child.
+        self.assertTrue(os.path.exists(client.turn_alive_file))
+        with open(client.turn_alive_file, encoding="utf-8") as f:
+            import json as _json
+            marker = _json.load(f)
+        self.assertEqual(marker["session"], "mesh-test")
+        self.assertEqual(marker["phase"], "tool")
+
+    def test_no_marker_refresh_without_new_rows(self):
+        client = self._client()
+        sid = "sess-2"
+        self._add_row(sid, "user", content="hi")
+        stop_evt = threading.Event()
+        t = threading.Thread(
+            target=client._run_step_watcher, args=(sid, stop_evt), daemon=True
+        )
+        t.start()
+        time.sleep(1.5)
+        stop_evt.set()
+        t.join(timeout=5)
+        # No new tool rows → the watcher never wrote a phase="tool" marker.
+        if os.path.exists(client.turn_alive_file):
+            with open(client.turn_alive_file, encoding="utf-8") as f:
+                import json as _json
+                marker = _json.load(f)
+            self.assertNotEqual(marker.get("phase"), "tool")
+        else:
+            pass  # no marker at all: also acceptable (nothing to refresh)
+
+
+class TestMarkerScopingDiag(unittest.TestCase):
+    def test_no_marker_logs_true_stall(self):
+        c = make_client()
+        c.turn_alive_file = "/nonexistent/never/written"
+        # Must not raise; just logs.
+        c._log_marker_scoping_diag()
+
+    def test_scoping_mismatch_detected(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            path = os.path.join(tmp.name, ".turn-alive")
+            with open(path, "w", encoding="utf-8") as f:
+                import json as _json
+                _json.dump(
+                    {"session": "other-session", "ts": time.time(),
+                     "phase": "model", "gen": 99}, f)
+            c = make_client()
+            c.session_name = "mesh-me"
+            c.turn_alive_file = path
+            c._turn_alive_gen = 1
+            # Must not raise; logs the mismatch.
+            c._log_marker_scoping_diag()
+        finally:
+            tmp.cleanup()
+
+
 class TestSessionAdoptionCorrelation(unittest.TestCase):
     """_adopt_new_session must only ever bind a session created by THIS turn.
 
