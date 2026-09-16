@@ -1011,7 +1011,13 @@ class HermesClient:
                         f"continue; or lower HERMES_LIVENESS_TIMEOUT."
                     )
             # Stop the step watcher now the child has finished (it only ever
-            # pushes rows created during the turn).
+            # pushes rows created during the turn). The `finally` below also
+            # sets this on every error path (subprocess setup or turn
+            # processing raising), so the daemon watcher is never orphaned
+            # — an orphan would keep polling state.db and, because it uses
+            # the client's current session + gen, refresh the liveness marker
+            # for a *later* stalled turn, keeping it alive until the hard cap
+            # and pushing its tool steps again. Event.set() is idempotent.
             watcher_stop.set()
             # Checkpoint gate: if the operator pressed /hold, block here
             # until /go (or timeout) before the reply leaves the bridge.
@@ -1025,6 +1031,13 @@ class HermesClient:
         except Exception as e:
             logger.error("Unexpected error calling Hermes: %s", e, exc_info=True)
             return f"❌ Unexpected error: {str(e)[:200]}"
+
+        finally:
+            # Every exit path (normal, FileNotFoundError, any other
+            # Exception) must stop the step watcher. See the comment above:
+            # an orphaned daemon watcher refreshes the liveness marker for
+            # subsequent turns and re-pushes their tool steps.
+            watcher_stop.set()
 
     def _run_with_liveness_guard(self, cmd: list[str]) -> str | None:
         """

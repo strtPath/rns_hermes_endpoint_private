@@ -347,6 +347,92 @@ class TestMarkerScopingDiag(unittest.TestCase):
             tmp.cleanup()
 
 
+class TestStepWatcherStoppedOnException(unittest.TestCase):
+    """The step watcher must be stopped on EVERY exit path of chat(), not just
+    the happy path. If subprocess setup or turn processing raises, the daemon
+    watcher would otherwise be orphaned and keep refreshing the liveness
+    marker for later turns. Regression: the stop event was only set in the
+    happy path of chat(); it now lives in a finally block."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+            "tool_calls TEXT, tool_name TEXT, content TEXT, tool_call_id TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def test_watcher_stopped_when_guard_raises(self):
+        client = make_client(hermes_bin="/usr/bin/true")
+        client.session_name = "mesh-test"
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+        client._step_mode = True
+        client._push_callback = lambda _body: None  # step-mode + push -> watcher starts
+        client._resume_id = None
+
+        # Capture the stop event handed to the watcher thread.
+        recorded = {}
+        real_watcher = client._run_step_watcher
+
+        def spy(sid, stop_evt):
+            recorded["stop_evt"] = stop_evt
+            # Do not actually run the polling loop; we only need the event ref.
+
+        client._run_step_watcher = spy
+
+        # Force the turn to raise so chat() takes an exception path.
+        def boom(_cmd):
+            raise RuntimeError("simulated subprocess failure")
+
+        client._run_with_liveness_guard = boom
+
+        reply = client.chat("hello")
+        # chat() must swallow the exception and return an error string.
+        self.assertTrue(reply.startswith("❌ Unexpected error"), reply)
+        # The watcher stop event must have been created and set (finally path).
+        self.assertIn("stop_evt", recorded)
+        self.assertTrue(recorded["stop_evt"].is_set(),
+                        "watcher_stop was not set on the exception path")
+
+    def test_watcher_stopped_on_file_not_found(self):
+        client = make_client(hermes_bin="/usr/bin/true")
+        client.session_name = "mesh-test"
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+        client._step_mode = True
+        client._push_callback = lambda _body: None
+        client._resume_id = None
+
+        recorded = {}
+
+        def spy(sid, stop_evt):
+            recorded["stop_evt"] = stop_evt
+
+        client._run_step_watcher = spy
+
+        # FileNotFoundError path: make the binary missing.
+        client.hermes_bin = "/nonexistent/hermes-bin-path"
+        # _run_with_liveness_guard's Popen will raise FileNotFoundError.
+        # Leave it unpatched so the real Popen fires.
+        reply = client.chat("hello")
+        self.assertTrue(reply.startswith("❌ Hermes Agent not found"), reply)
+        self.assertIn("stop_evt", recorded)
+        self.assertTrue(recorded["stop_evt"].is_set(),
+                        "watcher_stop was not set on the FileNotFoundError path")
+
+
 class TestSessionAdoptionCorrelation(unittest.TestCase):
     """_adopt_new_session must only ever bind a session created by THIS turn.
 
