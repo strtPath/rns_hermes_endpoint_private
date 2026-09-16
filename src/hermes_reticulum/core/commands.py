@@ -268,9 +268,10 @@ def _cmd_tools(ctx: CommandContext, args: str) -> str | None:
     steps = cs.turn_recap(session) if session else []
     if not steps:
         return "No tool calls this turn yet."
-    lines = [f"🔧 Tools this turn ({len(steps)}):"]
+    lines = [f"📋 Tools this turn ({len(steps)}):"]
     for s in steps[-10:]:
-        lines.append(f"  {s.summary()}" + (" ❌" if s.is_error else ""))
+        # summary() already carries the error glyph — don't double it.
+        lines.append(f"  {s.summary()}")
     if len(steps) > 10:
         lines.append(f"  … and {len(steps) - 10} earlier")
     return "\n".join(lines)

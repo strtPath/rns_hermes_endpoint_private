@@ -145,7 +145,10 @@ def cmd_run(args):
         if push is None:
             logger.debug("no mesh peer for %r — dropping tool event", session)
             return
-        ok = bridge.send_reply(push["hash"], f"🔧 {label}", push["ident"])
+        from hermes_reticulum.core.tool_emoji import tool_label
+        ok = bridge.send_reply(
+            push["hash"], tool_label(label, getattr(step, "is_error", False)), push["ident"]
+        )
         if ok:
             logger.info("Tool event %s pushed to mesh peer %s", label, push["hash"][:16])
         else:

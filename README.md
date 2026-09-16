@@ -200,8 +200,29 @@ Reticulum peers interconnect autonomously. An off-grid RNode only needs a path �
 | `HERMES_RETICUM_ALLOW_ALL` | `false` | Allow any sender |
 | `HERMES_RETICUM_ALLOWED_USERS` | *(empty)* | LXMF hash allowlist |
 | `HERMES_RETICUM_BLOCKED_USERS` | *(empty)* | LXMF hash blocklist |
+| `HERMES_TOOL_EMOJIS` | `~/.hermes/reticulum_tool_emojis.json` | Optional tool-emoji override map (see below) |
 
 Full template: [config/env.example](config/env.example).
+
+### Tool emojis
+
+Tool activity on the mesh uses the same per-tool emoji the Telegram gateway
+shows (`📖 read_file`, `💻 terminal`, `🔍 web_search`, `🐍 execute_code` …), so a
+transcript reads the same whichever platform the operator is on. The table ships
+with the bridge, and a failed call is always `❌`.
+
+The table is a copy of the gateway's registry, which grows as Hermes adds tools.
+To re-sync without waiting for a bridge release, drop a flat
+`{"tool_name": "emoji"}` map at `~/.hermes/reticulum_tool_emojis.json`
+(override with `HERMES_TOOL_EMOJIS`); entries there win over the built-in table.
+An unreadable override file is logged and ignored rather than fatal.
+
+```json
+{
+  "terminal": "🖥",
+  "some_new_tool": "🛰"
+}
+```
 
 ### Hermes binary detection
 

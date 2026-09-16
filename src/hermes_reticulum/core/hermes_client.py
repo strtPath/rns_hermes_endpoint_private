@@ -358,11 +358,11 @@ class HermesClient:
     # like the gateway's progress bubble. No gateway, no hook needed.
 
     def _push_step(self, name: str, args_raw, result: str, is_error: bool) -> None:
-        """Push one tool call (💻 + command) and its output to the mesh peer."""
+        """Push one tool call (emoji + name) and its output to the mesh peer."""
         if not self._push_callback:
             _diag(f"  push_step({name}) skipped: no push callback")
             return
-        # Primary argument, formatted for the mesh (gateway 💻 style).
+        # Primary argument, formatted for the mesh (gateway progress-bubble style).
         args_text = args_raw or ""
         if isinstance(args_raw, (dict, list)):
             try:
@@ -375,8 +375,9 @@ class HermesClient:
                 args_text = str(primary)
         if not args_text:
             args_text = "(no arguments)"
-        # Error tools get a ❌ prefix; keep the command visible either way.
-        head = f"❌ {name}" if is_error else f"💻 {name}"
+        # Same per-tool emoji the gateway shows on Telegram; ❌ for a failed call.
+        from hermes_reticulum.core.tool_emoji import tool_label
+        head = tool_label(name, is_error)
         body = f"{head}\n{args_text}"
         if result:
             body += f"\n{result}"
@@ -1148,9 +1149,10 @@ class HermesClient:
         if not recap:
             return reply
         names = [r["name"] for r in recap]
-        line = "🔧 " + ", ".join(names)
-        if len(names) > 8:
-            line += f" (+{len(names) - 8} more)"
+        from hermes_reticulum.core.tool_emoji import tool_emoji
+        line = ", ".join(f"{tool_emoji(n)} {n}" for n in names)
+        if len(recap) > 8:
+            line += " …"
         return f"{reply}\n\n_{line}_"
 
     def _kill_process(self) -> None:
