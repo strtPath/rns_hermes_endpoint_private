@@ -91,6 +91,48 @@ installed beside the bridge — the bridge must remain installable standalone.
    confirmed by corrupting `terminal` → `🖥` and watching the test fail with
    `{'terminal': {'gateway': '💻', 'mesh': '🖥'}}`.
 
+## Review round 1 — coverage test skipped omissions
+
+The first version of the gated-tool coverage test iterated
+`set(SAFE_TOOLS) | set(RISKY_TOOLS)` but only checked names **already present**
+in the table:
+
+```python
+for name in sorted(set(SAFE_TOOLS) | set(RISKY_TOOLS)):
+    if name in TOOL_EMOJIS:                      # ← silently skips the gap
+        self.assertNotEqual(tool_emoji(name), FALLBACK_EMOJI, name)
+```
+
+Five gated names — `fact_store`, `fact_feedback`, `todo`, `page_info`,
+`cronjob` — were absent from the table and therefore rendering as `⚙️`, while
+the test stayed green. The `if` made the assertion unconditional on the very
+case it existed to catch. Now the presence check is asserted first.
+
+That also forced a decision the original PR had ducked: *why* those five were
+missing. None of them exist in the installed Hermes registry — the drift test
+could not have caught them either, because it only compares against what is
+registered:
+
+- `todo` / `cronjob` — pre-rename aliases; the live tools are `todo_list` and
+  `cronjob_manage`. Mapped to 📋 / ⏰ to match those.
+- `page_info` — a `browser_exec` helper *function*, not a registered tool at
+  all. Mapped to 🌐, the browser family's glyph.
+- `fact_store` / `fact_feedback` — the holographic-memory plugin registers these
+  with **no emoji**, so the gateway itself shows ⚙️ for them. Given 🗂️ / ⚖️ so
+  the mesh operator can tell a fact lookup from a fact rating.
+
+The five are declared in the test's `_ALIASES`, and a new inverse check
+(`test_table_has_no_undeclared_extras`) fails on any table entry the gateway
+does not register and `_ALIASES` does not declare — so a stale leftover after an
+upstream rename is caught instead of accumulating.
+
+A distinctness test was written and then **removed**: enforcing one emoji per
+gated tool tripped on `session_search`/`web_search` (both 🔍) and
+`skill_view`/`skills_list` (both 📚). Those collisions are the gateway's own
+choices, and forcing uniqueness would have made the mesh diverge from Telegram —
+the exact opposite of this module's purpose. The table mirrors upstream; it does
+not curate it.
+
 ## Upstream note
 
 `tools/xai_video_tools.py` registers `xai_video_edit` and `xai_video_extend`

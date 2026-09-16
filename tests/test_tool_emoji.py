@@ -113,12 +113,19 @@ class TestTableShape(unittest.TestCase):
     def test_table_covers_the_tools_the_bridge_gates(self):
         # SAFE_TOOLS / RISKY_TOOLS in control_server drive what the mesh
         # operator approves; every one of those must render a real emoji
-        # rather than the generic fallback.
+        # rather than the generic fallback. Assert PRESENCE first — a name
+        # absent from the table silently passed the old version of this test
+        # while rendering ⚙️ in the field.
         from hermes_reticulum.core.control_server import RISKY_TOOLS, SAFE_TOOLS
 
         for name in sorted(set(SAFE_TOOLS) | set(RISKY_TOOLS)):
-            if name in TOOL_EMOJIS:
-                self.assertNotEqual(tool_emoji(name), FALLBACK_EMOJI, name)
+            self.assertIn(
+                name,
+                TOOL_EMOJIS,
+                f"{name} is gated by classify_tool() but has no emoji mapping — "
+                "it would render as the generic fallback",
+            )
+            self.assertNotEqual(tool_emoji(name), FALLBACK_EMOJI, name)
 
     def test_no_table_value_is_a_bare_word(self):
         # The gateway registers xai_video_* with emoji="video"; we substitute a
@@ -187,6 +194,14 @@ class TestParityWithInstalledGateway(unittest.TestCase):
     # (missing gateway deps), not that the gateway lacks them.
     _SENTINELS = ("terminal", "read_file", "write_file", "web_search")
 
+    # Tools the bridge's classification sets name but upstream never registers:
+    # `todo`/`cronjob` are pre-rename aliases (todo_list/cronjob_manage are the
+    # live names), `page_info` is a browser_exec helper function, and the
+    # holographic-memory plugin registers fact_store/fact_feedback with no emoji
+    # at all. These are deliberate local entries, not drift, so the parity check
+    # does not require upstream to know them.
+    _ALIASES = {"todo", "cronjob", "page_info", "fact_store", "fact_feedback"}
+
     def test_probe_sees_the_real_registry(self):
         """Guard against a vacuous pass over a partially-loaded registry."""
         gateway = self._gateway_tool_emojis()
@@ -226,4 +241,20 @@ class TestParityWithInstalledGateway(unittest.TestCase):
             [],
             "tools the gateway knows but the mesh table does not "
             f"(add them, or set HERMES_TOOL_EMOJIS overrides): {missing}",
+        )
+
+    def test_table_has_no_undeclared_extras(self):
+        """Every table entry is either a registered gateway tool or a declared alias.
+
+        The inverse of the parity check: an entry upstream never heard of is
+        either a stale leftover after a tool was removed, or a name that should
+        be in _ALIASES with a reason. Either way a reviewer should see it.
+        """
+        gateway = self._gateway_tool_emojis()
+        unknown = sorted(set(TOOL_EMOJIS) - set(gateway) - self._ALIASES)
+        self.assertEqual(
+            unknown,
+            [],
+            f"table entries the installed gateway does not register: {unknown} — "
+            "add to _ALIASES with a reason, or drop them",
         )

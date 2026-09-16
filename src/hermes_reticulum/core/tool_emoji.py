@@ -59,6 +59,20 @@ TOOL_EMOJIS: dict[str, str] = {
     "clarify": "❓",
     "close_terminal": "🖥️",
     "cronjob_manage": "⏰",
+    # Legacy/alias names the bridge's tool-classification sets still carry.
+    # `todo` and `cronjob` are the pre-rename names of todo_list/cronjob_manage
+    # (single source: the registry's "todo"/cronjob entry points). `page_info`
+    # is a browser_exec helper function, not a registered tool — it shares the
+    # browser family's 🌐. Kept out of the drift check's table because upstream
+    # registers none of them (see _ALIASES in tests).
+    "todo": "📋",
+    "cronjob": "⏰",
+    "page_info": "🌐",
+    # Holographic-memory plugin tools: registered with NO emoji upstream, so the
+    # gateway itself falls back to ⚙️ for these. Distinct glyphs here so the mesh
+    # operator can tell a fact lookup from a fact rating.
+    "fact_store": "🗂️",
+    "fact_feedback": "⚖️",
     "delegate_task": "🔀",
     "desktop_preview": "🖼️",
     "drive_preview": "🖱️",
