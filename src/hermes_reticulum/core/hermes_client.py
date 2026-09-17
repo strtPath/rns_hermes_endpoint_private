@@ -171,14 +171,6 @@ class HermesClient:
         )
         self._turn_alive_gen = 0
         self._turn_alive_lock = threading.Lock()
-        # Turn anchor for the tool recap: the session's MAX(messages.id)
-        # taken BEFORE this turn's child spawns. The recap only counts tool
-        # rows with id > anchor, so a tool-free turn gets no footer and a
-        # tool-heavy turn never recaps prior turns' tools (see
-        # docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md).
-        # None until the first chat(); reset per turn.
-        self._turn_anchor_sid: str | None = None
-        self._turn_anchor_id: int | None = None
         self.source_tag = source_tag
         self.extra_args = extra_args or []
         self.model = model or os.getenv("HERMES_MODEL", "").strip() or None
@@ -525,16 +517,26 @@ class HermesClient:
         self._hold_gate = False
         return reply
 
-    def tool_recap(self, limit: int = 10) -> list[dict]:
+    def tool_recap(
+        self,
+        limit: int = 10,
+        anchor: tuple[str, int] | None = None,
+    ) -> list[dict]:
         """Recap of the tool calls made during the CURRENT mesh turn.
 
         Read from state.db (the same store hermes persists to), so this
         works even when the live ``agent:step`` hook is unavailable.
-        Scoped to rows with ``id > _turn_anchor_id`` (the session's
-        MAX(id) captured before this turn's child spawned), so a tool-free
-        turn returns [] (no footer) and prior turns' tools never bleed in.
-        If no anchor was captured (should not happen from chat()), fall
-        back to no filter rather than guessing.
+        Scoped to rows with ``id > anchor_id`` (where ``anchor`` is the
+        per-turn ``(sid, row_id)`` boundary captured just before this turn's
+        child spawned), so a tool-free turn returns [] (no footer) and prior
+        turns' tools never bleed in. ``anchor`` is per-call — it is captured
+        inside the turn lock and threaded to the recap, NOT stored as shared
+        mutable client state, so concurrent bridge turns can never read
+        each other's boundary (see
+        docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md).
+        If ``anchor`` is None (session not resolvable, or a DB error at
+        capture time) or its sid doesn't match the session being recap'd,
+        fall back to no filter rather than guessing.
 
         Returns a list of ``{"name": str, "is_error": bool, "preview": str}``
         for the most recent ``limit`` tool messages of this turn (oldest
@@ -543,13 +545,13 @@ class HermesClient:
         sid = self._resume_id or self._resolve_session_id()
         if not sid:
             return []
-        if (
-            self._turn_anchor_sid == sid
-            and self._turn_anchor_id is not None
-        ):
-            anchor = self._turn_anchor_id
+        anchor_sid, anchor_id = (
+            (anchor[0], anchor[1]) if anchor else (None, None)
+        )
+        if anchor_sid == sid and anchor_id is not None:
+            filter_anchor = anchor_id
         else:
-            anchor = None
+            filter_anchor = None
         db_path = os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
@@ -561,12 +563,12 @@ class HermesClient:
             try:
                 # Tool-call messages are persisted as assistant rows with a
                 # tool_calls JSON payload; tool *results* as role='tool'.
-                if anchor is not None:
+                if filter_anchor is not None:
                     rows = conn.execute(
                         "SELECT content, tool_calls FROM messages "
                         "WHERE session_id = ? AND role = 'assistant' "
                         "AND id > ? ORDER BY id ASC",
-                        (sid, anchor),
+                        (sid, filter_anchor),
                     ).fetchall()
                 else:
                     rows = conn.execute(
@@ -673,16 +675,16 @@ class HermesClient:
 
     def _capture_turn_anchor(
         self, sid: str | None, boundary: str = "max"
-    ) -> None:
-        """Record this turn's recap anchor — the row-id boundary below which
-        all rows belong to PRIOR turns.
+    ) -> tuple[str, int] | None:
+        """Compute this turn's recap anchor — the ``(sid, row_id)`` boundary
+        below which all rows belong to PRIOR turns.
 
         ``messages`` is session-global (the store is shared across turns), so
-        the boundary between "prior turns" and "this turn" must be captured
+        the boundary between "prior turns" and "this turn" must be computed
         at the right moment:
 
         - boundary="max" (default): the session's MAX(messages.id). Only
-          valid BEFORE the child spawns (chat() does this): at that point
+          valid BEFORE the child spawns (chat() computes this): at that point
           the max id is the last row of prior turns, and every row the
           child writes has an id above it. A tool-free turn then yields an
           empty recap (no footer) and prior turns' tools never bleed in.
@@ -692,19 +694,24 @@ class HermesClient:
           its first user row is the pre-turn boundary; every tool row of
           this turn sits above it.
 
-        ``tool_recap()`` counts only rows with ``id > anchor``.
+        ``tool_recap(anchor=...)`` counts only rows with ``id > row_id``.
 
-        ``sid`` may be None (session not yet resolvable): the anchor stays
-        unset, and tool_recap() falls back to no filter (the old behavior)
-        rather than guessing. A DB error likewise leaves the anchor unset.
+        Returns the ``tuple`` so the caller can hold it as a LOCAL variable
+        for this turn and thread it into the recap. It is deliberately NOT
+        stored as shared client state: chat() may run concurrently from the
+        bridge's thread pool, and a shared mutable anchor would let one turn
+        overwrite another's boundary (see
+        docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md).
+
+        ``sid`` may be None (session not yet resolvable) → returns None, and
+        tool_recap() falls back to no filter (the old behavior) rather than
+        guessing. A DB error likewise returns None.
         """
-        self._turn_anchor_sid = sid
-        self._turn_anchor_id = None
         if not sid:
-            return
+            return None
         db_path = self._state_db_path()
         if not os.path.exists(db_path):
-            return
+            return None
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
@@ -721,11 +728,15 @@ class HermesClient:
                     ).fetchone()
             finally:
                 conn.close()
-            self._turn_anchor_id = row[0] if row and row[0] is not None else 0
+            row_id = row[0] if row and row[0] is not None else 0
+            return (sid, row_id)
         except (sqlite3.Error, OSError) as exc:
             logger.debug("Could not capture turn anchor: %s", exc)
+            return None
 
-    def _adopt_new_session(self, turn_start: float, before: set[str]) -> None:
+    def _adopt_new_session(
+        self, turn_start: float, before: set[str]
+    ) -> tuple[str, int] | None:
         """Title the session created by *this* turn with the mesh thread name.
 
         Compatibility shim for Hermes builds that lack ``--create-if-missing``:
@@ -752,6 +763,10 @@ class HermesClient:
         unpinned thread costs only continuity; pinning the wrong session
         corrupts the conversation. Callers hold the turn lock across
         spawn+adopt, so concurrent turns on this client cannot interleave.
+
+        Returns the first-turn recap anchor (``boundary="first_user"``) so the
+        caller can thread it into the recap; None when nothing was adopted or
+        the boundary could not be computed.
         """
         db_path = self._state_db_path()
         try:
@@ -767,7 +782,7 @@ class HermesClient:
                 conn.close()
         except (sqlite3.Error, OSError) as exc:
             logger.warning("Could not query state.db to adopt a session: %s", exc)
-            return
+            return None
 
         candidates = [row[0] for row in rows if row[0] not in before]
         if len(candidates) != 1:
@@ -778,7 +793,7 @@ class HermesClient:
                 "conversation.",
                 self.session_name, self.source_tag, len(candidates),
             )
-            return
+            return None
 
         session_id = candidates[0]
         try:
@@ -790,27 +805,29 @@ class HermesClient:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logger.warning("Could not rename session %s: %s", session_id, exc)
-            return
+            return None
         if proc.returncode != 0:
             logger.warning(
                 "hermes sessions rename failed (rc=%s): %s",
                 proc.returncode,
                 (proc.stderr or proc.stdout or "").strip()[:200],
             )
-            return
+            return None
 
         self._resume_id = session_id
         # The session id only became known during this turn (adoption), so
-        # the pre-spawn anchor capture in chat() had no sid. Re-capture now
-        # with the correct pre-turn boundary: this session is brand-new and
-        # was created by THIS turn, so its first user row is the pre-turn
-        # boundary — every tool row of this turn has an id above it.
-        # (MAX(id) would be wrong: it would exclude this turn's own tools.)
-        self._capture_turn_anchor(session_id, boundary="first_user")
+        # the pre-spawn anchor in chat() had no sid. Compute it now with the
+        # correct pre-turn boundary: this session is brand-new and was created
+        # by THIS turn, so its first user row is the pre-turn boundary — every
+        # tool row of this turn has an id above it. (MAX(id) would be wrong:
+        # it would exclude this turn's own tools.) Returned as a LOCAL anchor
+        # for the caller to thread into the recap (never shared state).
+        anchor = self._capture_turn_anchor(session_id, boundary="first_user")
         logger.info(
             "Created and titled mesh thread %r -> session %s",
             self.session_name, session_id[:12],
         )
+        return anchor
 
     def _ensure_session(self, new_session: bool) -> None:
         """
@@ -914,16 +931,20 @@ class HermesClient:
             # no -c, then adopt + title it after the run so later calls can
             # resolve it by name. See _adopt_new_session.
             adopt_before = self._session_ids()
-        # Recap anchor: capture the session's MAX(messages.id) BEFORE the
-        # child spawns so tool_recap() only counts this turn's tool rows.
-        # First turn (sid unknown until adoption) gets anchor sid=None;
-        # _adopt_new_session re-captures it once the session id is known.
-        self._capture_turn_anchor(self._resume_id)
         with self._model_lock:
             model = self.model
         if model:
             cmd += ["-m", model]
         cmd.extend(self.extra_args)
+
+        # Per-turn tool-recap anchor. Computed INSIDE the turn lock (below),
+        # held as a LOCAL for this invocation, and threaded into the recap —
+        # never shared mutable client state. Two concurrent bridge turns (the
+        # bridge fans out on a thread pool) each get their own boundary, so
+        # one turn can never read another's. The first turn (sid unknown until
+        # adoption) gets None here; _adopt_new_session computes it once the
+        # session id is known (boundary="first_user").
+        turn_anchor: tuple[str, int] | None = None
 
         # CLI-side step-through watcher: push each tool call + output as its
         # own mesh message while the child runs. The gateway hook (agent:step)
@@ -964,6 +985,13 @@ class HermesClient:
                 # this invocation can possibly have created (see
                 # _adopt_new_session).
                 turn_start = time.time()
+                # Recap anchor: compute the session's MAX(messages.id) while we
+                # hold the turn lock, BEFORE the child spawns, as a LOCAL for
+                # this turn. Doing it under the lock (not before) means a
+                # concurrent turn can neither overwrite nor read it — the old
+                # shared-instance anchor let a second turn clobber the first
+                # turn's boundary before either serialized on the lock.
+                turn_anchor = self._capture_turn_anchor(self._resume_id)
                 # Spec Part 1, Option B: advance the per-child generation
                 # before spawning so the hook's refreshes are scoped to THIS
                 # child's lifetime, and the initial phase="model" marker
@@ -977,8 +1005,25 @@ class HermesClient:
                     # holding the turn lock: state.db is shared, so releasing
                     # the lock first would let a concurrent turn create its own
                     # session inside the spawn→adopt window, and we could pin
-                    # the wrong conversation.
-                    self._adopt_new_session(turn_start, adopt_before)
+                    # the wrong conversation. Adoption also computes the
+                    # first-turn anchor (boundary="first_user") now that the
+                    # session id exists.
+                    adopted_anchor = self._adopt_new_session(
+                        turn_start, adopt_before
+                    )
+                    if adopted_anchor is not None:
+                        turn_anchor = adopted_anchor
+                # Recap AFTER adoption, so the first-turn anchor (computed
+                # during adoption) is already in place when the footer is
+                # built. On a resumed/known session the pre-spawn anchor is
+                # used as-is; on a fresh session the first_user anchor (or
+                # None, falling back to no filter) is. This is the fix for the
+                # "first turn of an adopted session recaps nothing" gap — the
+                # recap must see the sid/boundary that only adoption provides.
+                if result is not None:
+                    result = self._with_tool_recap(
+                        result, anchor=turn_anchor
+                    )
             if result is not None and self._guard_killed and not self._deny_veto:
                 if self._guard_kill_worth_retrying(
                     getattr(self, "_last_run_ms", 0.0)
@@ -1053,13 +1098,21 @@ class HermesClient:
             logger.error("Unexpected error calling Hermes: %s", e, exc_info=True)
             return f"❌ Unexpected error: {str(e)[:200]}"
 
-    def _run_with_liveness_guard(self, cmd: list[str]) -> str | None:
+    def _run_with_liveness_guard(
+        self, cmd: list[str], anchor: tuple[str, int] | None = None
+    ) -> str | None:
         """
         Run the hermes subprocess with a liveness guard.
 
         Kills the process if zero output (stdout+stderr) for
         ``liveness_timeout`` seconds. Returns the reply text or an
         error message.
+
+        ``anchor`` is this turn's per-turn recap boundary (a local, threaded
+        here — NOT shared state). It is NOT used to recap inside this method:
+        the recap is applied by the caller AFTER session adoption, so the
+        first-turn (adopted-session) anchor is already in place when the
+        footer is built.
         """
         last_activity = time.monotonic()
         started = time.monotonic()
@@ -1207,7 +1260,11 @@ class HermesClient:
             if not reply:
                 logger.warning("Hermes returned empty output")
                 return "_(no response)_"
-            return self._with_tool_recap(reply)
+            # The recap is applied by chat() AFTER session adoption (the
+            # first turn's anchor is only known during adoption), so return
+            # the raw reply here and let the caller thread the per-turn
+            # anchor in.
+            return reply
 
         except FileNotFoundError:
             logger.error("Hermes binary not found at: %s", self.hermes_bin)
@@ -1222,7 +1279,9 @@ class HermesClient:
             self._process = None
             done.set()
 
-    def _with_tool_recap(self, reply: str) -> str:
+    def _with_tool_recap(
+        self, reply: str, anchor: tuple[str, int] | None = None
+    ) -> str:
         """Append a compact tool recap to the reply (recap fallback).
 
         Live tool steps are the primary channel; this is the safety net —
@@ -1232,12 +1291,16 @@ class HermesClient:
         Suppressed entirely in step mode: the CLI-side watcher already
         delivered each tool call + output as its own 💻 message, so a recap
         footer would be a redundant recap the user explicitly rejected.
+
+        ``anchor`` is this turn's per-turn recap boundary, threaded in by the
+        caller (chat() computes it under the turn lock and hands it over
+        after adoption). Never reads shared client state.
         """
         if self._step_mode:
             _diag(f"  recap suppressed (step mode) reply={len(reply)} chars")
             return reply
         try:
-            recap = self.tool_recap(limit=8)
+            recap = self.tool_recap(limit=8, anchor=anchor)
         except Exception as exc:
             logger.debug("tool_recap failed: %s", exc)
             return reply
