@@ -229,14 +229,24 @@ Each client has a 32-character hex LXMF identity hash — from Sideband (Setting
 
 ## Systemd service
 
-Adjust paths in `config/hermes-reticulum*.service` before installing.
+`install.sh` renders the unit from your checkout — no manual path editing.
+The template in `config/` uses the placeholder path `/opt/rns_hermes_endpoint`;
+the installer substitutes it with your actual repo path and current user's
+`$HOME`, injects a `PATH` env line (user units inherit a minimal environment),
+writes `~/.config/systemd/user/hermes-reticulum.service`, and enables it.
 
 ### User-level (no root)
 
 ```bash
-mkdir -p ~/.config/systemd/user/
-cp config/hermes-reticulum.user.service ~/.config/systemd/user/hermes-reticulum.service
-# Edit WorkingDirectory, Environment, and ExecStart for your paths
+# Installs the package and the systemd user service in one step:
+bash install.sh --service
+
+# Or, if you already installed the package, just the service:
+sed "s|/opt/rns_hermes_endpoint|$(pwd)|g" \
+    config/hermes-reticulum.user.service \
+    > ~/.config/systemd/user/hermes-reticulum.service
+echo "Environment=PATH=$(pwd)/venv/bin:/usr/bin:/bin" \
+    >> ~/.config/systemd/user/hermes-reticulum.service
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-reticulum
 journalctl --user -u hermes-reticulum -f
@@ -245,8 +255,10 @@ journalctl --user -u hermes-reticulum -f
 ### System-level (root)
 
 ```bash
+# The unit ships with the /opt/rns_hermes_endpoint placeholder and a
+# dedicated User=/Group= (hermes:hermes) for hardened deployments.
+# Adjust both for your deployment before installing:
 sudo cp config/hermes-reticulum.service /etc/systemd/system/
-# Edit paths and service user for your deployment
 sudo systemctl daemon-reload
 sudo systemctl enable --now hermes-reticulum
 ```
