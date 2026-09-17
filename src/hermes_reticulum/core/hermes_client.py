@@ -136,6 +136,14 @@ class HermesClient:
         self.liveness_timeout = int(
             os.getenv("HERMES_LIVENESS_TIMEOUT", "600")
         )
+        # Hard cap: an absolute wall clock on a single turn, independent of the
+        # relative liveness silence window. Even if the marker keeps trickling
+        # fresh tool rows forever, a turn that runs past this cap is itself
+        # suspect and is killed. Set 0 to disable. Distinct from
+        # liveness_timeout (which is "silence with no progress").
+        self.turn_hard_cap = int(
+            os.getenv("HERMES_TURN_HARD_CAP", "21600")
+        )
         # Liveness-heartbeat marker file (spec Part 1, Option A): the
         # ``agent:step`` hook and the bridge itself write
         # ``{"session": <thread title>, "ts": <time.time()>, "phase": ...,
@@ -302,6 +310,48 @@ class HermesClient:
             return False
         return True
 
+    def _log_marker_scoping_diag(self) -> None:
+        """Log the marker's session+gen vs this child's, at a guard kill.
+
+        Distinguishes a scoping mismatch (marker written for a different
+        session or generation — e.g. a resumed child whose gen was bumped
+        after the hook wrote the marker) from a true stall (no marker at
+        all). Called from the watchdog kill path; best-effort, never raises.
+        """
+        cur_gen = self.current_turn_alive_gen()
+        try:
+            with open(self.turn_alive_file, encoding="utf-8") as f:
+                marker = json.load(f)
+        except FileNotFoundError:
+            logger.warning(
+                "Liveness guard fired: no marker present "
+                "(child session=%r gen=%d) — true stall or marker never written",
+                self.session_name, cur_gen,
+            )
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Liveness guard fired: marker unreadable (%s) "
+                "(child session=%r gen=%d)",
+                exc, self.session_name, cur_gen,
+            )
+            return
+        m_session = marker.get("session")
+        m_gen = marker.get("gen")
+        if m_session != self.session_name or m_gen != cur_gen:
+            logger.warning(
+                "Liveness guard fired on SCOPING MISMATCH: marker "
+                "(session=%r gen=%s) != child (session=%r gen=%d) — "
+                "possibly a stale/resumed marker, not a true stall",
+                m_session, m_gen, self.session_name, cur_gen,
+            )
+        else:
+            logger.warning(
+                "Liveness guard fired on TRUE STALL: marker matched "
+                "(session=%r gen=%d) but went stale within %ds",
+                self.session_name, cur_gen, self.liveness_timeout,
+            )
+
     def steer(self, text: str) -> None:
         """Queue steering text to be injected as a prefix to the next prompt."""
         self._steer_pending = (text or "").strip() or None
@@ -358,11 +408,11 @@ class HermesClient:
     # like the gateway's progress bubble. No gateway, no hook needed.
 
     def _push_step(self, name: str, args_raw, result: str, is_error: bool) -> None:
-        """Push one tool call (💻 + command) and its output to the mesh peer."""
+        """Push one tool call (emoji + name) and its output to the mesh peer."""
         if not self._push_callback:
             _diag(f"  push_step({name}) skipped: no push callback")
             return
-        # Primary argument, formatted for the mesh (gateway 💻 style).
+        # Primary argument, formatted for the mesh (gateway progress-bubble style).
         args_text = args_raw or ""
         if isinstance(args_raw, (dict, list)):
             try:
@@ -375,8 +425,9 @@ class HermesClient:
                 args_text = str(primary)
         if not args_text:
             args_text = "(no arguments)"
-        # Error tools get a ❌ prefix; keep the command visible either way.
-        head = f"❌ {name}" if is_error else f"💻 {name}"
+        # Same per-tool emoji the gateway shows on Telegram; ❌ for a failed call.
+        from hermes_reticulum.core.tool_emoji import tool_label
+        head = tool_label(name, is_error)
         body = f"{head}\n{args_text}"
         if result:
             body += f"\n{result}"
@@ -452,8 +503,13 @@ class HermesClient:
                 _diag(f"step-watcher fetch error: {e}")
                 continue
             results_by_cid: dict = {}
+            saw_tool_activity = False
             for rid, role, tool_calls, tool_name, content, tool_call_id in rows:
                 if role == "tool" and tool_call_id:
+                    # A tool RESULT row: the model's last call ran. This is
+                    # real tool progress — mark it (heartbeat below) and keep
+                    # the result for the assistant row that issued it.
+                    saw_tool_activity = True
                     results_by_cid[tool_call_id] = content or ""
                 elif role == "assistant" and tool_calls:
                     try:
@@ -462,6 +518,8 @@ class HermesClient:
                         continue
                     if not isinstance(calls, list):
                         continue
+                    if calls:
+                        saw_tool_activity = True
                     for call in calls:
                         if not isinstance(call, dict) or "function" not in call:
                             continue
@@ -475,6 +533,17 @@ class HermesClient:
                         )
                         self._push_step(cname, cargs, result_text, is_error)
                         pushed += 1
+            # Only refresh the liveness marker if this batch actually contained
+            # tool activity. MAX(id) advances for ANY new row in the session
+            # (user, system, text-only assistant, tool), so a blind refresh on
+            # last_id > last_pushed would let unrelated rows keep a stalled
+            # child alive until the hard cap. A working turn emits tool rows;
+            # only those should warm the heartbeat. The gateway agent:step hook
+            # never fires for a CLI child, so this in-process refresh is what
+            # keeps a working -q turn's marker fresh (scoped by session + gen).
+            # Best-effort: a write failure degrades to the bytes-only guard.
+            if saw_tool_activity:
+                self.write_turn_alive_marker(phase="tool")
             last_pushed = last_id
         _diag(f"step-watcher stop sid={sid} pushed={pushed}")
 
@@ -1083,7 +1152,13 @@ class HermesClient:
                         f"continue; or lower HERMES_LIVENESS_TIMEOUT."
                     )
             # Stop the step watcher now the child has finished (it only ever
-            # pushes rows created during the turn).
+            # pushes rows created during the turn). The `finally` below also
+            # sets this on every error path (subprocess setup or turn
+            # processing raising), so the daemon watcher is never orphaned
+            # — an orphan would keep polling state.db and, because it uses
+            # the client's current session + gen, refresh the liveness marker
+            # for a *later* stalled turn, keeping it alive until the hard cap
+            # and pushing its tool steps again. Event.set() is idempotent.
             watcher_stop.set()
             # Checkpoint gate: if the operator pressed /hold, block here
             # until /go (or timeout) before the reply leaves the bridge.
@@ -1097,6 +1172,13 @@ class HermesClient:
         except Exception as e:
             logger.error("Unexpected error calling Hermes: %s", e, exc_info=True)
             return f"❌ Unexpected error: {str(e)[:200]}"
+
+        finally:
+            # Every exit path (normal, FileNotFoundError, any other
+            # Exception) must stop the step watcher. See the comment above:
+            # an orphaned daemon watcher refreshes the liveness marker for
+            # subsequent turns and re-pushes their tool steps.
+            watcher_stop.set()
 
     def _run_with_liveness_guard(
         self, cmd: list[str], anchor: tuple[str, int] | None = None
@@ -1140,17 +1222,40 @@ class HermesClient:
                     pass
 
         def _watchdog():
-            if not self.liveness_timeout:
+            if not self.liveness_timeout and not self.turn_hard_cap:
                 return
             while not done.is_set():
+                now = time.monotonic()
+                # Hard cap: absolute wall clock on the whole turn, independent
+                # of the silence window. Fires even if the marker is fresh (a
+                # turn trickling tool rows for hours is still suspect).
+                if self.turn_hard_cap and (now - started) > self.turn_hard_cap:
+                    logger.warning(
+                        "Liveness guard: turn exceeded the hard cap %ds, "
+                        "killing hermes",
+                        self.turn_hard_cap,
+                    )
+                    self._stop_requested = True
+                    self._guard_killed = True
+                    self._deny_veto = False
+                    self._kill_process()
+                    self.clear_turn_alive_marker()
+                    return
+                if not self.liveness_timeout:
+                    done.wait(1.0)
+                    continue
                 with activity_lock:
-                    remaining = (last_activity + self.liveness_timeout) - time.monotonic()
+                    remaining = (last_activity + self.liveness_timeout) - now
                 if remaining <= 0:
                     logger.warning(
                         "Liveness guard: no output or heartbeat for %ds, "
                         "killing hermes",
                         self.liveness_timeout,
                     )
+                    # Diagnostic: was this a scoping mismatch (marker session
+                    # or gen not matching this child — e.g. on resume) vs a
+                    # true stall? Logged once at the kill, best-effort.
+                    self._log_marker_scoping_diag()
                     self._stop_requested = True
                     self._guard_killed = True
                     # A liveness-guard kill is NOT a mesh veto — clear it so
@@ -1307,9 +1412,10 @@ class HermesClient:
         if not recap:
             return reply
         names = [r["name"] for r in recap]
-        line = "🔧 " + ", ".join(names)
-        if len(names) > 8:
-            line += f" (+{len(names) - 8} more)"
+        from hermes_reticulum.core.tool_emoji import tool_emoji
+        line = ", ".join(f"{tool_emoji(n)} {n}" for n in names)
+        if len(recap) > 8:
+            line += " …"
         return f"{reply}\n\n_{line}_"
 
     def _kill_process(self) -> None:

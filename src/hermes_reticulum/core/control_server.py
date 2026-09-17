@@ -50,10 +50,8 @@ class ToolStep:
 
     def summary(self) -> str:
         """Compact one-line summary for mesh display (bandwidth-aware)."""
-        base = f"🔧 {self.name}"
-        if self.is_error:
-            base += " ❌"
-        return base
+        from hermes_reticulum.core.tool_emoji import tool_label
+        return tool_label(self.name, self.is_error)
 
 
 def classify_tool(name: str) -> str:

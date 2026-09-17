@@ -200,8 +200,29 @@ Reticulum peers interconnect autonomously. An off-grid RNode only needs a path �
 | `HERMES_RETICUM_ALLOW_ALL` | `false` | Allow any sender |
 | `HERMES_RETICUM_ALLOWED_USERS` | *(empty)* | LXMF hash allowlist |
 | `HERMES_RETICUM_BLOCKED_USERS` | *(empty)* | LXMF hash blocklist |
+| `HERMES_TOOL_EMOJIS` | `~/.hermes/reticulum_tool_emojis.json` | Optional tool-emoji override map (see below) |
 
 Full template: [config/env.example](config/env.example).
+
+### Tool emojis
+
+Tool activity on the mesh uses the same per-tool emoji the Telegram gateway
+shows (`📖 read_file`, `💻 terminal`, `🔍 web_search`, `🐍 execute_code` …), so a
+transcript reads the same whichever platform the operator is on. The table ships
+with the bridge, and a failed call is always `❌`.
+
+The table is a copy of the gateway's registry, which grows as Hermes adds tools.
+To re-sync without waiting for a bridge release, drop a flat
+`{"tool_name": "emoji"}` map at `~/.hermes/reticulum_tool_emojis.json`
+(override with `HERMES_TOOL_EMOJIS`); entries there win over the built-in table.
+An unreadable override file is logged and ignored rather than fatal.
+
+```json
+{
+  "terminal": "🖥",
+  "some_new_tool": "🛰"
+}
+```
 
 ### Hermes binary detection
 
@@ -229,14 +250,37 @@ Each client has a 32-character hex LXMF identity hash — from Sideband (Setting
 
 ## Systemd service
 
-Adjust paths in `config/hermes-reticulum*.service` before installing.
+`install.sh` renders the unit from your checkout — no manual path editing.
+The template in `config/` uses the placeholder path `/opt/rns_hermes_endpoint`;
+the installer resolves it to your actual repo path, points `ExecStart` at the
+binary the install actually created (honouring `--venv` / `--global`), injects
+a `PATH` env line (user units inherit a minimal environment), writes
+`~/.config/systemd/user/hermes-reticulum.service`, and enables it.
 
 ### User-level (no root)
 
 ```bash
-mkdir -p ~/.config/systemd/user/
-cp config/hermes-reticulum.user.service ~/.config/systemd/user/hermes-reticulum.service
-# Edit WorkingDirectory, Environment, and ExecStart for your paths
+# Installs the package and the systemd user service in one step:
+bash install.sh --service
+
+# Or, if you already installed the package, render the unit by hand:
+python3 - <<'EOF'
+import os
+home = os.getcwd()
+src = os.path.join(home, "config", "hermes-reticulum.user.service")
+dst = os.path.expanduser("~/.config/systemd/user/hermes-reticulum.service")
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+lines = open(src).readlines()
+out, venv = [], os.path.join(home, "venv")
+for line in lines:
+    line = line.replace("/opt/rns_hermes_endpoint", home)
+    if line.startswith("ExecStart="):
+        line = f"ExecStart={venv}/bin/hermes-reticulum run\n"
+    out.append(line)
+    if line.startswith("EnvironmentFile="):
+        out.append(f"Environment=PATH={venv}/bin:/usr/bin:/bin\n")
+open(dst, "w").writelines(out)
+EOF
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-reticulum
 journalctl --user -u hermes-reticulum -f
@@ -245,8 +289,10 @@ journalctl --user -u hermes-reticulum -f
 ### System-level (root)
 
 ```bash
+# The unit ships with the /opt/rns_hermes_endpoint placeholder and a
+# dedicated User=/Group= (hermes:hermes) for hardened deployments.
+# Adjust both for your deployment before installing:
 sudo cp config/hermes-reticulum.service /etc/systemd/system/
-# Edit paths and service user for your deployment
 sudo systemctl daemon-reload
 sudo systemctl enable --now hermes-reticulum
 ```
