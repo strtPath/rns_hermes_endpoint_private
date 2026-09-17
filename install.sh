@@ -286,10 +286,18 @@ BRIDGE_HOME="${SCRIPT_DIR}"
 # systemd units have no variable expansion and a hostile-looking checkout
 # path (|, &, /, whitespace) would corrupt a naive sed substitution, so
 # render the unit with the placeholder already resolved via Python.
-RENDER_PY="$BRIDGE_HOME/venv/bin/python"
-[[ -x "$RENDER_PY" ]] || RENDER_PY="$(command -v python3)"
+RENDER_PY="${VENV_DIR}/bin/python"
+if [[ ! -x "$RENDER_PY" ]]; then
+    RENDER_PY=""
+    for cand in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python; do
+        if command -v "$cand" &>/dev/null; then
+            RENDER_PY="$(command -v "$cand")"
+            break
+        fi
+    done
+fi
 if [[ -z "$RENDER_PY" ]]; then
-    echo "  ⚠ No python3 found — skipping systemd service step."
+    echo "  ⚠ No Python interpreter found — skipping systemd service step."
     echo ""
 else
     if [[ "$INSTALL_SERVICE" == "no" ]]; then
