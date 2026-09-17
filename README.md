@@ -231,9 +231,10 @@ Each client has a 32-character hex LXMF identity hash — from Sideband (Setting
 
 `install.sh` renders the unit from your checkout — no manual path editing.
 The template in `config/` uses the placeholder path `/opt/rns_hermes_endpoint`;
-the installer substitutes it with your actual repo path and current user's
-`$HOME`, injects a `PATH` env line (user units inherit a minimal environment),
-writes `~/.config/systemd/user/hermes-reticulum.service`, and enables it.
+the installer resolves it to your actual repo path, points `ExecStart` at the
+binary the install actually created (honouring `--venv` / `--global`), injects
+a `PATH` env line (user units inherit a minimal environment), writes
+`~/.config/systemd/user/hermes-reticulum.service`, and enables it.
 
 ### User-level (no root)
 
@@ -241,12 +242,24 @@ writes `~/.config/systemd/user/hermes-reticulum.service`, and enables it.
 # Installs the package and the systemd user service in one step:
 bash install.sh --service
 
-# Or, if you already installed the package, just the service:
-sed "s|/opt/rns_hermes_endpoint|$(pwd)|g" \
-    config/hermes-reticulum.user.service \
-    > ~/.config/systemd/user/hermes-reticulum.service
-echo "Environment=PATH=$(pwd)/venv/bin:/usr/bin:/bin" \
-    >> ~/.config/systemd/user/hermes-reticulum.service
+# Or, if you already installed the package, render the unit by hand:
+python3 - <<'EOF'
+import os
+home = os.getcwd()
+src = os.path.join(home, "config", "hermes-reticulum.user.service")
+dst = os.path.expanduser("~/.config/systemd/user/hermes-reticulum.service")
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+lines = open(src).readlines()
+out, venv = [], os.path.join(home, "venv")
+for line in lines:
+    line = line.replace("/opt/rns_hermes_endpoint", home)
+    if line.startswith("ExecStart="):
+        line = f"ExecStart={venv}/bin/hermes-reticulum run\n"
+    out.append(line)
+    if line.startswith("EnvironmentFile="):
+        out.append(f"Environment=PATH={venv}/bin:/usr/bin:/bin\n")
+open(dst, "w").writelines(out)
+EOF
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-reticulum
 journalctl --user -u hermes-reticulum -f

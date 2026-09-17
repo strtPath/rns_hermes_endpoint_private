@@ -30,7 +30,11 @@ class TestDotenvReachesAcl(unittest.TestCase):
         os.chdir(self._tmp.name)
         self._saved = {
             var: os.environ.pop(var, None)
-            for var in ("HERMES_RETICUM_ALLOW_ALL", "HERMES_RETICUM_ALLOWED_USERS")
+            for var in (
+                "HERMES_RETICUM_ALLOW_ALL",
+                "HERMES_RETICUM_ALLOWED_USERS",
+                "HERMES_RETICUM_BLOCKED_USERS",
+            )
         }
         with open(".env", "w", encoding="utf-8") as fh:
             fh.write("HERMES_RETICUM_ALLOW_ALL=false\n")
