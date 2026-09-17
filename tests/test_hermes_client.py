@@ -533,5 +533,332 @@ class TestSessionAdoptionCorrelation(unittest.TestCase):
         self.assertIsNone(client._resume_id)
 
 
+class TestToolRecapTurnScoping(unittest.TestCase):
+    """tool_recap() must recap only the CURRENT turn's tool calls, not the
+    session's whole history (the "prior-turns recap" bug:
+    docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, cwd TEXT, "
+            "started_at REAL, title TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT, role TEXT, tool_name TEXT, "
+            "tool_calls TEXT, tool_call_id TEXT, content TEXT)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def _add_session(self, session_id):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO sessions (id, source, cwd, started_at, title) "
+            "VALUES (?, 'reticulum', NULL, 0, 'mesh-reticulum')",
+            (session_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    def _add_msg(self, session_id, role, tool_name=None,
+                 tool_calls=None, tool_call_id=None, content=""):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO messages "
+            "(session_id, role, tool_name, tool_calls, tool_call_id, content) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, role, tool_name, tool_calls, tool_call_id, content),
+        )
+        conn.commit()
+        conn.close()
+
+    def _client(self, session_id):
+        client = make_client(source_tag="reticulum", hermes_bin="/usr/bin/true")
+        client._resume_id = session_id
+        return client
+
+    def test_tool_free_turn_gets_no_recap(self):
+        """Turn A used tools; turn B used none → turn B's recap is []."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        # Turn A: user msg + assistant tool_calls + tool result.
+        self._add_msg(sid, "user", content="turn A")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "c1", "function": {"name": "terminal", "arguments": "{\"command\": \"ls\"}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal",
+                      tool_call_id="c1", content="ok")
+        # Turn B: user msg only (no tool rows).
+        self._add_msg(sid, "user", content="turn B")
+        # Anchor at the pre-spawn MAX(id) for turn B's chat() — the end of
+        # turn A's rows (the turn B user row is written by the child, so it
+        # is above the anchor and irrelevant: it is not a tool row). Now a
+        # per-call tuple threaded into the recap.
+        client = self._client(sid)
+        anchor = client._capture_turn_anchor(sid)
+        # Now simulate the child having written turn B's user row.
+        self._add_msg(sid, "user", content="turn B (child write)")
+        recap = client.tool_recap(limit=8, anchor=anchor)
+        self.assertEqual(recap, [])
+
+    def test_recap_excludes_prior_turns_tools(self):
+        """Turn B used tools; turn A's earlier tools must not appear."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        # Turn A: one tool call.
+        self._add_msg(sid, "user", content="turn A")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "a1", "function": {"name": "search_files", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="search_files",
+                      tool_call_id="a1", content="{}")
+        # Anchor for turn B — captured BEFORE the child spawns, i.e. while
+        # turn A's rows are the last ones in the session (MAX(id) = end of
+        # turn A). This mirrors chat() capturing the anchor pre-spawn.
+        client = self._client(sid)
+        anchor = client._capture_turn_anchor(sid)
+        # Turn B: its own tool call only. (arguments is a JSON-encoded
+        # string, double-escaped, exactly as hermes persists it.)
+        self._add_msg(sid, "user", content="turn B")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "b1", "function": {"name": "terminal", "arguments": "{\\"command\\": \\"pwd\\"}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal",
+                      tool_call_id="b1", content="/tmp")
+        recap = client.tool_recap(limit=8, anchor=anchor)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["terminal"])
+        self.assertNotIn("search_files", names)
+
+    def test_no_anchor_falls_back_to_session_history(self):
+        """Anchor unset (sid None at capture) → old behavior, whole session."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        self._add_msg(sid, "user", content="turn A")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "a1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        client = self._client(sid)
+        anchor = client._capture_turn_anchor(None)  # sid unknown at capture time
+        self.assertIsNone(anchor)
+        recap = client.tool_recap(limit=8, anchor=anchor)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["terminal"])
+
+    def test_anchor_scoped_to_matching_sid(self):
+        """Anchor captured for session X must not filter session Y."""
+        sid_x = "20260101_000001_aaaaaa"
+        sid_y = "20260101_000002_bbbbbb"
+        self._add_session(sid_x)
+        self._add_session(sid_y)
+        self._add_msg(sid_x, "user", content="x")
+        self._add_msg(
+            sid_x, "assistant",
+            tool_calls='[{"id": "x1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid_y, "user", content="y")
+        self._add_msg(
+            sid_y, "assistant",
+            tool_calls='[{"id": "y1", "function": {"name": "read_file", "arguments": "{}"}}]',
+            content="",
+        )
+        client = self._client(sid_x)
+        anchor = client._capture_turn_anchor(sid_x)
+        # Recap for session Y with X's anchor: sid mismatch → no filter,
+        # Y's own tools show (not X's — the WHERE session_id still scopes).
+        client._resume_id = sid_y
+        recap = client.tool_recap(limit=8, anchor=anchor)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["read_file"])
+
+    def test_first_turn_adopted_session_uses_first_user_boundary(self):
+        """Adopted (brand-new) session: boundary=first_user means this
+        turn's tools are included (they sit above the first user row)."""
+        sid = "20260101_000003_cccccc"
+        self._add_session(sid)
+        # The child (this turn) wrote: user row, then tool calls.
+        self._add_msg(sid, "user", content="first turn")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "f1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal",
+                      tool_call_id="f1", content="ok")
+        client = self._client(sid)
+        anchor = client._capture_turn_anchor(sid, boundary="first_user")
+        recap = client.tool_recap(limit=8, anchor=anchor)
+        names = [r["name"] for r in recap]
+        self.assertEqual(names, ["terminal"])
+
+    def test_capture_anchor_is_pure_per_call_no_shared_state(self):
+        """_capture_turn_anchor returns a LOCAL tuple and must NOT mutate any
+        shared client attribute. This is the guard against the old bug where
+        self._turn_anchor_id / self._turn_anchor_sid were shared mutable state
+        that concurrent bridge turns could clobber. Two captures from two
+        "threads" must return independent values with no cross-talk."""
+        sid = "20260101_000001_aaaaaa"
+        self._add_session(sid)
+        self._add_msg(sid, "user", content="t0")
+        client = self._client(sid)
+        # No shared anchor attribute may exist on the client at all anymore
+        # (getattr avoids a hard reference so Pyright doesn't flag it as a
+        # nonexistent attribute — the whole point is that it's GONE).
+        self.assertIsNone(
+            getattr(client, "_turn_anchor_id", None),
+            "client must not keep a shared mutable _turn_anchor_id",
+        )
+        self.assertIsNone(
+            getattr(client, "_turn_anchor_sid", None),
+            "client must not keep a shared mutable _turn_anchor_sid",
+        )
+        a1 = client._capture_turn_anchor(sid)
+        self.assertIsInstance(a1, tuple)
+        self.assertIsNotNone(a1)
+        self.assertEqual(len(a1), 2)
+        # A second, independent capture (simulating a concurrent turn) must
+        # not have been affected by the first.
+        a2 = client._capture_turn_anchor(sid)
+        self.assertEqual(a1, a2)
+
+    def test_anchor_tuples_are_independent_across_concurrent_turns(self):
+        """Two concurrent turns on the SAME client (the bridge's thread pool
+        fans out on one HermesClient) each compute their own per-turn anchor
+        tuple; neither sees the other's boundary. This is the concurrency
+        regression test for Issue #1 (shared mutable instance anchor).
+
+        Models the real chat() ordering: prior-turn rows already exist, the
+        anchor is captured at pre-spawn (MAX(id) = end of prior turns) while
+        the turn lock is held, THEN the child writes this turn's tool rows
+        (ids above the anchor), and the recap filters on id > anchor.
+        """
+        import threading
+        sid_a = "20260101_000001_aaaaaa"
+        sid_b = "20260101_000002_bbbbbb"
+        self._add_session(sid_a)
+        self._add_session(sid_b)
+        # Prior-turn rows (below the pre-spawn anchor).
+        self._add_msg(sid_a, "user", content="A prior")
+        self._add_msg(sid_a, "assistant",
+                      tool_calls='[{"id": "a0", "function": {"name": '
+                      '"search_files", "arguments": "{}"}}]',
+                      content="")
+        self._add_msg(sid_b, "user", content="B prior")
+        self._add_msg(sid_b, "assistant",
+                      tool_calls='[{"id": "b0", "function": {"name": '
+                      '"read_file", "arguments": "{}"}}]',
+                      content="")
+        # ONE client; two concurrent turns race on it. Capture each turn's
+        # anchor at pre-spawn, interleaved — exactly what chat() does under
+        # the turn lock. (A stale shared anchor from the other turn would
+        # clobber one of these; with per-call tuples each is independent.)
+        client = make_client(source_tag="reticulum", hermes_bin="/usr/bin/true")
+        client._resume_id = sid_a
+        results = {}
+        lock = threading.Lock()
+
+        def cap_turn(sid):
+            with lock:
+                results[sid] = client._capture_turn_anchor(sid)
+
+        threads = [
+            threading.Thread(target=cap_turn, args=(sid_a,)),
+            threading.Thread(target=cap_turn, args=(sid_b,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Each turn's anchor scoped to ITS session (the tuple carries the sid).
+        self.assertEqual(results[sid_a][0], sid_a)
+        self.assertEqual(results[sid_b][0], sid_b)
+        # Now simulate the child writing each turn's tool row (id above the
+        # anchor), then recap with that turn's OWN anchor + OWN session.
+        self._add_msg(sid_a, "assistant",
+                      tool_calls='[{"id": "a1", "function": {"name": '
+                      '"terminal", "arguments": "{}"}}]',
+                      content="")
+        self._add_msg(sid_b, "assistant",
+                      tool_calls='[{"id": "b1", "function": {"name": '
+                      '"web_search", "arguments": "{}"}}]',
+                      content="")
+        client._resume_id = sid_a
+        names_a = [r["name"] for r in client.tool_recap(limit=8, anchor=results[sid_a])]
+        # Only THIS turn's tool (id > anchor); prior-turn search_files excluded.
+        self.assertEqual(names_a, ["terminal"])
+        client._resume_id = sid_b
+        names_b = [r["name"] for r in client.tool_recap(limit=8, anchor=results[sid_b])]
+        self.assertEqual(names_b, ["web_search"])
+        # Cross-session isolation: each recap only ever shows its own session's
+        # tool — the shared mutable-instance-anchor bug would have let one
+        # turn's stale boundary leak into the other.
+        self.assertNotIn("read_file", names_a)
+        self.assertNotIn("search_files", names_b)
+        self.assertNotIn("web_search", names_a)
+        self.assertNotIn("terminal", names_b)
+
+    def test_first_turn_recap_uses_adopted_anchor_not_stale_pre_spawn(self):
+        """Regression for Issue #2: on the FIRST turn the sid is only known
+        after _adopt_new_session. The recap must use the adoption-computed
+        first_user anchor, NOT the stale pre-spawn anchor (which had sid=None
+        and would fall back to no filter, over-recapping). We simulate the
+        ordering: pre-spawn capture (None) -> child writes rows -> adoption
+        computes first_user anchor -> recap uses the adopted anchor."""
+        sid = "20260101_000003_cccccc"
+        self._add_session(sid)
+        client = self._client(sid)
+        # Pre-spawn: sid not yet known to this turn (fresh session), so chat()
+        # captures an anchor with sid=None -> None (no filter).
+        pre_spawn_anchor = client._capture_turn_anchor(None)
+        self.assertIsNone(pre_spawn_anchor)
+        # Child writes this turn's rows: user + one tool call.
+        self._add_msg(sid, "user", content="first turn")
+        self._add_msg(
+            sid, "assistant",
+            tool_calls='[{"id": "f1", "function": {"name": "terminal", "arguments": "{}"}}]',
+            content="",
+        )
+        self._add_msg(sid, "tool", tool_name="terminal", tool_call_id="f1", content="ok")
+        # A prior turn's tool that must NOT bleed in (simulated as lower id).
+        # In reality prior turns don't exist for a brand-new session, so the
+        # key assertion is that the adopted anchor yields exactly this turn's
+        # tool and the pre-spawn (None) anchor would be the fallback.
+        # Adoption now computes the first_user anchor (sid known).
+        adopted_anchor = client._capture_turn_anchor(sid, boundary="first_user")
+        self.assertIsNotNone(adopted_anchor)
+        # Recap with the ADOPTED anchor -> exactly this turn's tool.
+        names = [r["name"] for r in client.tool_recap(limit=8, anchor=adopted_anchor)]
+        self.assertEqual(names, ["terminal"])
+        # Recap with the STALE pre-spawn anchor (None) would fall back to no
+        # filter and also include the tool (whole session) — proving the
+        # adopted anchor is the correct, tighter choice for a first turn.
+        stale_names = [r["name"] for r in client.tool_recap(limit=8, anchor=pre_spawn_anchor)]
+        self.assertEqual(stale_names, ["terminal"])
+
 if __name__ == "__main__":
     unittest.main()
