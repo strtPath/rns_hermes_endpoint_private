@@ -289,7 +289,7 @@ BRIDGE_HOME="${SCRIPT_DIR}"
 RENDER_PY="${VENV_DIR}/bin/python"
 if [[ ! -x "$RENDER_PY" ]]; then
     RENDER_PY=""
-    for cand in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python; do
+    for cand in python3 python3.13 python3.12 python3.11; do
         if command -v "$cand" &>/dev/null; then
             RENDER_PY="$(command -v "$cand")"
             break
