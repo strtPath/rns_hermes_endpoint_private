@@ -42,10 +42,11 @@ HOLD_TIMEOUT_S = float(os.environ.get("HERMES_STEP_HOLD_TIMEOUT", "1800"))
 # nodes' path tables over time, so a long-lived bridge must re-announce to stay
 # discoverable. 0 = disable periodic re-announce (announce only at startup).
 # Change by editing RETICULUM_ANNOUNCE_INTERVAL in .env and restarting the bridge.
-DEFAULT_ANNOUNCE_INTERVAL_MIN = float(os.environ.get("RETICULUM_ANNOUNCE_INTERVAL", "30"))
+# (Clamped to MIN_ANNOUNCE_INTERVAL_MIN in ReticulumBridge.__init__ when positive.)
 
-# Floor for the live /announce <minutes> override: below this the re-announce
-# broadcast becomes a spam loop that burns bridge and mesh bandwidth.
+# Floor for the live /announce <minutes> override and the env default: below
+# this the re-announce broadcast becomes a spam loop that burns bridge and
+# mesh bandwidth.
 MIN_ANNOUNCE_INTERVAL_MIN = 1.0
 
 
@@ -185,11 +186,16 @@ class LXMFBridge:
 
         # Periodic re-announce scheduler (see announce()). Started by
         # announce(); stopped by stop().
-        self.announce_interval_min: float = DEFAULT_ANNOUNCE_INTERVAL_MIN
-        # The RETICULUM_ANNOUNCE_INTERVAL value as set in .env (the true
-        # "default"); announce_interval_min is the live cadence and can
-        # diverge from this after a /announce <min> override.
-        self.env_announce_interval_min: float = DEFAULT_ANNOUNCE_INTERVAL_MIN
+        # env_announce_interval_min is the RETICULUM_ANNOUNCE_INTERVAL value as
+        # set in .env (the true "default"). Clamp sub-floor positive values to
+        # the floor so a startup announce() (which uses this when interval_min
+        # is omitted) can't trip the MIN_ANNOUNCE_INTERVAL_MIN guard; 0 =
+        # disable is passed through unchanged.
+        env_interval = float(os.environ.get("RETICULUM_ANNOUNCE_INTERVAL", "30"))
+        if 0 < env_interval < MIN_ANNOUNCE_INTERVAL_MIN:
+            env_interval = MIN_ANNOUNCE_INTERVAL_MIN
+        self.env_announce_interval_min: float = env_interval
+        self.announce_interval_min: float = env_interval
         self._announce_timer: threading.Thread | None = None
         self._announce_timer_stop: threading.Event | None = None
         # Serializes the (stop-old / start-new) timer swap in announce() so
@@ -334,6 +340,12 @@ class LXMFBridge:
             self._do_announce()
 
         with self._announce_lock:
+            # If stop() already ran and cleared the timer, don't spawn a new
+            # daemon thread after shutdown — it would run past the bridge
+            # lifecycle (the loop only notices _running=False at its next tick).
+            if not self._running:
+                logger.debug("announce(): bridge stopped; skipping timer start")
+                return
             if interval_min and interval_min > 0:
                 self._start_announce_timer(interval_min)
                 logger.info(
