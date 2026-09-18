@@ -65,6 +65,19 @@ Configuration (env, read at import):
   MESH_GATE_TIMEOUT         seconds the operator has to answer; on timeout the
                             Hermes approval gate fails closed (blocks).
                             default 900
+  MESH_GATE_TRIAGE          Jev pre-gate triage stage. Values:
+                              off        (default) gate works exactly as before
+                              hint_only  Jev classifies + logs a hint, verdict
+                                         is IGNORED (dry-run calibration)
+                              allow_benign  Jev may auto-allow ROUTINE calls;
+                                         anything sensitive/destructive/
+                                         uncertain still escalates to the
+                                         human approve/deny gate. Requires
+                                         OPENROUTER_API_KEY (or
+                                         TYPESAFE_API_KEY) in the gateway env.
+  MESH_GATE_TRIAGE_CONF     confidence floor for auto-allow (0..1). default 0.6
+  MESH_GATE_TRIAGE_EXEC     "1" to let Jev auto-allow execute_code at high
+                            confidence; "0" (default) keeps it always-gated.
 """
 
 from __future__ import annotations
@@ -97,6 +110,27 @@ STATE_DB = os.environ.get(
 # block. The "block on timeout" guarantee is implemented fail-closed at both
 # layers.
 _GATE_TIMEOUT = float(os.environ.get("MESH_GATE_TIMEOUT", "900"))
+
+# ── Jev triage stage ────────────────────────────────────────────────────
+# off / hint_only / allow_benign. off = gate behaves exactly as before.
+# Fetches on import so a restart picks up a changed toggle.
+TRIAGE_MODE = os.environ.get("MESH_GATE_TRIAGE", "off").strip().lower()
+TRIAGE_CONF_FLOOR = float(os.environ.get("MESH_GATE_TRIAGE_CONF", "0.6"))
+TRIAGE_ALLOW_EXECUTE_CODE = os.environ.get("MESH_GATE_TRIAGE_EXEC", "0") in (
+    "1", "true", "yes", "on",
+)
+
+# Jev endpoint + question space (live-probed 2026-09-17; see probe_jev.py and
+# the 09-17 integration writeup §4). Same mechanism jev-skill-suggest uses:
+# gateway/run.py loads ~/.hermes/.env into the process env at startup, so the
+# OpenRouter key is available here via os.environ.
+_TRIAGE_ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
+_TRIAGE_MODEL = "typesafe/jev-1.13"
+_TRIAGE_KEY_ENV = ("OPENROUTER_API_KEY", "TYPESAFE_API_KEY")
+_TRIAGE_TIMEOUT = 8  # bounded; a slow/stalled Jev call escalates, never blocks
+
+# Sibling triage module — pure decision logic, no Hermes deps (unit-tested).
+from . import triage as _triage  # noqa: E402
 
 # ── Tool scope: which tools we inspect ─────────────────────────────────
 # terminal:        shell commands → run through Hermes' detector directly
@@ -324,6 +358,193 @@ def _block_message(
     )
 
 
+# ── Jev triage client ────────────────────────────────────────────────────
+# Fail-open: any key/POST/parse error → None → caller escalates to the human
+# gate. Mirrors jev-skill-suggest's proven _ask_jev client (same endpoint,
+# same auth via os.environ populated from ~/.hermes/.env at gateway start).
+
+def _triage_key() -> str:
+    for var in _TRIAGE_KEY_ENV:
+        val = os.environ.get(var)
+        if val:
+            return val
+    return ""
+
+
+def _ask_jev(state: str) -> dict | None:
+    """One Jev system_one call classifying a tool call's risk.
+
+    Returns {"risk": float, "stakes": <str|dict>, "handling": str,
+    "confidence": float} or None on any error. Never raises.
+    """
+    key = _triage_key()
+    if not key:
+        logger.warning("mesh-tool-gate: triage has no API key — escalating")
+        return None
+    questions = {
+        "risk": {
+            "type": "noul",
+            "instructions": (
+                "Would executing this tool call harm the mesh, the host, or "
+                "another node if run as requested? Answer with a noul value 0..1 "
+                "where 0 = completely safe and 1 = would cause real damage."
+            ),
+        },
+        "stakes": {
+            "type": "score",
+            "instructions": "How consequential is acting on this call?",
+            "criteria": ["routine", "sensitive", "destructive"],
+        },
+        "handling": {
+            "type": "choice",
+            "instructions": (
+                "How should the operator handle this call? Pick 'allow' ONLY if "
+                "it is a benign, routinely-approved action that a human would "
+                "clear without thinking. Pick 'escalate' if it needs human "
+                "review. Pick 'deny' only if it must be blocked."
+            ),
+            "criteria": {
+                "allow": "benign, routinely approved",
+                "escalate": "needs human review",
+                "deny": "must be blocked",
+            },
+        },
+    }
+    payload = {"state": state, "model": _TRIAGE_MODEL, "questions": questions}
+    req = urllib.request.Request(
+        _TRIAGE_ENDPOINT,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_TRIAGE_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — fail open on any transport error
+        logger.warning("mesh-tool-gate: Jev triage call failed: %s", e)
+        return None
+
+    ans = body.get("answers") or {}
+    risk = ans.get("risk") or {}
+    stakes = ans.get("stakes") or {}
+    handling = ans.get("handling") or {}
+    handling_choice = (
+        handling.get("choice") if isinstance(handling, dict) else handling
+    )
+    try:
+        handling_conf = float(
+            handling.get("confidence", 0) if isinstance(handling, dict) else 0
+        )
+    except (TypeError, ValueError):
+        handling_conf = 0.0
+
+    # Normalize Jev's stakes score-object into a plain bucket. Live Jev
+    # (probed 2026-09-18) returns {type:score, score:0..1, legend:{0:..,1:..,
+    # 2:..}, probabilities:{0:p,1:p,2:p}, confidence:c} — the per-bucket
+    # probabilities are Jev's own best read of WHICH bucket wins, so argmax
+    # over the legend is more faithful than thresholding the raw score.
+    stakes_conf = 0.0
+    probs = None
+    if isinstance(stakes, dict):
+        probs = stakes.get("probabilities") or {}
+        try:
+            stakes_conf = float(stakes.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            stakes_conf = 0.0
+    if probs:
+        legend = stakes.get("legend") or {}
+        # highest-probability bucket wins; keep the bucket keyword if given
+        best_idx = max(probs, key=lambda k: float(probs.get(k, 0) or 0))
+        bucket = legend.get(best_idx) if isinstance(legend, dict) else (
+            legend[best_idx] if isinstance(legend, list) and best_idx < len(legend)
+            else None
+        )
+        if bucket not in ("routine", "sensitive", "destructive"):
+            bucket = None
+    else:
+        bucket = stakes.get("choice") if isinstance(stakes, dict) else stakes
+
+    # The gate trusts the WEAKEST of Jev's confidences: a call rated
+    # destructive-but-unconfident must still go to a human, and a low-stakes
+    # unconfident call must too. confidence=min(handling_conf, stakes_conf).
+    confs = [c for c in (handling_conf, stakes_conf) if c > 0]
+    confidence = min(confs) if confs else 0.0
+
+    return {
+        "risk": _triage._noul(risk),
+        "stakes": bucket,
+        "handling": handling_choice,
+        "confidence": confidence,
+    }
+
+
+def _triage_state(tool_name: str, desc: str, kind: str) -> str:
+    """Compact, non-PII state for Jev (a mesh turn's tool call).
+
+    QUARANTINE: desc may contain a terminal command or a file path — never
+    session PII, user identity, or full secret material. Jev sees only a
+    short description + tool class, matching the PII quarantine rule.
+    """
+    return (
+        f"A Reticulum mesh session's agent wants to run tool '{tool_name}' "
+        f"(class: {kind}). Details: {desc[:400]}. "
+        "Classify its risk and how the operator should handle it."
+    )
+
+
+def _triage_tool_call(
+    tool_name: str, desc: str, kind: str,
+) -> str:
+    """Ask Jev how to route a gated tool call; return allow | escalate | deny.
+
+    Fired before the human gate. Only takes effect when TRIAGE_MODE is
+    'allow_benign' — under 'hint_only' the verdict is logged and ignored
+    (the call still escalates to the human gate), which is the dry-run
+    calibration mode.
+
+    ANY Jev error / missing key / low confidence → 'escalate' (human gate
+    stays the backstop). Never auto-allow on doubt. Returns 'deny' only when
+    Jev explicitly says the call must be blocked (or destructive + high risk).
+    """
+    if TRIAGE_MODE == "off":
+        return "escalate"
+
+    j = _ask_jev(_triage_state(tool_name, desc, kind))
+    if j is None:
+        logger.warning("mesh-tool-gate: Jev triage unavailable — escalating")
+        return "escalate"
+
+    v = _triage.verdict(
+        handling=j["handling"],
+        risk_noul=j["risk"],
+        stakes=j["stakes"],
+        confidence=j["confidence"],
+        conf_floor=TRIAGE_CONF_FLOOR,
+        allow_execute_code=TRIAGE_ALLOW_EXECUTE_CODE,
+        tool_name=tool_name,
+    )
+
+    action = "ALLOW (skip human gate)" if v == "allow" else (
+        "DENY" if v == "deny" else "ESCALATE to human gate"
+    )
+    logger.info(
+        "mesh-tool-gate: Jev triage %s mode=%r tool=%s risk=%.2f stakes=%r "
+        "handling=%r conf=%.2f → %s (return=%r)",
+        "hint" if TRIAGE_MODE == "hint_only" else "apply",
+        TRIAGE_MODE, tool_name, j["risk"], j["stakes"], j["handling"],
+        j["confidence"], action, v,
+    )
+    # hint_only is dry-run: Jev rates the call but NEVER changes the gate
+    # outcome. Everything still escalates to the human until the operator
+    # flips to allow_benign.
+    if TRIAGE_MODE == "hint_only":
+        return "escalate"
+    return v
+
+
 # ---------------------------------------------------------------------------
 # pre_tool_call handler
 # ---------------------------------------------------------------------------
@@ -356,9 +577,16 @@ def on_pre_tool_call(
     except Exception:  # noqa: BLE001
         pass
 
-    # --- execute_code: always gate (opaque Python payload) ---
+    # --- execute_code: always gate (opaque Python payload), unless Jev
+    # triage is enabled AND confident enough to auto-allow it.
     if tool_name == "execute_code":
         desc = _build_description(tool_name, args)
+        tri = _triage_tool_call(tool_name, desc, "execute_code")
+        if tri == "deny":
+            return {"action": "block", "message": _block_message("deny")}
+        if tri == "allow":
+            logger.info("mesh-tool-gate: Jev auto-allowed execute_code on mesh")
+            return None  # auto-allowed → proceed without human gate
         approved, verdict, deny_reason = _gate_tool(mesh, tool_name, desc, "execute_code")
         if not approved:
             return {
@@ -408,8 +636,24 @@ def on_pre_tool_call(
     if not is_dangerous:
         return None  # safe → proceed (output still streamed by agent:step)
 
-    # Dangerous — open the pre-exec approval gate on the mesh.
+    # Dangerous — Jev triage may auto-allow a ROUTINE call (e.g. a status/read
+    # a human would clear without thinking). Anything sensitive/destructive/
+    # uncertain still escalates to the human gate below.
     desc = _build_description(tool_name, args)
+    tri = _triage_tool_call(tool_name, desc, "dangerous")
+    if tri == "deny":
+        logger.warning(
+            "mesh-tool-gate: Jev DENIED %s %r", tool_name, command[:120],
+        )
+        return {"action": "block", "message": _block_message("deny")}
+    if tri == "allow":
+        logger.info(
+            "mesh-tool-gate: Jev auto-allowed %s %r on mesh",
+            tool_name, command[:120],
+        )
+        return None  # auto-allowed → proceed without human gate
+
+    # Escalate — open the pre-exec approval gate on the mesh.
     approved, verdict, deny_reason = _gate_tool(
         mesh,
         tool_name,
