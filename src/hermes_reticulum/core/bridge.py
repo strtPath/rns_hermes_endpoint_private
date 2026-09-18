@@ -44,6 +44,10 @@ HOLD_TIMEOUT_S = float(os.environ.get("HERMES_STEP_HOLD_TIMEOUT", "1800"))
 # Change by editing RETICULUM_ANNOUNCE_INTERVAL in .env and restarting the bridge.
 DEFAULT_ANNOUNCE_INTERVAL_MIN = float(os.environ.get("RETICULUM_ANNOUNCE_INTERVAL", "30"))
 
+# Floor for the live /announce <minutes> override: below this the re-announce
+# broadcast becomes a spam loop that burns bridge and mesh bandwidth.
+MIN_ANNOUNCE_INTERVAL_MIN = 1.0
+
 
 HOLD_STATE_PATH = os.environ.get(
     "HERMES_STEP_HOLD_FILE",
@@ -182,8 +186,15 @@ class LXMFBridge:
         # Periodic re-announce scheduler (see announce()). Started by
         # announce(); stopped by stop().
         self.announce_interval_min: float = DEFAULT_ANNOUNCE_INTERVAL_MIN
+        # The RETICULUM_ANNOUNCE_INTERVAL value as set in .env (the true
+        # "default"); announce_interval_min is the live cadence and can
+        # diverge from this after a /announce <min> override.
+        self.env_announce_interval_min: float = DEFAULT_ANNOUNCE_INTERVAL_MIN
         self._announce_timer: threading.Thread | None = None
         self._announce_timer_stop: threading.Event | None = None
+        # Serializes the (stop-old / start-new) timer swap in announce() so
+        # concurrent /announce commands can't join an unstarted thread.
+        self._announce_lock = threading.Lock()
 
     @property
     def address(self) -> str | None:
@@ -298,28 +309,41 @@ class LXMFBridge:
     def announce(self, interval_min: float = None):
         """Announce our destination on the Reticulum network.
 
-        Also starts the periodic re-announce timer. Pass ``interval_min`` to
-        override the env-configured cadence for this run (0 disables). When
-        omitted, the env default (``RETICULUM_ANNOUNCE_INTERVAL``) is used.
-        The first announce fires immediately; subsequent ones fire every
-        ``interval_min`` minutes while the bridge runs.
+        Also (re)starts the periodic re-announce timer. Pass ``interval_min``
+        to override the env-configured cadence for this run (0 disables).
+        When omitted, the current live cadence is kept (so a bare re-announce
+        preserves a /announce <min> override). Values below
+        ``MIN_ANNOUNCE_INTERVAL_MIN`` (except 0 = disable) are rejected to
+        avoid flooding the mesh. The first announce fires immediately;
+        subsequent ones fire every ``interval_min`` minutes while the bridge
+        runs.
         """
         if interval_min is None:
-            interval_min = DEFAULT_ANNOUNCE_INTERVAL_MIN
+            # Keep the current live cadence (preserves a /announce <min>
+            # override instead of snapping back to the env default).
+            interval_min = self.announce_interval_min
+        if 0 < interval_min < MIN_ANNOUNCE_INTERVAL_MIN:
+            raise ValueError(
+                f"Interval too small: {interval_min} min "
+                f"(minimum {MIN_ANNOUNCE_INTERVAL_MIN} min to avoid spamming the mesh)"
+            )
+
         self.announce_interval_min = interval_min
 
         if self.destination:
             self._do_announce()
 
-        if interval_min and interval_min > 0:
-            self._start_announce_timer(interval_min)
-            logger.info(
-                "Periodic re-announce every %.0f min (address %s)",
-                interval_min, self.address,
-            )
-        else:
-            self._announce_timer = None
-            logger.info("Periodic re-announce disabled (interval=0)")
+        with self._announce_lock:
+            if interval_min and interval_min > 0:
+                self._start_announce_timer(interval_min)
+                logger.info(
+                    "Periodic re-announce every %.0f min (address %s)",
+                    interval_min, self.address,
+                )
+            else:
+                self._announce_timer = None
+                self._announce_timer_stop = None
+                logger.info("Periodic re-announce disabled (interval=0)")
 
     def _do_announce(self):
         """Send the actual RNS announce for the registered destination."""
@@ -531,7 +555,10 @@ class LXMFBridge:
         logger.info("Shutting down Hermes for Reticulum bridge...")
         self._running = False
 
-        self._stop_announce_timer()
+        # Same lock as announce() so stop() can't join a timer that a
+        # concurrent /announce is mid-creation.
+        with self._announce_lock:
+            self._stop_announce_timer()
 
         if self.liveness:
             self.liveness.stop()
