@@ -201,8 +201,34 @@ Reticulum peers interconnect autonomously. An off-grid RNode only needs a path â
 | `HERMES_RETICUM_ALLOWED_USERS` | *(empty)* | LXMF hash allowlist |
 | `HERMES_RETICUM_BLOCKED_USERS` | *(empty)* | LXMF hash blocklist |
 | `HERMES_TOOL_EMOJIS` | `~/.hermes/reticulum_tool_emojis.json` | Optional tool-emoji override map (see below) |
+| `MESH_GATE_TRIAGE` | `off` | Jev pre-gate triage stage: `off`, `hint_only`, or `allow_benign` (see below) |
+| `MESH_GATE_TRIAGE_CONF` | `0.6` | Confidence floor for auto-allow under `allow_benign` |
+| `MESH_GATE_TRIAGE_EXEC` | `0` | **Reserved/inert** â€” `execute_code` is ALWAYS human-gated (opaque payload; triage may deny it but never auto-allow it) |
 
 Full template: [config/env.example](config/env.example).
+
+### Jev pre-gate triage
+
+With `MESH_GATE_TRIAGE=allow_benign` and an `OPENROUTER_API_KEY` (or
+`TYPESAFE_API_KEY`) in the gateway env, Jev may auto-allow routine,
+benign tool calls before the human approve/deny gate is offered.
+Anything sensitive, destructive, uncertain, or below
+`MESH_GATE_TRIAGE_CONF` still escalates to the human gate, and any Jev
+error or timeout fails open to the human gate. `hint_only` logs the
+classification without changing the gate (dry-run calibration).
+
+`MESH_GATE_TRIAGE_CONF` defaults to `0.6`. Calibrated 2026-09-18 against
+13 representative calls with `typesafe/jev-1.13`; the 0.4-0.7 range is a
+flat plateau where the same five read-only calls auto-clear and nothing
+sensitive or destructive clears at any tested floor. See
+[docs/mesh-gate-triage-confidence-floor.md](docs/mesh-gate-triage-confidence-floor.md)
+for the full rationale and the recommendation to run `hint_only` for a
+few days of real traffic before flipping to `allow_benign`.
+
+`execute_code` is an exception worth calling out: its opaque Python payload
+cannot be reliably classified from a truncated first-line excerpt, and raw code would
+leak to the provider, so it is ALWAYS routed through the human gate. Jev triage may
+still DENY a clearly destructive `execute_code` call, but it can never auto-ALLOW one.
 
 ### Tool emojis
 
