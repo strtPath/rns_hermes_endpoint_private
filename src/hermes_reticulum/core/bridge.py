@@ -186,14 +186,33 @@ class LXMFBridge:
 
         # Periodic re-announce scheduler (see announce()). Started by
         # announce(); stopped by stop().
-        # env_announce_interval_min is the RETICULUM_ANNOUNCE_INTERVAL value as
-        # set in .env (the true "default"). Clamp sub-floor positive values to
-        # the floor so a startup announce() (which uses this when interval_min
-        # is omitted) can't trip the MIN_ANNOUNCE_INTERVAL_MIN guard; 0 =
-        # disable is passed through unchanged.
-        env_interval = float(os.environ.get("RETICULUM_ANNOUNCE_INTERVAL", "30"))
+        # env_announce_interval_min is the RETICULUM_ANNOUNCE_INTERVAL value
+        # as set in .env (the true "default"). Validate it here: a positive
+        # value below MIN_ANNOUNCE_INTERVAL_MIN would make the periodic
+        # re-announce a spam loop, so reject it loudly at startup instead of
+        # silently substituting a different cadence (the user would otherwise
+        # get a running bridge at the wrong cadence AND /announce reporting
+        # the substituted value as the env default). 0 = disable is allowed.
+        raw_env_interval = os.environ.get("RETICULUM_ANNOUNCE_INTERVAL", "30")
+        try:
+            env_interval = float(raw_env_interval)
+        except ValueError:
+            raise ValueError(
+                f"Invalid RETICULUM_ANNOUNCE_INTERVAL={raw_env_interval!r}: "
+                f"expected a number of minutes (e.g. 20, 30, 60; 0 disables)."
+            )
+        if env_interval < 0:
+            raise ValueError(
+                f"Invalid RETICULUM_ANNOUNCE_INTERVAL={raw_env_interval!r}: "
+                f"must be >= 0."
+            )
         if 0 < env_interval < MIN_ANNOUNCE_INTERVAL_MIN:
-            env_interval = MIN_ANNOUNCE_INTERVAL_MIN
+            raise ValueError(
+                f"RETICULUM_ANNOUNCE_INTERVAL={raw_env_interval!r} min is below the "
+                f"minimum {MIN_ANNOUNCE_INTERVAL_MIN:g} min — that cadence would spam "
+                f"the mesh. Use 0 to disable, or at least {MIN_ANNOUNCE_INTERVAL_MIN:g} "
+                f"minutes."
+            )
         self.env_announce_interval_min: float = env_interval
         self.announce_interval_min: float = env_interval
         self._announce_timer: threading.Thread | None = None
