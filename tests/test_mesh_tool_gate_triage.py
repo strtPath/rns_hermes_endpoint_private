@@ -147,12 +147,26 @@ def test_explicit_escalate_stays_human():
     assert r == "escalate"
 
 
-def test_explicit_deny():
+def test_explicit_deny_high_confidence():
+    # Confident deny does block — Jev explicitly says the call must be
+    # denied and is sure about it.
+    r = triage.verdict(
+        handling="deny", risk_noul=0.0, stakes="routine",
+        confidence=0.95, tool_name="terminal",
+    )
+    assert r == "deny"
+
+
+def test_explicit_deny_low_confidence_escalates():
+    # An UNCERTAIN deny must not bypass the human gate: a low-confidence
+    # model answer claiming "deny" could make a benign call unrecoverable,
+    # contradicting the "low confidence → escalate" rule. It escalates so a
+    # human still reviews it.
     r = triage.verdict(
         handling="deny", risk_noul=0.0, stakes="routine",
         confidence=0.5, tool_name="terminal",
     )
-    assert r == "deny"
+    assert r == "escalate"
 
 
 def test_none_bucket_escalates():

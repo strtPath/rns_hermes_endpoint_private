@@ -76,8 +76,10 @@ def verdict(
       5. if tool_name == 'execute_code', allow_execute_code must be True
          (the Python payload is opaque to the gate's regex detection).
 
-    DENY only when Jev itself says deny (handling == 'deny') OR the call is
-    destructive at high risk (risk_noul > 0.8) — Jev's own "must be blocked".
+    DENY only when Jev itself confidently says deny (handling == 'deny' and
+    confidence >= conf_floor) OR the call is destructive at high risk
+    (risk_noul > 0.8) — Jev's own "must be blocked". An uncertain denial
+    still escalates so a human reviews it.
 
     Everything else — Jev error, low confidence, escalate, unknown — is
     'escalate' (the human gate stays the backstop; never auto-allow on doubt).
@@ -86,12 +88,19 @@ def verdict(
     if not handling or handling == NONE_CODE:
         return "escalate"
     handling = handling.strip().lower()
-
-    if handling == HANDLING_DENY:
-        return "deny"
-
     risk = _noul(risk_noul)
     stakes_bucket = classify_stakes(stakes)
+
+    # DENY is a blocking verdict that bypasses the human gate, so we only
+    # honor it when Jev is CONFIDENT — otherwise an explicitly uncertain or
+    # low-confidence model answer could make a benign call unrecoverable.
+    # An uncertain denial escalates so a human still reviews it. The
+    # destructive+high-risk deny below is the deterministic rule Jev reads
+    # of the call itself and does not depend on Jev's confidence.
+    if handling == HANDLING_DENY:
+        if confidence >= conf_floor:
+            return "deny"
+        return "escalate"
 
     # Highest stakes command with high asserted risk → deny (Jev's "must
     # block" reads on the call, not the human's choice).

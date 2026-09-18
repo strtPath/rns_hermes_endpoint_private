@@ -150,3 +150,126 @@ def test_allow_benign_sensitive_escalates(monkeypatch):
     )
     v = mod._triage_tool_call("terminal", "sudo pacman -Syu", "dangerous")
     assert v == "escalate"
+
+
+# ---------------------------------------------------------------------------
+# Security hardening (review findings):
+#   F1 opaque execute_code never auto-allows
+#   F2 zero/missing confidence forces escalation (never discarded)
+#   F3 credential-like description material is scrubbed before OpenRouter
+#   F5 malformed Jev response fails open (returns None, never raises)
+# ---------------------------------------------------------------------------
+
+class _FakeResp:
+    """Minimal response shim with a `.read()` returning a JSON string."""
+
+    def __init__(self, body: dict):
+        import json
+        self._b = json.dumps(body).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _set_triage_key(monkeypatch):
+    monkeypatch.setattr(mod, "_triage_key", lambda: "test-key")
+
+
+def test_ask_jev_malformed_response_fails_open(monkeypatch):
+    # Non-numeric probability + dict/list legend combo → would previously
+    # raise ValueError/TypeError out of _ask_jev. It must return None so the
+    # caller escalates to the human gate (F5).
+    _set_triage_key(monkeypatch)
+
+    def _urlopen(_req, timeout=0):
+        return _FakeResp({
+            "answers": {
+                "risk": {"noul": 0.05},
+                "stakes": {
+                    "probabilities": {"not-a-number": "oops"},
+                    "legend": [0, 1, 2],
+                },
+                "handling": {"choice": "allow", "confidence": 0.9},
+            }
+        })
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", _urlopen)
+    j = mod._ask_jev("something")
+    assert j is None, "malformed response must fail open (None), not raise"
+
+
+def test_ask_jev_zero_confidence_forces_escalation(monkeypatch):
+    # One axis reports 0/missing confidence: the min() must keep that 0 so the
+    # combined confidence is 0 → any caller escalates. It must NOT be dropped
+    # in favor of the other axis' high confidence (F2).
+    _set_triage_key(monkeypatch)
+
+    def _urlopen(_req, timeout=0):
+        return _FakeResp({
+            "answers": {
+                "risk": {"noul": 0.05},
+                "stakes": {"choice": "routine", "confidence": 0.95},
+                "handling": {"choice": "allow", "confidence": 0},  # missing/0
+            }
+        })
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", _urlopen)
+    j = mod._ask_jev("something")
+    assert j is not None
+    assert j["handling"] == "allow"
+    assert j["confidence"] == 0.0, "0 confidence must not be discarded"
+
+
+def test_scrub_triage_desc_redacts_credentials():
+    # A terminal command with inline credentials that would otherwise ship to
+    # OpenRouter verbatim — the scrubber must redact the secret material.
+    d = (
+        "curl -H 'Authorization: Bearer ghp_AbCdEfGhIjKlMnOpQrStUvWxYz012345' "
+        "https://api.example.com --data 'password=hunter2&token=sk_live_x'"
+    )
+    out = mod._scrub_triage_desc(d)
+    assert "AbCdEfGhIjKlMnOpQrStUvWxYz012345" not in out, "bearer token must be redacted"
+    assert "hunter2" not in out, "password value must be redacted"
+    assert "sk_live_x" not in out, "token value must be redacted"
+    assert "<redacted>" in out, "redaction placeholder should remain"
+
+
+def test_triage_state_scrubbed_description():
+    # The state actually shipped to Jev must not contain credential material.
+    state = mod._triage_state(
+            "terminal",
+            "curl -H 'Authorization: Bearer PPQqRrSsTtUuVvWwXxYyZzAaBbCcDdEeFfGg' x",
+            "dangerous",
+        )
+    assert "PPQqRrSsTtUuVvWwXxYyZzAaBbCcDdEeFfGg" not in state
+
+
+def test_execute_code_never_auto_allowed(monkeypatch):
+    # F1: opaque Python payload — even a benign Jev verdict must NOT let the
+    # tool bypass the human gate. execute_code is ALWAYS human-gated: the
+    # triage stage may DENY it, but an `allow` verdict is collapsed to
+    # `escalate` (the human gate decides) inside _triage_tool_call, so
+    # the handler's execute_code branch never sees an auto-allow to honor.
+    mod.TRIAGE_MODE = "allow_benign"
+    monkeypatch.setattr(mod, "_ask_jev", lambda *_a, **_k: _benign_jev())
+    v = mod._triage_tool_call("execute_code", "import os; os.system('rm -rf /')", "execute_code")
+    assert v == "escalate", "execute_code must never auto-allow — integral escalates"
+
+
+def test_execute_code_triage_may_deny(monkeypatch):
+    # Safety net kept: Jev CONFIDENTLY calling a destructive execute_code
+    # "must be blocked" still yields a block verdict (the handler blocks on
+    # `deny`), but a LOW-confidence deny must still escalate (not hard-block).
+    mod.TRIAGE_MODE = "allow_benign"
+    monkeypatch.setattr(
+        mod, "_ask_jev",
+        lambda *_a, **_k: _benign_jev() | {"handling": "deny", "confidence": 0.95},
+    )
+    v = mod._triage_tool_call("execute_code", "import os; os.system('rm -rf /')", "execute_code")
+    assert v == "deny"

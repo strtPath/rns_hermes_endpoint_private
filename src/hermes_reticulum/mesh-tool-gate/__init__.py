@@ -76,8 +76,14 @@ Configuration (env, read at import):
                                          OPENROUTER_API_KEY (or
                                          TYPESAFE_API_KEY) in the gateway env.
   MESH_GATE_TRIAGE_CONF     confidence floor for auto-allow (0..1). default 0.6
-  MESH_GATE_TRIAGE_EXEC     "1" to let Jev auto-allow execute_code at high
-                            confidence; "0" (default) keeps it always-gated.
+  MESH_GATE_TRIAGE_EXEC     reserved "execute_code auto-allow" toggle. The
+                                opaque Python payload is ALWAYS human-gated — the
+                                triage stage may DENY a clearly destructive call
+                                but can never auto-ALLOW it (the review-honest
+                                behaviour), so this flag is NOT honored; kept
+                                for backwards-compat so operators don't flip a
+                                dead knob expecting the old unsafe fast-path.
+                                default 0
 """
 
 from __future__ import annotations
@@ -116,9 +122,9 @@ _GATE_TIMEOUT = float(os.environ.get("MESH_GATE_TIMEOUT", "900"))
 # Fetches on import so a restart picks up a changed toggle.
 TRIAGE_MODE = os.environ.get("MESH_GATE_TRIAGE", "off").strip().lower()
 TRIAGE_CONF_FLOOR = float(os.environ.get("MESH_GATE_TRIAGE_CONF", "0.6"))
-TRIAGE_ALLOW_EXECUTE_CODE = os.environ.get("MESH_GATE_TRIAGE_EXEC", "0") in (
-    "1", "true", "yes", "on",
-)
+# NOTE: no MESH_GATE_TRIAGE_EXEC read here — execute_code is ALWAYS
+# human-gated (opaque payload); the triage stage may only deny it, never
+# auto-allow it. The env var is reserved/inert for backwards compatibility.
 
 # Jev endpoint + question space (live-probed 2026-09-17; see probe_jev.py and
 # the 09-17 integration writeup §4). Same mechanism jev-skill-suggest uses:
@@ -371,6 +377,23 @@ def _triage_key() -> str:
     return ""
 
 
+def _to_conf(value) -> float:
+    """Coerce a Jev confidence answer to a 0..1 float; 0.0 on any bad shape.
+
+    Missing (None), empty, non-numeric, or out-of-range values return 0.0 so
+    the uncertainty guard treats them as "not confident" and escalates — never
+    as a high-confidence signal. (See the min() in _ask_jev: a 0 from either
+    axis forces the whole call to escalate to the human gate.)
+    """
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(1.0, max(0.0, f))
+
+
 def _ask_jev(state: str) -> dict | None:
     """One Jev system_one call classifying a tool call's risk.
 
@@ -427,70 +450,119 @@ def _ask_jev(state: str) -> dict | None:
         logger.warning("mesh-tool-gate: Jev triage call failed: %s", e)
         return None
 
-    ans = body.get("answers") or {}
-    risk = ans.get("risk") or {}
-    stakes = ans.get("stakes") or {}
-    handling = ans.get("handling") or {}
-    handling_choice = (
-        handling.get("choice") if isinstance(handling, dict) else handling
-    )
+    # Everything below normalizes the provider's answer. Any shape we can't
+    # parse must FAIL OPEN (return None → caller escalates to the human gate)
+    # exactly like a transport error — a schema-drift or malformed response
+    # must never break the pre-tool callback.
     try:
-        handling_conf = float(
-            handling.get("confidence", 0) if isinstance(handling, dict) else 0
+        ans = body.get("answers") or {}
+        risk = ans.get("risk") or {}
+        stakes = ans.get("stakes") or {}
+        handling = ans.get("handling") or {}
+        handling_choice = (
+            handling.get("choice") if isinstance(handling, dict) else handling
         )
-    except (TypeError, ValueError):
-        handling_conf = 0.0
-
-    # Normalize Jev's stakes score-object into a plain bucket. Live Jev
-    # (probed 2026-09-18) returns {type:score, score:0..1, legend:{0:..,1:..,
-    # 2:..}, probabilities:{0:p,1:p,2:p}, confidence:c} — the per-bucket
-    # probabilities are Jev's own best read of WHICH bucket wins, so argmax
-    # over the legend is more faithful than thresholding the raw score.
-    stakes_conf = 0.0
-    probs = None
-    if isinstance(stakes, dict):
-        probs = stakes.get("probabilities") or {}
-        try:
-            stakes_conf = float(stakes.get("confidence", 0) or 0)
-        except (TypeError, ValueError):
-            stakes_conf = 0.0
-    if probs:
-        legend = stakes.get("legend") or {}
-        # highest-probability bucket wins; keep the bucket keyword if given
-        best_idx = max(probs, key=lambda k: float(probs.get(k, 0) or 0))
-        bucket = legend.get(best_idx) if isinstance(legend, dict) else (
-            legend[best_idx] if isinstance(legend, list) and best_idx < len(legend)
-            else None
+        handling_conf = _to_conf(
+            handling.get("confidence") if isinstance(handling, dict) else None
         )
-        if bucket not in ("routine", "sensitive", "destructive"):
-            bucket = None
-    else:
-        bucket = stakes.get("choice") if isinstance(stakes, dict) else stakes
 
-    # The gate trusts the WEAKEST of Jev's confidences: a call rated
-    # destructive-but-unconfident must still go to a human, and a low-stakes
-    # unconfident call must too. confidence=min(handling_conf, stakes_conf).
-    confs = [c for c in (handling_conf, stakes_conf) if c > 0]
-    confidence = min(confs) if confs else 0.0
+        # Normalize Jev's stakes score-object into a plain bucket. Live Jev
+        # (probed 2026-09-18) returns {type:score, score:0..1, legend:{0:..,1:..,
+        # 2:..}, probabilities:{0:p,1:p,2:p}, confidence:c} — the per-bucket
+        # probabilities are Jev's own best read of WHICH bucket wins, so argmax
+        # over the legend is more faithful than thresholding the raw score.
+        stakes_conf = 0.0
+        probs = None
+        if isinstance(stakes, dict):
+            probs = stakes.get("probabilities") or {}
+            stakes_conf = _to_conf(stakes.get("confidence"))
+        if probs:
+            legend = stakes.get("legend") or {}
+            # highest-probability bucket wins; keep the bucket keyword if given
+            best_idx = max(
+                probs, key=lambda k: _to_conf(probs.get(k, 0))
+            )
+            bucket = legend.get(best_idx) if isinstance(legend, dict) else (
+                legend[best_idx] if isinstance(legend, list) and best_idx < len(legend)
+                else None
+            )
+            if bucket not in ("routine", "sensitive", "destructive"):
+                bucket = None
+        else:
+            bucket = stakes.get("choice") if isinstance(stakes, dict) else stakes
 
-    return {
-        "risk": _triage._noul(risk),
-        "stakes": bucket,
-        "handling": handling_choice,
-        "confidence": confidence,
-    }
+        # The gate trusts the WEAKEST of Jev's confidences: a call rated
+        # destructive-but-unconfident must still go to a human, and a
+        # low-stakes unconfident call must too. confidence=min(handling_conf,
+        # stakes_conf). A ZERO (missing, invalid, or exact-0) from either
+        # answer is taken as "uncertain" and forces the whole call to raise —
+        # it is NEVER discarded, or an absent answer on one axis would let the
+        # other axis' high confidence auto-allow a call that should escalate.
+        confidence = min(handling_conf, stakes_conf)
+
+        return {
+            "risk": _triage._noul(risk),
+            "stakes": bucket,
+            "handling": handling_choice,
+            "confidence": confidence,
+        }
+    except Exception as e:  # noqa: BLE001 — malformed/nonconforming response
+        logger.warning("mesh-tool-gate: Jev triage response unparseable: %s", e)
+        return None
+
+
+def _scrub_triage_desc(desc: str) -> str:
+    """Strip credential-like material from a description before it leaves the
+    host (Jev/OpenRouter is external). For ``terminal`` calls the description
+    is the command verbatim, so an inline token, password, or private key
+    would otherwise be disclosed to the provider. This redacts the standard
+    secret shapes; truncation alone is NOT redaction.
+    """
+    if not desc:
+        return desc
+    import re
+
+    # Prefer keeping a placeholder so Jev still sees *something* was hidden.
+    _REDACT = "<redacted>"
+    # Bearer/token/basic Authorization headers and inline values.
+    desc = re.sub(
+        r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}",
+        r"\1 " + _REDACT,
+        desc,
+        flags=re.IGNORECASE,
+    )
+    # key=, token=, password=, passwd=, secret=, api_key=, apikey=, id_rsa
+    # value assignments (long bare values → redact the value).
+    desc = re.sub(
+        r"\b((?:api[_-]?key|token|password|passwd|secret|auth|private[_-]?key|"
+        r"client[_-]?secret|ssh[_-]?key)\b\s*[=:]\s*)\S+",
+        r"\1" + _REDACT,
+        desc,
+        flags=re.IGNORECASE,
+    )
+    # Long opaque runs that look like keys/tokens/secrets (30+ chars of
+    # base64/hex/typical secret alphabet) — redact rather than ship.
+    desc = re.sub(
+        r"(?<![A-Za-z0-9])[A-Za-z0-9._~+/=-]{30,}(?![A-Za-z0-9])",
+        _REDACT,
+        desc,
+    )
+    return desc
 
 
 def _triage_state(tool_name: str, desc: str, kind: str) -> str:
     """Compact, non-PII state for Jev (a mesh turn's tool call).
 
     QUARANTINE: desc may contain a terminal command or a file path — never
-    session PII, user identity, or full secret material. Jev sees only a
-    short description + tool class, matching the PII quarantine rule.
+    session PII, user identity, or full secret material. The description is
+    SCRUBBED for credential-like material before it is shipped to the
+    external provider (see _scrub_triage_desc); Jev sees only a short
+    description + tool class, matching the PII quarantine rule.
     """
+    safe = _scrub_triage_desc(desc)
     return (
         f"A Reticulum mesh session's agent wants to run tool '{tool_name}' "
-        f"(class: {kind}). Details: {desc[:400]}. "
+        f"(class: {kind}). Details: {safe[:400]}. "
         "Classify its risk and how the operator should handle it."
     )
 
@@ -523,7 +595,10 @@ def _triage_tool_call(
         stakes=j["stakes"],
         confidence=j["confidence"],
         conf_floor=TRIAGE_CONF_FLOOR,
-        allow_execute_code=TRIAGE_ALLOW_EXECUTE_CODE,
+        # execute_code is ALWAYS human-gated (opaque payload). The triage
+        # stage may only DENY it — never auto-ALLOW — so hard-force the flag
+        # off here regardless of any env setting, keeping the verdict/log honest.
+        allow_execute_code=False,
         tool_name=tool_name,
     )
 
@@ -577,16 +652,18 @@ def on_pre_tool_call(
     except Exception:  # noqa: BLE001
         pass
 
-    # --- execute_code: always gate (opaque Python payload), unless Jev
-    # triage is enabled AND confident enough to auto-allow it.
+    # --- execute_code: ALWAYS go through the human gate. The Python payload
+    # is opaque — only its first line/120 chars feed the Jev description, so
+    # an unfinished multiline body could hide destructive work. Triage is
+    # still consulted as a SAFETY NET and may DENY a clearly destructive call
+    # (Jev confident it must block), but it can never auto-ALLOW and bypass
+    # the human gate. First-line-truncated classification is no substitute
+    # for human review of the whole body.
     if tool_name == "execute_code":
         desc = _build_description(tool_name, args)
         tri = _triage_tool_call(tool_name, desc, "execute_code")
         if tri == "deny":
             return {"action": "block", "message": _block_message("deny")}
-        if tri == "allow":
-            logger.info("mesh-tool-gate: Jev auto-allowed execute_code on mesh")
-            return None  # auto-allowed → proceed without human gate
         approved, verdict, deny_reason = _gate_tool(mesh, tool_name, desc, "execute_code")
         if not approved:
             return {
