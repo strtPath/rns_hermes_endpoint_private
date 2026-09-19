@@ -339,11 +339,19 @@ def _block_message(
 ) -> str:
     """Build the gateway-aligned ``BLOCKED`` message for a denied gate.
 
+    Three distinct cases, so the model gets the right instruction:
+
     - Explicit deny (verdict == 'deny'): "Action denied by user.", plus the
-      reason clause when the operator gave one.
-    - Timeout / failure (anything else): the timeout wording, so the model
-      gets the same "do NOT retry/rephrase" guardrail without the fake
-      operator attribution; silence is not consent.
+      reason clause when the operator gave one. FIRM — the user said no; do
+      not attempt this avenue at all.
+    - Genuine timeout (verdict == 'timeout'): the operator never answered.
+      The exact action is dead (do not retry/rephrase/redirect), but the rest
+      of the task may continue on safe tools — this is operator silence, not
+      a refusal.
+    - Infrastructure failure (gate-error / no-control-endpoint / anything
+      else): the gate could not reach the operator. Firm like a deny — no
+      "continue with safe tools" coaching, because a malfunction isn't
+      operator consent (or its absence).
     """
     if verdict == "deny":
         reason_addendum = (
@@ -355,12 +363,20 @@ def _block_message(
             "rephrase it, and do NOT attempt the same outcome via a "
             "different path."
         )
-    # timeout / gate-error / no-control-endpoint → gateway timeout wording
+    if verdict == "timeout":
+        return (
+            "BLOCKED: The requested action did not receive approval before "
+            "the gate timed out. Do NOT retry it, do NOT rephrase it, and "
+            "do NOT attempt the same outcome via a different path. You may "
+            "continue the rest of the task using safe tools that need no "
+            "approval."
+        )
+    # gate-error / no-control-endpoint → firm, no continuation coaching
     return (
-        "BLOCKED: Action timed out without user response. The user has "
-        "NOT consented to this action. Do NOT retry it, do NOT rephrase "
-        "it, and do NOT attempt the same outcome via a different path. "
-        "Silence is not consent."
+        "BLOCKED: Action could not be approved because the approval gate "
+        "failed. The user has NOT consented to this action. Do NOT retry "
+        "it, do NOT rephrase it, and do NOT attempt the same outcome via "
+        "a different path."
     )
 
 

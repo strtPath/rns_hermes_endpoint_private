@@ -358,12 +358,27 @@ attempts a dangerous command, the operator on the mesh is prompted to
 **fails closed** — an unanswered gate blocks the tool.
 
 Because Hermes invokes `pre_tool_call` hooks **synchronously** (see
-`hermes_cli/plugins.py::invoke_hook`), there is no separate hook worker and,
-on the Hermes builds we verified (v0.19.0), **no `plugins.hook_callback_timeout`
-setting exists**. The gate simply blocks the turn for up to
+`hermes_cli/plugins.py::invoke_hook`), the gate blocks the turn for up to
 `MESH_GATE_TIMEOUT` seconds while it waits for your reply. Meanwhile the
 bridge's liveness guard keeps the child turn alive during the wait, so a long
 gate does not trip it.
+
+**Three timeouts must stay aligned** (or the mesh gate wedges when the
+operator is AFK). The gate has three stacked layers — the control-server deny
+clock (`HERMES_MESH_APPROVAL_TIMEOUT`), the plugin's blocking POST
+(`MESH_GATE_TIMEOUT`), and Hermes' hook-callback timeout
+(`plugins.hook_callback_timeout`, a `~/.hermes/config.yaml` setting, default
+30s, hard max 600s). `pre_tool_call` is a **fail-closed** hook, and after a
+timeout Hermes suppresses re-firing it for 60s — so if the hook-callback
+timeout fires before the control clock resolves, EVERY tool fails with
+`pre_tool_call plugin callback timed out or is still running` for the rest of
+the turn. The layers MUST satisfy `MESH_GATE_TIMEOUT >=
+HERMES_MESH_APPROVAL_TIMEOUT` and `hook_callback_timeout > MESH_GATE_TIMEOUT`
+and `hook_callback_timeout < 600`. The shipped alignment is 480/480/490.
+Raising the gate to ~900s is impossible on this path — the 600s clamp caps
+the real operator window. See `docs/mesh-bridge-findings-2026-09-18-unanswered-gate-wedges-turn.md`.
+Verify what your build supports with `hermes config get plugins` before
+relying on any value.
 
 | Setting | Where | Purpose |
 |---------|-------|---------|
