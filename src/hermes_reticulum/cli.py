@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -87,15 +88,23 @@ def _deny_veto(hermes) -> None:
 
 
 def _validate_gate_timeouts() -> None:
-    """Fail loudly if the two bridge-side gate timeouts are misconfigured.
+    """Fail loudly if the bridge-side gate timeouts are misconfigured.
 
-    \`MESH_GATE_TIMEOUT\` (plugin blocking POST, gateway process) must be >=
-    \`HERMES_MESH_APPROVAL_TIMEOUT\` (control-server deny clock, bridge
+    MESH_GATE_TIMEOUT (gateway-plugin blocking POST) must be >=
+    HERMES_MESH_APPROVAL_TIMEOUT (control-server deny clock, bridge
     process). If the plugin's urlopen times out before the control server's
-    deny clock, the plugin fails closed BEFORE the operator could answer —
-    a raised approval timeout is silently capped by the smaller gate timeout.
-    This relationship is load-bearing and both values come from the same
-    .env, so validate it rather than let it fail closed at runtime.
+    deny clock, the plugin fails closed BEFORE the operator could answer — a
+    raised approval timeout is silently capped by the smaller gate timeout.
+    This relationship is load-bearing, so validate it rather than let it fail
+    closed at runtime.
+
+    Both values must also be finite and strictly positive. An approval wait
+    of <= 0 (Event.wait(0) / wait(-1)) returns immediately with no decision,
+    which would deny every gated action without giving the operator any
+    window; NaN and infinity are equally invalid. The plugin's _GATE_TIMEOUT
+    runs in the gateway process, so when the gateway has its own env this
+    check validates the bridge's view of the values — set the same values
+    from one authoritative source (the README documents the ordering).
 
     Refuses to start (sys.exit) rather than silently clamping — the reported
     values must be exactly what was configured, never a rewritten number.
@@ -111,6 +120,25 @@ def _validate_gate_timeouts() -> None:
         )
         sys.exit(1)
         return
+    if not (math.isfinite(gate) and math.isfinite(approval)):
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: gate timeouts must be finite "
+            "(MESH_GATE_TIMEOUT=%r, HERMES_MESH_APPROVAL_TIMEOUT=%r). "
+            "NaN or infinity would break the approval wait. Refusing to start.",
+            gate, approval,
+        )
+        sys.exit(1)
+    if gate <= 0 or approval <= 0:
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: gate timeouts must be positive "
+            "(MESH_GATE_TIMEOUT=%rs, HERMES_MESH_APPROVAL_TIMEOUT=%rs). "
+            "A non-positive approval wait would deny every gated action "
+            "immediately. Refusing to start.",
+            gate, approval,
+        )
+        sys.exit(1)
     if gate < approval:
         logger = logging.getLogger("hermes_reticulum.cli")
         logger.error(

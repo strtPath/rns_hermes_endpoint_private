@@ -64,6 +64,39 @@ class TestGateTimeoutValidation(unittest.TestCase):
         _validate_gate_timeouts()
         self.assertEqual(len(self._exit_calls), 1, "non-numeric must exit(1)")
 
+    def test_zero_exits(self):
+        os.environ["MESH_GATE_TIMEOUT"] = "0"
+        os.environ["HERMES_MESH_APPROVAL_TIMEOUT"] = "0"
+        _validate_gate_timeouts()
+        self.assertEqual(len(self._exit_calls), 1,
+                         "zero would deny every gated action immediately")
+
+    def test_negative_exits(self):
+        os.environ["MESH_GATE_TIMEOUT"] = "-1"
+        os.environ["HERMES_MESH_APPROVAL_TIMEOUT"] = "-1"
+        _validate_gate_timeouts()
+        self.assertEqual(len(self._exit_calls), 1,
+                         "negative Event.wait(-1) returns immediately — invalid")
+
+    def test_nan_exits(self):
+        os.environ["MESH_GATE_TIMEOUT"] = "nan"
+        os.environ["HERMES_MESH_APPROVAL_TIMEOUT"] = "480"
+        _validate_gate_timeouts()
+        self.assertEqual(len(self._exit_calls), 1, "NaN is not a valid timeout")
+
+    def test_infinity_exits(self):
+        os.environ["MESH_GATE_TIMEOUT"] = "inf"
+        os.environ["HERMES_MESH_APPROVAL_TIMEOUT"] = "480"
+        _validate_gate_timeouts()
+        self.assertEqual(len(self._exit_calls), 1, "infinity is not a valid timeout")
+
+    def test_decimal_values_pass(self):
+        # Non-integer finite positive values are legitimate (e.g. 0.5).
+        os.environ["MESH_GATE_TIMEOUT"] = "30.5"
+        os.environ["HERMES_MESH_APPROVAL_TIMEOUT"] = "30.5"
+        _validate_gate_timeouts()
+        self.assertEqual(self._exit_calls, [], "finite positive decimals are valid")
+
 
 if __name__ == "__main__":
     unittest.main()
