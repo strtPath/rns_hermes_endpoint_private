@@ -165,8 +165,9 @@ plugins:
 ```
 
 This makes the control-server deny clock (480s) fire before the Hermes hook
-wrapper, so an unanswered gate produces the clean `BLOCKED: Action timed out
-without user response` message the model can act on, instead of the raw
+wrapper, so an unanswered gate produces the clean `BLOCKED: The requested
+action did not receive approval before the gate timed out` message (which
+also allows the model to continue on safe tools) instead of the raw
 `pre_tool_call plugin callback timed out or is still running` wedge.
 
 **The two values that MUST be reconciled are the three-layer ordering, not
