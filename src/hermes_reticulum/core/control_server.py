@@ -346,6 +346,7 @@ class ControlServer:
                 if started is not None else 0.0
             ),
             "acl": self._acl_mode(),
+            "approval_timeout_s": self.approval_timeout,
         }
 
     def _acl_mode(self) -> str:
