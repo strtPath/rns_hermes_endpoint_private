@@ -374,16 +374,32 @@ timeout fires before the control clock resolves, EVERY tool fails with
 `pre_tool_call plugin callback timed out or is still running` for the rest of
 the turn. The layers MUST satisfy `MESH_GATE_TIMEOUT >=
 HERMES_MESH_APPROVAL_TIMEOUT` and `hook_callback_timeout > MESH_GATE_TIMEOUT`
-and `hook_callback_timeout < 600`. The shipped alignment is 480/480/490.
-Raising the gate to ~900s is impossible on this path — the 600s clamp caps
-the real operator window. See `docs/mesh-bridge-findings-2026-09-18-unanswered-gate-wedges-turn.md`.
-Verify what your build supports with `hermes config get plugins` before
-relying on any value.
+and `hook_callback_timeout < 600`.
+
+> **⚠️ The shipped code defaults are NOT safe on their own.** The repo
+> defaults for the two bridge timeouts are 900s each, and Hermes ships
+> `hook_callback_timeout` at 30s. Left untouched, the 30s hook wrapper fires
+> far before the 900s gate resolves — so if the operator is AFK past 30s,
+> `pre_tool_call plugin callback timed out or is still running` wedges every
+> tool for the rest of the turn. **You MUST set all three** on deployment:
+> choose a gate window, then set `MESH_GATE_TIMEOUT` and
+> `HERMES_MESH_APPROVAL_TIMEOUT` to that value in the bridge `.env`, and
+> `plugins.hook_callback_timeout` above it (and below 600) in
+> `~/.hermes/config.yaml`. The 480/480/490 alignment on this host is one such
+> valid choice; it is an example, not the shipped default. Raising the gate
+> toward 900s is pointless — the 600s hard clamp in Hermes core caps the real
+> operator window at ~590s no matter what you set. Since v0.21.x the bridge
+> also **refuses to start** if `MESH_GATE_TIMEOUT <
+> HERMES_MESH_APPROVAL_TIMEOUT` (it would fail closed before you could ever
+> answer), so keep the ordering correct.
+
+A concrete safe recipe for a fast link (WiFi/LAN):
 
 | Setting | Where | Purpose |
 |---------|-------|---------|
-| `MESH_GATE_TIMEOUT` | bridge `.env` | How long the gate waits for your verdict (default 900s) |
-| `HERMES_MESH_APPROVAL_TIMEOUT` | bridge `.env` | Control-server-side gate wait (default 900s) |
+| `MESH_GATE_TIMEOUT` | bridge `.env` | How long the gate waits for your verdict (default 900s). Must be `>= HERMES_MESH_APPROVAL_TIMEOUT`. |
+| `HERMES_MESH_APPROVAL_TIMEOUT` | bridge `.env` | Control-server-side gate wait (default 900s). |
+| `plugins.hook_callback_timeout` | `~/.hermes/config.yaml` | Hermes hook-wrapper backstop (default 30s, hard max 600s). Must be `> MESH_GATE_TIMEOUT` and `< 600`. |
 | `HERMES_MESH_CONTROL_URL` | bridge `.env` / plugin env | Where the gate plugin posts `/gate/notify` (default `http://127.0.0.1:8471`) |
 
 If your Hermes build *does* expose a hook timeout that is shorter than
