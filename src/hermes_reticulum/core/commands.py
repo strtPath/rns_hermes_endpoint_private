@@ -26,6 +26,7 @@ from typing import Callable
 from hermes_reticulum.core.hermes_client import HermesClient
 from hermes_reticulum.core.model_command import ModelCommandHandler
 from hermes_reticulum.core.control_server import ControlServer
+from hermes_reticulum.core.bridge import MIN_ANNOUNCE_INTERVAL_MIN
 
 logger = logging.getLogger("hermes_reticulum.commands")
 
@@ -188,6 +189,8 @@ def _cmd_help(ctx: CommandContext, args: str) -> str | None:
         "/steps on|off — full tool call + output before each next action",
         "/hold — pause the final reply (checkpoint gate)",
         "/go — release a /hold",
+        "/announce [minutes] — re-announce the bridge on the mesh now; "
+        "with <minutes>, also set the periodic re-announce cadence for this run",
         "",
     ]
     return "\n".join(lines)
@@ -268,9 +271,10 @@ def _cmd_tools(ctx: CommandContext, args: str) -> str | None:
     steps = cs.turn_recap(session) if session else []
     if not steps:
         return "No tool calls this turn yet."
-    lines = [f"🔧 Tools this turn ({len(steps)}):"]
+    lines = [f"📋 Tools this turn ({len(steps)}):"]
     for s in steps[-10:]:
-        lines.append(f"  {s.summary()}" + (" ❌" if s.is_error else ""))
+        # summary() already carries the error glyph — don't double it.
+        lines.append(f"  {s.summary()}")
     if len(steps) > 10:
         lines.append(f"  … and {len(steps) - 10} earlier")
     return "\n".join(lines)
@@ -344,6 +348,90 @@ def _cmd_go(ctx: CommandContext, args: str) -> str | None:
     return "🚀 Released — sending the reply."
 
 
+# ── announce (re-announce the bridge on the mesh) ──────────────────────
+
+
+def _fmt_interval(minutes: float) -> str:
+    """Human-readable cadence: whole minutes, otherwise one decimal."""
+    if minutes == int(minutes):
+        return f"{int(minutes)} min"
+    return f"{minutes:.1f} min"
+
+
+def _cmd_announce(ctx: CommandContext, args: str) -> str | None:
+    """Re-announce the bridge's destination on the Reticulum mesh.
+
+    Bare ``/announce`` re-announces immediately and keeps the current live
+    cadence. ``/announce <minutes>`` also sets the periodic re-announce
+    cadence for the *current run* (persisted cadence still comes from
+    RETICULUM_ANNOUNCE_INTERVAL in .env, applied at bridge start). 0 disables
+    periodic re-announce; values below MIN_ANNOUNCE_INTERVAL_MIN are rejected.
+    """
+    bridge = getattr(ctx, "bridge", None)
+    dest = getattr(bridge, "destination", None)
+    if dest is None:
+        return "Bridge not started — nothing to announce yet."
+
+    arg = args.strip().lower()
+    if arg and arg not in ("help", "-h", "?"):
+        try:
+            interval = float(arg)
+        except ValueError:
+            return (
+                "Usage: /announce [minutes]\n"
+                "  (no arg) — re-announce now (keeps current cadence)\n"
+                f"  <minutes> — re-announce now AND set the periodic "
+                f"re-announce cadence for this run (min {MIN_ANNOUNCE_INTERVAL_MIN:g}; "
+                "0 disables)"
+            )
+        if interval < 0:
+            return "Interval must be ≥ 0."
+        if 0 < interval < MIN_ANNOUNCE_INTERVAL_MIN:
+            return (
+                f"Interval too small: {interval:g} min. "
+                f"Use at least {MIN_ANNOUNCE_INTERVAL_MIN:g} min (or 0 to disable) — "
+                "smaller values would spam the mesh."
+            )
+        if interval > 0:
+            # Restart the periodic timer with the new cadence (announce()
+            # re-announces immediately + restarts the scheduler).
+            try:
+                bridge.announce(interval_min=interval)
+            except ValueError as e:
+                return str(e)
+            return (
+                f"📡 Re-announced {bridge.address} on the mesh.\n"
+                f"Periodic re-announce now every {_fmt_interval(interval)} for "
+                "this run."
+            )
+        # interval == 0 → disable periodic re-announce, still re-announce now.
+        try:
+            bridge.announce(interval_min=0.0)
+        except ValueError as e:
+            return str(e)
+        return (
+            f"📡 Re-announced {bridge.address} on the mesh.\n"
+            "Periodic re-announce DISABLED for this run "
+            "(set RETICULUM_ANNOUNCE_INTERVAL>0 in .env and restart to enable)."
+        )
+
+    # Bare /announce: re-announce now, keep the current live cadence.
+    try:
+        bridge.announce()
+    except ValueError as e:
+        return str(e)
+    cur = getattr(bridge, "announce_interval_min", 0.0)
+    env_default = getattr(bridge, "env_announce_interval_min", cur)
+    cadence = (
+        f"every {_fmt_interval(cur)}" if cur > 0 else "disabled (interval=0)"
+    )
+    return (
+        f"📡 Re-announced {bridge.address} on the mesh.\n"
+        f"Periodic re-announce: {cadence} "
+        f"(env default {_fmt_interval(env_default)} via RETICULUM_ANNOUNCE_INTERVAL)."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Registry — add new commands here
 # ──────────────────────────────────────────────────────────────────────
@@ -370,6 +458,8 @@ COMMANDS: dict[str, CommandFn] = {
     "/steps": _cmd_steps,
     "/hold": _cmd_hold,
     "/go": _cmd_go,
+    # Mesh presence
+    "/announce": _cmd_announce,
 }
 
 
@@ -425,6 +515,8 @@ class CommandDispatcher:
             command = "/usage"
         elif word in ("version", "v"):
             command = "/version"
+        elif word in ("announce",):
+            command = "/announce"
 
         handler = COMMANDS.get(command)
         if handler is None:

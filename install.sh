@@ -7,6 +7,12 @@
 #   bash install.sh              # Install with default settings
 #   bash install.sh --venv PATH  # Install into specific venv
 #   bash install.sh --global     # Install globally (needs pip --break-system-packages)
+#   bash install.sh --service    # Also install the systemd user service
+#   bash install.sh --no-service # Skip the systemd service step (default: auto)
+#
+# The --service step renders config/hermes-reticulum.user.service against the
+# actual checkout path and current user — no manual path editing required.
+# Pass --service to force it on, --no-service to skip it.
 #
 # ═══════════════════════════════════════════════════════════════
 
@@ -15,6 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${SCRIPT_DIR}/venv"
 INSTALL_MODE="venv"
+INSTALL_SERVICE="auto"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -28,10 +35,20 @@ while [[ $# -gt 0 ]]; do
             INSTALL_MODE="global"
             shift
             ;;
+        --service)
+            INSTALL_SERVICE="yes"
+            shift
+            ;;
+        --no-service)
+            INSTALL_SERVICE="no"
+            shift
+            ;;
         --help|-h)
-            echo "Usage: bash install.sh [--venv DIR] [--global]"
-            echo "  --venv DIR   Install into a virtual environment (default: ./venv)"
-            echo "  --global     Install globally (needs --break-system-packages or pipx)"
+            echo "Usage: bash install.sh [--venv DIR] [--global] [--service] [--no-service]"
+            echo "  --venv DIR    Install into a virtual environment (default: ./venv)"
+            echo "  --global      Install globally (needs --break-system-packages or pipx)"
+            echo "  --service     Install the systemd user service (default: auto — only if systemd user session is available)"
+            echo "  --no-service  Skip the systemd service step"
             exit 0
             ;;
         *)
@@ -247,6 +264,124 @@ PYEOF
 else
     echo "  ⚠ No Python found to update config.yaml."
     echo "    Add 'mesh-tool-gate' and 'reticulum' to plugins.enabled manually."
+fi
+
+# ─── Systemd user service (optional) ───
+echo ""
+# Resolve the executable the unit should run. The rendered unit must target
+# the environment this install actually put the package in:
+#   - venv mode:  $VENV_DIR/bin/hermes-reticulum  (honours --venv PATH)
+#   - global:     the interpreter on PATH (no checkout-local venv exists)
+if [[ "$INSTALL_MODE" == "venv" ]]; then
+    BRIDGE_BIN="${VENV_DIR}/bin/hermes-reticulum"
+    BRIDGE_VENV="${VENV_DIR}"
+else
+    BRIDGE_BIN="$(command -v hermes-reticulum 2>/dev/null || echo hermes-reticulum)"
+    BRIDGE_VENV=""
+fi
+# The unit's WorkingDirectory/EnvironmentFile/Environment(HOME) follow the
+# checkout, regardless of where the package was installed.
+BRIDGE_HOME="${SCRIPT_DIR}"
+
+# systemd units have no variable expansion and a hostile-looking checkout
+# path (|, &, /, whitespace) would corrupt a naive sed substitution, so
+# render the unit with the placeholder already resolved via Python.
+RENDER_PY="${VENV_DIR}/bin/python"
+if [[ ! -x "$RENDER_PY" ]]; then
+    RENDER_PY=""
+    for cand in python3 python3.13 python3.12 python3.11; do
+        if command -v "$cand" &>/dev/null; then
+            RENDER_PY="$(command -v "$cand")"
+            break
+        fi
+    done
+fi
+if [[ -z "$RENDER_PY" ]]; then
+    echo "  ⚠ No Python interpreter found — skipping systemd service step."
+    echo ""
+else
+    if [[ "$INSTALL_SERVICE" == "no" ]]; then
+        echo "Skipping systemd service (requested via --no-service)"
+        echo ""
+    elif [[ "$INSTALL_SERVICE" == "yes" ]] || [[ "$INSTALL_SERVICE" == "auto" ]]; then
+        # Auto mode: only proceed if a systemd user manager is actually
+        # reachable (headless/SSH/container sessions often have systemctl
+        # installed but no active user manager).
+        if [[ "$INSTALL_SERVICE" == "auto" ]] && \
+           { ! command -v systemctl &>/dev/null || ! systemctl --user is-system-running &>/dev/null; }; then
+            echo "Skipping systemd service (no reachable systemd user session)"
+            echo ""
+        else
+            UNIT_DIR="${HOME}/.config/systemd/user"
+            UNIT_DST="${UNIT_DIR}/hermes-reticulum.service"
+            UNIT_SRC="${BRIDGE_HOME}/config/hermes-reticulum.user.service"
+
+            if [[ ! -f "$UNIT_SRC" ]]; then
+                echo "✗ Service template not found at $UNIT_SRC"
+                exit 1
+            fi
+
+            mkdir -p "$UNIT_DIR"
+            "$RENDER_PY" - "$UNIT_SRC" "$UNIT_DST" \
+                "$BRIDGE_HOME" "$BRIDGE_BIN" "$BRIDGE_VENV" <<'PYEOF'
+import sys
+src, dst, home, bridge_bin, bridge_venv = sys.argv[1:6]
+
+def _sysd_quote(value):  # systemd-style value quoting (handles whitespace)
+    if value and not any(c.isspace() for c in value):
+        return value
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+with open(src, encoding="utf-8") as fh:
+    lines = fh.readlines()
+out = []
+for line in lines:
+    line = line.replace("/opt/rns_hermes_endpoint", home)
+    if line.startswith("ExecStart=") and bridge_bin:
+        # bridge_bin may contain whitespace (e.g. a venv path or checkout
+        # under a directory with a space); quote it so systemd doesn't split
+        # the executable path while parsing ExecStart.
+        line = f"ExecStart={_sysd_quote(bridge_bin)} run\n"
+    if line.startswith("Environment=HOME="):
+        line = f"Environment=HOME={_sysd_quote(home)}\n"
+    out.append(line)
+    if line.startswith("EnvironmentFile="):
+        if bridge_venv:
+            out.append(
+                f"Environment=PATH={_sysd_quote(bridge_venv + '/bin')}:/usr/bin:/bin\n"
+            )
+        else:
+            out.append("Environment=PATH=/usr/local/bin:/usr/bin:/bin\n")
+with open(dst, "w", encoding="utf-8") as fh:
+    fh.writelines(out)
+PYEOF
+
+            if systemctl --user daemon-reload; then
+                if [[ "$INSTALL_SERVICE" == "yes" ]]; then
+                    if systemctl --user enable --now hermes-reticulum; then
+                        echo "✓ Installed and started systemd user service: hermes-reticulum"
+                    else
+                        echo "⚗ Wrote and enabled the unit but could not start it."
+                        echo "  Check: journalctl --user -u hermes-reticulum"
+                        echo "  Retry: systemctl --user start hermes-reticulum"
+                    fi
+                else
+                    if systemctl --user enable hermes-reticulum; then
+                        echo "✓ Installed systemd user service: hermes-reticulum (enabled, not started)"
+                        echo "  Start it with: systemctl --user start hermes-reticulum"
+                        echo "  Follow logs with: journalctl --user -u hermes-reticulum -f"
+                    else
+                        echo "⚗ Wrote the unit but could not enable it."
+                        echo "  Retry: systemctl --user enable hermes-reticulum"
+                    fi
+                fi
+            else
+                echo "⚗ Wrote unit to $UNIT_DST but could not talk to systemd."
+                echo "  Review it, then run: systemctl --user daemon-reload && systemctl --user enable hermes-reticulum"
+            fi
+            echo ""
+        fi
+    fi
 fi
 
 # ─── Done ───

@@ -136,6 +136,14 @@ class HermesClient:
         self.liveness_timeout = int(
             os.getenv("HERMES_LIVENESS_TIMEOUT", "600")
         )
+        # Hard cap: an absolute wall clock on a single turn, independent of the
+        # relative liveness silence window. Even if the marker keeps trickling
+        # fresh tool rows forever, a turn that runs past this cap is itself
+        # suspect and is killed. Set 0 to disable. Distinct from
+        # liveness_timeout (which is "silence with no progress").
+        self.turn_hard_cap = int(
+            os.getenv("HERMES_TURN_HARD_CAP", "21600")
+        )
         # Liveness-heartbeat marker file (spec Part 1, Option A): the
         # ``agent:step`` hook and the bridge itself write
         # ``{"session": <thread title>, "ts": <time.time()>, "phase": ...,
@@ -302,6 +310,48 @@ class HermesClient:
             return False
         return True
 
+    def _log_marker_scoping_diag(self) -> None:
+        """Log the marker's session+gen vs this child's, at a guard kill.
+
+        Distinguishes a scoping mismatch (marker written for a different
+        session or generation — e.g. a resumed child whose gen was bumped
+        after the hook wrote the marker) from a true stall (no marker at
+        all). Called from the watchdog kill path; best-effort, never raises.
+        """
+        cur_gen = self.current_turn_alive_gen()
+        try:
+            with open(self.turn_alive_file, encoding="utf-8") as f:
+                marker = json.load(f)
+        except FileNotFoundError:
+            logger.warning(
+                "Liveness guard fired: no marker present "
+                "(child session=%r gen=%d) — true stall or marker never written",
+                self.session_name, cur_gen,
+            )
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Liveness guard fired: marker unreadable (%s) "
+                "(child session=%r gen=%d)",
+                exc, self.session_name, cur_gen,
+            )
+            return
+        m_session = marker.get("session")
+        m_gen = marker.get("gen")
+        if m_session != self.session_name or m_gen != cur_gen:
+            logger.warning(
+                "Liveness guard fired on SCOPING MISMATCH: marker "
+                "(session=%r gen=%s) != child (session=%r gen=%d) — "
+                "possibly a stale/resumed marker, not a true stall",
+                m_session, m_gen, self.session_name, cur_gen,
+            )
+        else:
+            logger.warning(
+                "Liveness guard fired on TRUE STALL: marker matched "
+                "(session=%r gen=%d) but went stale within %ds",
+                self.session_name, cur_gen, self.liveness_timeout,
+            )
+
     def steer(self, text: str) -> None:
         """Queue steering text to be injected as a prefix to the next prompt."""
         self._steer_pending = (text or "").strip() or None
@@ -358,11 +408,11 @@ class HermesClient:
     # like the gateway's progress bubble. No gateway, no hook needed.
 
     def _push_step(self, name: str, args_raw, result: str, is_error: bool) -> None:
-        """Push one tool call (💻 + command) and its output to the mesh peer."""
+        """Push one tool call (emoji + name) and its output to the mesh peer."""
         if not self._push_callback:
             _diag(f"  push_step({name}) skipped: no push callback")
             return
-        # Primary argument, formatted for the mesh (gateway 💻 style).
+        # Primary argument, formatted for the mesh (gateway progress-bubble style).
         args_text = args_raw or ""
         if isinstance(args_raw, (dict, list)):
             try:
@@ -375,8 +425,9 @@ class HermesClient:
                 args_text = str(primary)
         if not args_text:
             args_text = "(no arguments)"
-        # Error tools get a ❌ prefix; keep the command visible either way.
-        head = f"❌ {name}" if is_error else f"💻 {name}"
+        # Same per-tool emoji the gateway shows on Telegram; ❌ for a failed call.
+        from hermes_reticulum.core.tool_emoji import tool_label
+        head = tool_label(name, is_error)
         body = f"{head}\n{args_text}"
         if result:
             body += f"\n{result}"
@@ -452,8 +503,13 @@ class HermesClient:
                 _diag(f"step-watcher fetch error: {e}")
                 continue
             results_by_cid: dict = {}
+            saw_tool_activity = False
             for rid, role, tool_calls, tool_name, content, tool_call_id in rows:
                 if role == "tool" and tool_call_id:
+                    # A tool RESULT row: the model's last call ran. This is
+                    # real tool progress — mark it (heartbeat below) and keep
+                    # the result for the assistant row that issued it.
+                    saw_tool_activity = True
                     results_by_cid[tool_call_id] = content or ""
                 elif role == "assistant" and tool_calls:
                     try:
@@ -462,6 +518,8 @@ class HermesClient:
                         continue
                     if not isinstance(calls, list):
                         continue
+                    if calls:
+                        saw_tool_activity = True
                     for call in calls:
                         if not isinstance(call, dict) or "function" not in call:
                             continue
@@ -475,6 +533,17 @@ class HermesClient:
                         )
                         self._push_step(cname, cargs, result_text, is_error)
                         pushed += 1
+            # Only refresh the liveness marker if this batch actually contained
+            # tool activity. MAX(id) advances for ANY new row in the session
+            # (user, system, text-only assistant, tool), so a blind refresh on
+            # last_id > last_pushed would let unrelated rows keep a stalled
+            # child alive until the hard cap. A working turn emits tool rows;
+            # only those should warm the heartbeat. The gateway agent:step hook
+            # never fires for a CLI child, so this in-process refresh is what
+            # keeps a working -q turn's marker fresh (scoped by session + gen).
+            # Best-effort: a write failure degrades to the bytes-only guard.
+            if saw_tool_activity:
+                self.write_turn_alive_marker(phase="tool")
             last_pushed = last_id
         _diag(f"step-watcher stop sid={sid} pushed={pushed}")
 
@@ -517,17 +586,41 @@ class HermesClient:
         self._hold_gate = False
         return reply
 
-    def tool_recap(self, limit: int = 10) -> list[dict]:
-        """Recap of the last tool calls in the current mesh session.
+    def tool_recap(
+        self,
+        limit: int = 10,
+        anchor: tuple[str, int] | None = None,
+    ) -> list[dict]:
+        """Recap of the tool calls made during the CURRENT mesh turn.
 
         Read from state.db (the same store hermes persists to), so this
         works even when the live ``agent:step`` hook is unavailable.
+        Scoped to rows with ``id > anchor_id`` (where ``anchor`` is the
+        per-turn ``(sid, row_id)`` boundary captured just before this turn's
+        child spawned), so a tool-free turn returns [] (no footer) and prior
+        turns' tools never bleed in. ``anchor`` is per-call — it is captured
+        inside the turn lock and threaded to the recap, NOT stored as shared
+        mutable client state, so concurrent bridge turns can never read
+        each other's boundary (see
+        docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md).
+        If ``anchor`` is None (session not resolvable, or a DB error at
+        capture time) or its sid doesn't match the session being recap'd,
+        fall back to no filter rather than guessing.
+
         Returns a list of ``{"name": str, "is_error": bool, "preview": str}``
-        for the most recent ``limit`` tool messages (oldest first).
+        for the most recent ``limit`` tool messages of this turn (oldest
+        first).
         """
         sid = self._resume_id or self._resolve_session_id()
         if not sid:
             return []
+        anchor_sid, anchor_id = (
+            (anchor[0], anchor[1]) if anchor else (None, None)
+        )
+        if anchor_sid == sid and anchor_id is not None:
+            filter_anchor = anchor_id
+        else:
+            filter_anchor = None
         db_path = os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
@@ -539,12 +632,20 @@ class HermesClient:
             try:
                 # Tool-call messages are persisted as assistant rows with a
                 # tool_calls JSON payload; tool *results* as role='tool'.
-                rows = conn.execute(
-                    "SELECT content, tool_calls FROM messages "
-                    "WHERE session_id = ? AND role = 'assistant' "
-                    "ORDER BY id ASC",
-                    (sid,),
-                ).fetchall()
+                if filter_anchor is not None:
+                    rows = conn.execute(
+                        "SELECT content, tool_calls FROM messages "
+                        "WHERE session_id = ? AND role = 'assistant' "
+                        "AND id > ? ORDER BY id ASC",
+                        (sid, filter_anchor),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT content, tool_calls FROM messages "
+                        "WHERE session_id = ? AND role = 'assistant' "
+                        "ORDER BY id ASC",
+                        (sid,),
+                    ).fetchall()
             finally:
                 conn.close()
         except (sqlite3.Error, OSError) as exc:
@@ -641,7 +742,70 @@ class HermesClient:
             logger.warning("Could not snapshot sessions from state.db: %s", exc)
             return set()
 
-    def _adopt_new_session(self, turn_start: float, before: set[str]) -> None:
+    def _capture_turn_anchor(
+        self, sid: str | None, boundary: str = "max"
+    ) -> tuple[str, int] | None:
+        """Compute this turn's recap anchor — the ``(sid, row_id)`` boundary
+        below which all rows belong to PRIOR turns.
+
+        ``messages`` is session-global (the store is shared across turns), so
+        the boundary between "prior turns" and "this turn" must be computed
+        at the right moment:
+
+        - boundary="max" (default): the session's MAX(messages.id). Only
+          valid BEFORE the child spawns (chat() computes this): at that point
+          the max id is the last row of prior turns, and every row the
+          child writes has an id above it. A tool-free turn then yields an
+          empty recap (no footer) and prior turns' tools never bleed in.
+        - boundary="first_user": the session's first role='user' row id.
+          Used by _adopt_new_session, where the sid only became known AFTER
+          the child ran. The session is brand-new (created by this turn), so
+          its first user row is the pre-turn boundary; every tool row of
+          this turn sits above it.
+
+        ``tool_recap(anchor=...)`` counts only rows with ``id > row_id``.
+
+        Returns the ``tuple`` so the caller can hold it as a LOCAL variable
+        for this turn and thread it into the recap. It is deliberately NOT
+        stored as shared client state: chat() may run concurrently from the
+        bridge's thread pool, and a shared mutable anchor would let one turn
+        overwrite another's boundary (see
+        docs/mesh-bridge-findings-2026-09-15-tool-recap-prior-turns.md).
+
+        ``sid`` may be None (session not yet resolvable) → returns None, and
+        tool_recap() falls back to no filter (the old behavior) rather than
+        guessing. A DB error likewise returns None.
+        """
+        if not sid:
+            return None
+        db_path = self._state_db_path()
+        if not os.path.exists(db_path):
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                if boundary == "first_user":
+                    row = conn.execute(
+                        "SELECT MIN(id) FROM messages "
+                        "WHERE session_id = ? AND role = 'user'",
+                        (sid,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT MAX(id) FROM messages WHERE session_id = ?",
+                        (sid,),
+                    ).fetchone()
+            finally:
+                conn.close()
+            row_id = row[0] if row and row[0] is not None else 0
+            return (sid, row_id)
+        except (sqlite3.Error, OSError) as exc:
+            logger.debug("Could not capture turn anchor: %s", exc)
+            return None
+
+    def _adopt_new_session(
+        self, turn_start: float, before: set[str]
+    ) -> tuple[str, int] | None:
         """Title the session created by *this* turn with the mesh thread name.
 
         Compatibility shim for Hermes builds that lack ``--create-if-missing``:
@@ -668,6 +832,10 @@ class HermesClient:
         unpinned thread costs only continuity; pinning the wrong session
         corrupts the conversation. Callers hold the turn lock across
         spawn+adopt, so concurrent turns on this client cannot interleave.
+
+        Returns the first-turn recap anchor (``boundary="first_user"``) so the
+        caller can thread it into the recap; None when nothing was adopted or
+        the boundary could not be computed.
         """
         db_path = self._state_db_path()
         try:
@@ -683,7 +851,7 @@ class HermesClient:
                 conn.close()
         except (sqlite3.Error, OSError) as exc:
             logger.warning("Could not query state.db to adopt a session: %s", exc)
-            return
+            return None
 
         candidates = [row[0] for row in rows if row[0] not in before]
         if len(candidates) != 1:
@@ -694,7 +862,7 @@ class HermesClient:
                 "conversation.",
                 self.session_name, self.source_tag, len(candidates),
             )
-            return
+            return None
 
         session_id = candidates[0]
         try:
@@ -706,20 +874,29 @@ class HermesClient:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logger.warning("Could not rename session %s: %s", session_id, exc)
-            return
+            return None
         if proc.returncode != 0:
             logger.warning(
                 "hermes sessions rename failed (rc=%s): %s",
                 proc.returncode,
                 (proc.stderr or proc.stdout or "").strip()[:200],
             )
-            return
+            return None
 
         self._resume_id = session_id
+        # The session id only became known during this turn (adoption), so
+        # the pre-spawn anchor in chat() had no sid. Compute it now with the
+        # correct pre-turn boundary: this session is brand-new and was created
+        # by THIS turn, so its first user row is the pre-turn boundary — every
+        # tool row of this turn has an id above it. (MAX(id) would be wrong:
+        # it would exclude this turn's own tools.) Returned as a LOCAL anchor
+        # for the caller to thread into the recap (never shared state).
+        anchor = self._capture_turn_anchor(session_id, boundary="first_user")
         logger.info(
             "Created and titled mesh thread %r -> session %s",
             self.session_name, session_id[:12],
         )
+        return anchor
 
     def _ensure_session(self, new_session: bool) -> None:
         """
@@ -829,6 +1006,15 @@ class HermesClient:
             cmd += ["-m", model]
         cmd.extend(self.extra_args)
 
+        # Per-turn tool-recap anchor. Computed INSIDE the turn lock (below),
+        # held as a LOCAL for this invocation, and threaded into the recap —
+        # never shared mutable client state. Two concurrent bridge turns (the
+        # bridge fans out on a thread pool) each get their own boundary, so
+        # one turn can never read another's. The first turn (sid unknown until
+        # adoption) gets None here; _adopt_new_session computes it once the
+        # session id is known (boundary="first_user").
+        turn_anchor: tuple[str, int] | None = None
+
         # CLI-side step-through watcher: push each tool call + output as its
         # own mesh message while the child runs. The gateway hook (agent:step)
         # can't fire for a CLI child, so this is what actually delivers the
@@ -868,6 +1054,13 @@ class HermesClient:
                 # this invocation can possibly have created (see
                 # _adopt_new_session).
                 turn_start = time.time()
+                # Recap anchor: compute the session's MAX(messages.id) while we
+                # hold the turn lock, BEFORE the child spawns, as a LOCAL for
+                # this turn. Doing it under the lock (not before) means a
+                # concurrent turn can neither overwrite nor read it — the old
+                # shared-instance anchor let a second turn clobber the first
+                # turn's boundary before either serialized on the lock.
+                turn_anchor = self._capture_turn_anchor(self._resume_id)
                 # Spec Part 1, Option B: advance the per-child generation
                 # before spawning so the hook's refreshes are scoped to THIS
                 # child's lifetime, and the initial phase="model" marker
@@ -881,8 +1074,25 @@ class HermesClient:
                     # holding the turn lock: state.db is shared, so releasing
                     # the lock first would let a concurrent turn create its own
                     # session inside the spawn→adopt window, and we could pin
-                    # the wrong conversation.
-                    self._adopt_new_session(turn_start, adopt_before)
+                    # the wrong conversation. Adoption also computes the
+                    # first-turn anchor (boundary="first_user") now that the
+                    # session id exists.
+                    adopted_anchor = self._adopt_new_session(
+                        turn_start, adopt_before
+                    )
+                    if adopted_anchor is not None:
+                        turn_anchor = adopted_anchor
+                # Recap AFTER adoption, so the first-turn anchor (computed
+                # during adoption) is already in place when the footer is
+                # built. On a resumed/known session the pre-spawn anchor is
+                # used as-is; on a fresh session the first_user anchor (or
+                # None, falling back to no filter) is. This is the fix for the
+                # "first turn of an adopted session recaps nothing" gap — the
+                # recap must see the sid/boundary that only adoption provides.
+                if result is not None:
+                    result = self._with_tool_recap(
+                        result, anchor=turn_anchor
+                    )
             if result is not None and self._guard_killed and not self._deny_veto:
                 if self._guard_kill_worth_retrying(
                     getattr(self, "_last_run_ms", 0.0)
@@ -942,7 +1152,13 @@ class HermesClient:
                         f"continue; or lower HERMES_LIVENESS_TIMEOUT."
                     )
             # Stop the step watcher now the child has finished (it only ever
-            # pushes rows created during the turn).
+            # pushes rows created during the turn). The `finally` below also
+            # sets this on every error path (subprocess setup or turn
+            # processing raising), so the daemon watcher is never orphaned
+            # — an orphan would keep polling state.db and, because it uses
+            # the client's current session + gen, refresh the liveness marker
+            # for a *later* stalled turn, keeping it alive until the hard cap
+            # and pushing its tool steps again. Event.set() is idempotent.
             watcher_stop.set()
             # Checkpoint gate: if the operator pressed /hold, block here
             # until /go (or timeout) before the reply leaves the bridge.
@@ -957,13 +1173,28 @@ class HermesClient:
             logger.error("Unexpected error calling Hermes: %s", e, exc_info=True)
             return f"❌ Unexpected error: {str(e)[:200]}"
 
-    def _run_with_liveness_guard(self, cmd: list[str]) -> str | None:
+        finally:
+            # Every exit path (normal, FileNotFoundError, any other
+            # Exception) must stop the step watcher. See the comment above:
+            # an orphaned daemon watcher refreshes the liveness marker for
+            # subsequent turns and re-pushes their tool steps.
+            watcher_stop.set()
+
+    def _run_with_liveness_guard(
+        self, cmd: list[str], anchor: tuple[str, int] | None = None
+    ) -> str | None:
         """
         Run the hermes subprocess with a liveness guard.
 
         Kills the process if zero output (stdout+stderr) for
         ``liveness_timeout`` seconds. Returns the reply text or an
         error message.
+
+        ``anchor`` is this turn's per-turn recap boundary (a local, threaded
+        here — NOT shared state). It is NOT used to recap inside this method:
+        the recap is applied by the caller AFTER session adoption, so the
+        first-turn (adopted-session) anchor is already in place when the
+        footer is built.
         """
         last_activity = time.monotonic()
         started = time.monotonic()
@@ -991,17 +1222,40 @@ class HermesClient:
                     pass
 
         def _watchdog():
-            if not self.liveness_timeout:
+            if not self.liveness_timeout and not self.turn_hard_cap:
                 return
             while not done.is_set():
+                now = time.monotonic()
+                # Hard cap: absolute wall clock on the whole turn, independent
+                # of the silence window. Fires even if the marker is fresh (a
+                # turn trickling tool rows for hours is still suspect).
+                if self.turn_hard_cap and (now - started) > self.turn_hard_cap:
+                    logger.warning(
+                        "Liveness guard: turn exceeded the hard cap %ds, "
+                        "killing hermes",
+                        self.turn_hard_cap,
+                    )
+                    self._stop_requested = True
+                    self._guard_killed = True
+                    self._deny_veto = False
+                    self._kill_process()
+                    self.clear_turn_alive_marker()
+                    return
+                if not self.liveness_timeout:
+                    done.wait(1.0)
+                    continue
                 with activity_lock:
-                    remaining = (last_activity + self.liveness_timeout) - time.monotonic()
+                    remaining = (last_activity + self.liveness_timeout) - now
                 if remaining <= 0:
                     logger.warning(
                         "Liveness guard: no output or heartbeat for %ds, "
                         "killing hermes",
                         self.liveness_timeout,
                     )
+                    # Diagnostic: was this a scoping mismatch (marker session
+                    # or gen not matching this child — e.g. on resume) vs a
+                    # true stall? Logged once at the kill, best-effort.
+                    self._log_marker_scoping_diag()
                     self._stop_requested = True
                     self._guard_killed = True
                     # A liveness-guard kill is NOT a mesh veto — clear it so
@@ -1111,7 +1365,11 @@ class HermesClient:
             if not reply:
                 logger.warning("Hermes returned empty output")
                 return "_(no response)_"
-            return self._with_tool_recap(reply)
+            # The recap is applied by chat() AFTER session adoption (the
+            # first turn's anchor is only known during adoption), so return
+            # the raw reply here and let the caller thread the per-turn
+            # anchor in.
+            return reply
 
         except FileNotFoundError:
             logger.error("Hermes binary not found at: %s", self.hermes_bin)
@@ -1126,7 +1384,9 @@ class HermesClient:
             self._process = None
             done.set()
 
-    def _with_tool_recap(self, reply: str) -> str:
+    def _with_tool_recap(
+        self, reply: str, anchor: tuple[str, int] | None = None
+    ) -> str:
         """Append a compact tool recap to the reply (recap fallback).
 
         Live tool steps are the primary channel; this is the safety net —
@@ -1136,21 +1396,26 @@ class HermesClient:
         Suppressed entirely in step mode: the CLI-side watcher already
         delivered each tool call + output as its own 💻 message, so a recap
         footer would be a redundant recap the user explicitly rejected.
+
+        ``anchor`` is this turn's per-turn recap boundary, threaded in by the
+        caller (chat() computes it under the turn lock and hands it over
+        after adoption). Never reads shared client state.
         """
         if self._step_mode:
             _diag(f"  recap suppressed (step mode) reply={len(reply)} chars")
             return reply
         try:
-            recap = self.tool_recap(limit=8)
+            recap = self.tool_recap(limit=8, anchor=anchor)
         except Exception as exc:
             logger.debug("tool_recap failed: %s", exc)
             return reply
         if not recap:
             return reply
         names = [r["name"] for r in recap]
-        line = "🔧 " + ", ".join(names)
-        if len(names) > 8:
-            line += f" (+{len(names) - 8} more)"
+        from hermes_reticulum.core.tool_emoji import tool_emoji
+        line = ", ".join(f"{tool_emoji(n)} {n}" for n in names)
+        if len(recap) > 8:
+            line += " …"
         return f"{reply}\n\n_{line}_"
 
     def _kill_process(self) -> None:

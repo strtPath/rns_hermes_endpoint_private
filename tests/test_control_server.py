@@ -424,13 +424,17 @@ class TestStatusPayloadInProcess(unittest.TestCase):
     def setUp(self):
         self.server = ControlServer(port=0)  # not started; in-process API
 
-    def test_has_exactly_the_four_keys(self):
+    def test_has_exactly_the_five_keys(self):
         p = self.server.status_payload()
-        self.assertEqual(set(p), {"model", "session", "uptime", "acl"})
+        self.assertEqual(
+            set(p),
+            {"model", "session", "uptime", "acl", "approval_timeout_s"},
+        )
         self.assertEqual(
             set(p["session"]),
             {"running", "active_sessions", "pending_approvals"},
         )
+        self.assertGreater(p["approval_timeout_s"], 0)
 
     def test_model_null_until_wired(self):
         self.assertIsNone(self.server.status_payload()["model"])
@@ -514,7 +518,10 @@ class TestStatusHttpEndpoint(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(ctype, "application/json")
         payload = json.loads(body.decode("utf-8"))
-        self.assertEqual(set(payload), {"model", "session", "uptime", "acl"})
+        self.assertEqual(
+            set(payload),
+            {"model", "session", "uptime", "acl", "approval_timeout_s"},
+        )
         self.assertIn("running", payload["session"])
         self.assertIn("pending_approvals", payload["session"])
 

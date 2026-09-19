@@ -50,10 +50,8 @@ class ToolStep:
 
     def summary(self) -> str:
         """Compact one-line summary for mesh display (bandwidth-aware)."""
-        base = f"🔧 {self.name}"
-        if self.is_error:
-            base += " ❌"
-        return base
+        from hermes_reticulum.core.tool_emoji import tool_label
+        return tool_label(self.name, self.is_error)
 
 
 def classify_tool(name: str) -> str:
@@ -348,6 +346,7 @@ class ControlServer:
                 if started is not None else 0.0
             ),
             "acl": self._acl_mode(),
+            "approval_timeout_s": self.approval_timeout,
         }
 
     def _acl_mode(self) -> str:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-reticulum"
-version = "0.1.0"
+version = "0.2.0"
 description = "Put an AI agent on your Reticulum mesh — reachable from off-grid RNodes, Sideband, and any LXMF client, without a central messaging server"
 readme = "README.md"
 license = {text = "MIT"}
@@ -26,8 +26,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "rns>=1.3.5",
-    "lxmf>=1.0.0",
+    "rns>=1.5.4,<2.0",
+    "lxmf>=1.1.1,<2.0",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
 ]

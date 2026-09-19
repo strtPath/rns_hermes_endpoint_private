@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -86,6 +87,72 @@ def _deny_veto(hermes) -> None:
     hermes.stop()
 
 
+def _validate_gate_timeouts() -> None:
+    """Fail loudly if the bridge-side gate timeouts are misconfigured.
+
+    MESH_GATE_TIMEOUT (gateway-plugin blocking POST) must be >=
+    HERMES_MESH_APPROVAL_TIMEOUT (control-server deny clock, bridge
+    process). If the plugin's urlopen times out before the control server's
+    deny clock, the plugin fails closed BEFORE the operator could answer — a
+    raised approval timeout is silently capped by the smaller gate timeout.
+    This relationship is load-bearing, so validate it rather than let it fail
+    closed at runtime.
+
+    Both values must also be finite and strictly positive. An approval wait
+    of <= 0 (Event.wait(0) / wait(-1)) returns immediately with no decision,
+    which would deny every gated action without giving the operator any
+    window; NaN and infinity are equally invalid. The plugin's _GATE_TIMEOUT
+    runs in the gateway process, so when the gateway has its own env this
+    check validates the bridge's view of the values — set the same values
+    from one authoritative source (the README documents the ordering).
+
+    Refuses to start (sys.exit) rather than silently clamping — the reported
+    values must be exactly what was configured, never a rewritten number.
+    """
+    try:
+        gate = float(os.environ.get("MESH_GATE_TIMEOUT", "900"))
+        approval = float(os.environ.get("HERMES_MESH_APPROVAL_TIMEOUT", "900"))
+    except (TypeError, ValueError):
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "Gate timeout config invalid — MESH_GATE_TIMEOUT and "
+            "HERMES_MESH_APPROVAL_TIMEOUT must be numeric seconds."
+        )
+        sys.exit(1)
+        return
+    if not (math.isfinite(gate) and math.isfinite(approval)):
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: gate timeouts must be finite "
+            "(MESH_GATE_TIMEOUT=%r, HERMES_MESH_APPROVAL_TIMEOUT=%r). "
+            "NaN or infinity would break the approval wait. Refusing to start.",
+            gate, approval,
+        )
+        sys.exit(1)
+    if gate <= 0 or approval <= 0:
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: gate timeouts must be positive "
+            "(MESH_GATE_TIMEOUT=%rs, HERMES_MESH_APPROVAL_TIMEOUT=%rs). "
+            "A non-positive approval wait would deny every gated action "
+            "immediately. Refusing to start.",
+            gate, approval,
+        )
+        sys.exit(1)
+    if gate < approval:
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: MESH_GATE_TIMEOUT=%ss is less than "
+            "HERMES_MESH_APPROVAL_TIMEOUT=%ss. The plugin's blocking POST "
+            "would time out (fail closed) before the operator could answer — "
+            "the operator's window is silently capped at %ss. Set "
+            "MESH_GATE_TIMEOUT >= HERMES_MESH_APPROVAL_TIMEOUT in .env and "
+            "restart. Refusing to start.",
+            gate, approval, gate,
+        )
+        sys.exit(1)
+
+
 def cmd_run(args):
     """Start the bridge and run until interrupted."""
     setup_logging(args.verbose)
@@ -98,6 +165,11 @@ def cmd_run(args):
     rns_config = expand_path(args.rns_config or os.getenv("RETICULUM_CONFIG", None))
     hermes_bin = expand_path(args.hermes_bin or os.getenv("HERMES_BIN", "hermes"))
     timeout = args.timeout or int(os.getenv("HERMES_TIMEOUT", "300"))
+
+    # Fail loudly if the two bridge-side gate timeouts are misconfigured
+    # (see _validate_gate_timeouts). Must run after _load_dotenv() so the
+    # .env values are present.
+    _validate_gate_timeouts()
 
     # Initialize components
     acl = AccessControl()
@@ -145,7 +217,10 @@ def cmd_run(args):
         if push is None:
             logger.debug("no mesh peer for %r — dropping tool event", session)
             return
-        ok = bridge.send_reply(push["hash"], f"🔧 {label}", push["ident"])
+        from hermes_reticulum.core.tool_emoji import tool_label
+        ok = bridge.send_reply(
+            push["hash"], tool_label(label, getattr(step, "is_error", False)), push["ident"]
+        )
         if ok:
             logger.info("Tool event %s pushed to mesh peer %s", label, push["hash"][:16])
         else:

@@ -156,7 +156,7 @@ Confirm on the client side that your sender hash appears in `HERMES_RETICUM_ALLO
 ## Next steps
 
 - Architecture, security, and full configuration: [README.md](README.md)
-- Run as a persistent service: `config/hermes-reticulum*.service`
+- Run as a persistent service: `bash install.sh --service` (renders the unit from your checkout; see README)
 - Contribute or run tests: `pip install -e ".[dev]" && pytest tests/ -v`
 
 When your first off-grid message gets a reply, you have a production-ready pattern: **mesh transport on the edge, AI reasoning at the gateway.**

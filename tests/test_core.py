@@ -171,7 +171,7 @@ class TestVersion:
 
     def test_version_importable(self):
         from hermes_reticulum import __version__
-        assert __version__ == "0.1.0"
+        assert __version__ == "0.2.0"
 
 
 class TestBridgeLiveness:

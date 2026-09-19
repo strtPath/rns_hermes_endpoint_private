@@ -172,7 +172,7 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 |------|-------------------|-------------|-------|
 | Streaming replies | Token-by-token | ⬜ | LXMF is message-based, no streaming. Out of scope unless we chunk. |
 | Tool-call visibility | Renders tool activity | ⚠️ partial (2026-08-22) | Live `🔧 tool` push via `agent:step` hook → control server; `/approve`/`/deny` gate + `/steer`; state.db recap fallback. Caveat: `agent:step` fires *after* tool execution — veto, not pre-execution gate. See `mesh-bridge-findings-2026-08-22-tool-calls.md`. |
-| Attachments (image/file) | User sends image/file, agent sees it | ⬜ verify | LXMF text-only; likely out of scope. Confirm. |
+| Attachments (image/file) | User sends image/file, agent sees it | ⬜ in scope (Tier 5) | LXMF text-only for small messages, but RNS `Resource` can carry the bytes and LXMF the hash pointer — same pattern as voice-out (5.1). Inbound direction has no LXMF file-receive; needs the same `rngit`/spike path as voice-in (5.2). Added to roadmap 2026-09-16: both send-image-to-agent and send-image-back are now tracked under Tier 5 media. |
 | Voice (STT/TTS) | Voice note in, voice out | ⬜ verify | Constrained over mesh; likely out of scope. |
 | Markdown/formatting | Rich formatting | ⬜ | LXMF is plain text; keep replies plain-text-safe (TTS-friendly). |
 | Multi-turn tool loops | Agent runs tools, replies | ⚠️ | Works (it's `hermes chat`), but the *rendering* of tool activity is the gap (see above). |
@@ -205,6 +205,9 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 - **Voice & media: in scope as Tier 5.** Voice-out (5.1) is feasible now.
   Voice-in (5.2) needs a spike on the `rngit` inbound path. **Live call (5.3)
   is out of scope** for the LXMF transport — documented, not deferred.
+  Images joined the same tier 2026-09-16: image-out (5.4) rides the 5.1
+  RNS-Resource plumbing; image-in (5.5) shares the 5.2 inbound-transport
+  spike.
 - Does `/stop` need to kill the `hermes chat` subprocess, or just flag the
   bridge to ignore the next reply?
 
@@ -218,8 +221,10 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 5. **Tier 2 fuller session control** — the full non-`cli_only` session set
    (`/resume`, `/branch`, `/compress`, `/undo`, `/queue`, `/background`,
    `/sessions`, …) once the core batch is stable.
-6. **Tier 5 — Voice & media** — voice-out first (5.1), then a spike on voice-in
-   (5.2). See the transport constraints below before committing to 5.2.
+6. **Tier 5 — Voice & media** — voice-out first (5.1), then image-out (5.4)
+   reusing the same RNS-Resource transfer code, then a shared spike on the
+   inbound path for voice-in (5.2) and image-in (5.5). See the transport
+   constraints below before committing to the inbound side.
 7. Then cut the upstream PR from the clean branch (after Tier 4).
 
 ---
@@ -251,9 +256,18 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | 5.1 | **Voice-out** (TTS → OGG/Opus → RNS-Resource → LXMF pointer) | ✅ medium, high feasibility | Generate OGG locally (edge-tts/piper already in the stack's toolchain), transfer via RNS `Resource`, LXMF message carries hash+size. Mirrors Telegram voice bubbles. |
 | 5.2 | **Voice-in** (STT: your note → faster-whisper → text) | ⚠️ hard — spike first | No LXMF inbound file path. Options: (a) RNS `rngit` server the phone pushes to; (b) base64-chunked text (fragile, 368B/msg — only for tiny clips). **Spike 5.2 before building.** |
 | 5.3 | **Live call** (continuous two-way voice) | ❌ out of scope | Not feasible on this transport. Documented, not deferred. |
+| 5.4 | **Image-out** (agent sends image/file back to you) | ✅ medium, high feasibility | Same pattern as 5.1: save image locally, transfer bytes via RNS `Resource`, LXMF message carries hash+size (+ format hint). Client fetches over the RNS link. Feasible now once the 5.1 resource plumbing is in place; build after 5.1 shares the transfer code. |
+| 5.5 | **Image-in** (you send image/file to the agent) | ⚠️ hard — spike first | No LXMF inbound file path, same gap as 5.2. Options: (a) RNS `rngit` server you push to; (b) base64-chunked text (fragile at 368B/msg — images are too big). Agent side is easy once bytes arrive: save to disk, hand path to `vision_analyze` / `read_file`. **Spike 5.5 together with 5.2 — they share the same inbound-transport question.** |
 
 ### Open design questions for Tier 5
 - Voice-out codec + bitrate for LoRa bandwidth (Opus q~0.3? ~16–24 kbps?).
 - Where the OGG is stored + how the client is told the resource hash (a
   structured LXMF message field, or a short text preamble).
 - For 5.2: do we stand up `rngit`, or is voice-out-only an acceptable v1?
+- For 5.4/5.5 (images): image size ceiling for LoRa hop counts (a phone photo
+  is 2–5 MB; RNS Resource chunking handles it, but how slow at 3 hops?).
+  Format hints in the LXMF pointer message (JPEG/PNG/webp) so the client
+  renders without sniffing. And: does image-in need `rngit` like 5.2, or can
+  a shared RNS Resource the phone pushes to (if the RNode client supports
+  Resource upload) do the job — that decides whether 5.5 and 5.2 spike once
+  or twice.
