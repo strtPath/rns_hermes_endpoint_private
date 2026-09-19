@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import urllib.request
@@ -339,11 +340,19 @@ def _block_message(
 ) -> str:
     """Build the gateway-aligned ``BLOCKED`` message for a denied gate.
 
+    Three distinct cases, so the model gets the right instruction:
+
     - Explicit deny (verdict == 'deny'): "Action denied by user.", plus the
-      reason clause when the operator gave one.
-    - Timeout / failure (anything else): the timeout wording, so the model
-      gets the same "do NOT retry/rephrase" guardrail without the fake
-      operator attribution; silence is not consent.
+      reason clause when the operator gave one. FIRM — the user said no; do
+      not attempt this avenue at all.
+    - Genuine timeout (verdict == 'timeout'): the operator never answered.
+      The exact action is dead (do not retry/rephrase/redirect), but the rest
+      of the task may continue on safe tools — this is operator silence, not
+      a refusal.
+    - Infrastructure failure (gate-error / no-control-endpoint / anything
+      else): the gate could not reach the operator. Firm like a deny — no
+      "continue with safe tools" coaching, because a malfunction isn't
+      operator consent (or its absence).
     """
     if verdict == "deny":
         reason_addendum = (
@@ -355,12 +364,20 @@ def _block_message(
             "rephrase it, and do NOT attempt the same outcome via a "
             "different path."
         )
-    # timeout / gate-error / no-control-endpoint → gateway timeout wording
+    if verdict == "timeout":
+        return (
+            "BLOCKED: The requested action did not receive approval before "
+            "the gate timed out. Do NOT retry it, do NOT rephrase it, and "
+            "do NOT attempt the same outcome via a different path. You may "
+            "continue the rest of the task using safe tools that need no "
+            "approval."
+        )
+    # gate-error / no-control-endpoint → firm, no continuation coaching
     return (
-        "BLOCKED: Action timed out without user response. The user has "
-        "NOT consented to this action. Do NOT retry it, do NOT rephrase "
-        "it, and do NOT attempt the same outcome via a different path. "
-        "Silence is not consent."
+        "BLOCKED: Action could not be approved because the approval gate "
+        "failed. The user has NOT consented to this action. Do NOT retry "
+        "it, do NOT rephrase it, and do NOT attempt the same outcome via "
+        "a different path."
     )
 
 
@@ -753,5 +770,68 @@ def on_pre_tool_call(
     return None
 
 
+def _validate_timeout_against_control_server() -> None:
+    """Validate the plugin's effective MESH_GATE_TIMEOUT against the control
+    server's effective HERMES_MESH_APPROVAL_TIMEOUT.
+
+    The plugin (gateway process) owns MESH_GATE_TIMEOUT; the control server
+    (bridge process) owns HERMES_MESH_APPROVAL_TIMEOUT and reports it at
+    /status as approval_timeout_s. Comparing the two via the control server's
+    report — not the bridge's env view — is what makes this check correct when
+    the gateway and bridge are configured from different env sources
+    (e.g. the gateway loads ~/.hermes/.env independently).
+
+    Logs a loud warning on a mismatch; does NOT raise, so a control server
+    that is not yet up (transient at boot) degrades to `_gate_tool`'s own
+    fail-closed behavior rather than breaking plugin load. The gate remains
+    fail-closed either way; this is an operator-facing diagnostic.
+    """
+    if not _GATE_TIMEOUT or not math.isfinite(_GATE_TIMEOUT) or _GATE_TIMEOUT <= 0:
+        logger.error(
+            "mesh-tool-gate: MESH_GATE_TIMEOUT=%r is invalid (must be finite "
+            "and positive) — the plugin would wait <=0s or forever and deny "
+            "every gated action. Fix it before deploying.",
+            _GATE_TIMEOUT,
+        )
+        return
+    tok = _token()
+    if not tok:
+        return  # no control server yet — fail-closed gate handles it
+    try:
+        req = urllib.request.Request(
+            f"{CONTROL_URL}/status",
+            headers={"X-Hermes-Token": tok},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001 — control server transiently down
+        logger.warning(
+            "mesh-tool-gate: could not reach control server to validate gate "
+            "timeouts (%s) — relying on fail-closed gate behavior.",
+            e,
+        )
+        return
+    approval = body.get("approval_timeout_s")
+    if approval is None:
+        # Older/newer control server without the field — can't validate.
+        return
+    try:
+        approval = float(approval)
+    except (TypeError, ValueError):
+        return
+    if _GATE_TIMEOUT < approval:
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: plugin MESH_GATE_TIMEOUT=%ss is less "
+            "than the control server's HERMES_MESH_APPROVAL_TIMEOUT=%ss. The "
+            "plugin's blocking POST would time out (fail closed) before the "
+            "operator could answer — the operator's window is silently capped "
+            "at %ss. Set MESH_GATE_TIMEOUT >= HERMES_MESH_APPROVAL_TIMEOUT "
+            "from ONE authoritative env source and restart.",
+            _GATE_TIMEOUT, approval, _GATE_TIMEOUT,
+        )
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    _validate_timeout_against_control_server()

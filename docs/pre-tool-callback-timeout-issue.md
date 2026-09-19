@@ -144,32 +144,64 @@ especially over LoRa with hop latency.
 
 ### Recommendation
 
-**Option A.** Set `plugins.hook_callback_timeout: 900` in the Hermes
-config (or the bridge's `.env` if it's env-driven). This is a one-line
-config change. The 900s hook timeout matches the 900s gate timeout.
-The operator's verdict is respected. The only scenario where the tool
-blocks for 900s is a truly unanswered gate — which is the intended
-fail-closed behavior.
+**Option A, but with the 600s hard clamp in mind.** Set `plugins.hook_callback_timeout`
+in the Hermes config to just above the gate timeout and below the 600s hard clamp
+(`_MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0`). The clamp is a wall you cannot raise:
+a value like 900 is silently clamped to 600 at runtime, so **a 900s gate is impossible**
+on this code path, no matter what you set.
+
+A concrete safe alignment (the shipped reference, see the README Deployment section):
+
+```env
+# .env
+HERMES_MESH_APPROVAL_TIMEOUT=480
+MESH_GATE_TIMEOUT=480
+```
+
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  hook_callback_timeout: 490   # must be > MESH_GATE_TIMEOUT and < 600
+```
+
+This makes the control-server deny clock (480s) fire before the Hermes hook
+wrapper, so an unanswered gate produces the clean `BLOCKED: The requested
+action did not receive approval before the gate timed out` message (which
+also allows the model to continue on safe tools) instead of the raw
+`pre_tool_call plugin callback timed out or is still running` wedge.
+
+**The two values that MUST be reconciled are the three-layer ordering, not
+a specific number:**
+`HERMES_MESH_APPROVAL_TIMEOUT <= MESH_GATE_TIMEOUT < hook_callback_timeout < 600`.
+
+The only scenario where the tool blocks for the full gate window is a truly
+unanswered gate — the intended fail-closed behavior. A shorter gate window
+(fast link) cuts the worst-case block.
 
 ## Public deployment note
 
-This project is intended for public use. The two timeout values that
-must stay in sync are:
+This project is intended for public use. The gate has **three** coupled
+timeouts that must satisfy a specific ordering (the third layer lives in
+Hermes core and has a hard ceiling):
 
-| Setting | Location | Default |
-|---------|----------|---------|
-| `plugins.hook_callback_timeout` | Hermes `config.yaml` → `plugins:` | 30s (code), **must be ≥ gate timeout** |
-| `MESH_GATE_TIMEOUT` | env (bridge `.env`) | 900s |
-| `HERMES_MESH_APPROVAL_TIMEOUT` | env (bridge `.env`) | 900s |
+| Setting | Location | Default | Constraint |
+|---------|----------|---------|------------|
+| `HERMES_MESH_APPROVAL_TIMEOUT` | bridge `.env` | 900s | the real deny-by-default clock |
+| `MESH_GATE_TIMEOUT` | bridge `.env` | 900s | must be `>= HERMES_MESH_APPROVAL_TIMEOUT` |
+| `plugins.hook_callback_timeout` | Hermes `config.yaml` → `plugins:` | 30s | must be `> MESH_GATE_TIMEOUT` and `< 600` (hard clamp) |
 
-If `hook_callback_timeout` < `MESH_GATE_TIMEOUT`, any gated tool call
-that waits longer than `hook_callback_timeout` for the operator's verdict
-is **fail-closed blocked** — the operator's `/approve` arrives too late.
-The tool is blocked even though the operator approved it.
+If `hook_callback_timeout` < `MESH_GATE_TIMEOUT`, any gated tool call that
+waits longer than `hook_callback_timeout` for the operator's verdict is
+**fail-closed blocked** — the operator's `/approve` arrives too late. The tool
+is blocked even though the operator approved it. And if
+`MESH_GATE_TIMEOUT` < `HERMES_MESH_APPROVAL_TIMEOUT`, the plugin's POST fails
+closed before the control clock — the operator's window is silently capped.
 
-**Public users must set** `plugins.hook_callback_timeout` in their Hermes
-`config.yaml` to **at least** their `MESH_GATE_TIMEOUT` value. If they
-use the 900s default for the gate, they need `hook_callback_timeout: 900`.
+**The shipped code defaults (900/900/30) are NOT safe on their own** — the 30s
+hook wrapper fires long before a 900s gate resolves. Public users MUST set all
+three on deployment with the ordering above. The bridge refuses to start if
+`MESH_GATE_TIMEOUT < HERMES_MESH_APPROVAL_TIMEOUT` (v0.21.2+). See the README
+Deployment section for the full recipe.
 
 The `mesh-tool-gate` plugin (and any other plugin registering a
 `pre_tool_call` hook) inherits this behavior — the hook timeout is
