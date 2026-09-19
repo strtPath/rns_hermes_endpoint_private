@@ -86,6 +86,45 @@ def _deny_veto(hermes) -> None:
     hermes.stop()
 
 
+def _validate_gate_timeouts() -> None:
+    """Fail loudly if the two bridge-side gate timeouts are misconfigured.
+
+    \`MESH_GATE_TIMEOUT\` (plugin blocking POST, gateway process) must be >=
+    \`HERMES_MESH_APPROVAL_TIMEOUT\` (control-server deny clock, bridge
+    process). If the plugin's urlopen times out before the control server's
+    deny clock, the plugin fails closed BEFORE the operator could answer —
+    a raised approval timeout is silently capped by the smaller gate timeout.
+    This relationship is load-bearing and both values come from the same
+    .env, so validate it rather than let it fail closed at runtime.
+
+    Refuses to start (sys.exit) rather than silently clamping — the reported
+    values must be exactly what was configured, never a rewritten number.
+    """
+    try:
+        gate = float(os.environ.get("MESH_GATE_TIMEOUT", "900"))
+        approval = float(os.environ.get("HERMES_MESH_APPROVAL_TIMEOUT", "900"))
+    except (TypeError, ValueError):
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "Gate timeout config invalid — MESH_GATE_TIMEOUT and "
+            "HERMES_MESH_APPROVAL_TIMEOUT must be numeric seconds."
+        )
+        sys.exit(1)
+        return
+    if gate < approval:
+        logger = logging.getLogger("hermes_reticulum.cli")
+        logger.error(
+            "PRE-EXEC GATE MISCONFIGURED: MESH_GATE_TIMEOUT=%ss is less than "
+            "HERMES_MESH_APPROVAL_TIMEOUT=%ss. The plugin's blocking POST "
+            "would time out (fail closed) before the operator could answer — "
+            "the operator's window is silently capped at %ss. Set "
+            "MESH_GATE_TIMEOUT >= HERMES_MESH_APPROVAL_TIMEOUT in .env and "
+            "restart. Refusing to start.",
+            gate, approval, gate,
+        )
+        sys.exit(1)
+
+
 def cmd_run(args):
     """Start the bridge and run until interrupted."""
     setup_logging(args.verbose)
@@ -98,6 +137,11 @@ def cmd_run(args):
     rns_config = expand_path(args.rns_config or os.getenv("RETICULUM_CONFIG", None))
     hermes_bin = expand_path(args.hermes_bin or os.getenv("HERMES_BIN", "hermes"))
     timeout = args.timeout or int(os.getenv("HERMES_TIMEOUT", "300"))
+
+    # Fail loudly if the two bridge-side gate timeouts are misconfigured
+    # (see _validate_gate_timeouts). Must run after _load_dotenv() so the
+    # .env values are present.
+    _validate_gate_timeouts()
 
     # Initialize components
     acl = AccessControl()
