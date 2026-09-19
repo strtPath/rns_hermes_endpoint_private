@@ -108,6 +108,29 @@ def test_destructive_high_risk_denies():
     assert r == "deny"
 
 
+def test_destructive_high_risk_uncertain_escalates():
+    # A destructive/high-risk deny must NOT fire on an uncertain verdict:
+    # Jev's risk/stakes can normalize to max-risk + destructive on missing or
+    # malformed payload while confidence stays 0. That must escalate to the
+    # human gate, not permanently block. (Issue: unconditional deny on
+    # malformed input.)
+    r = triage.verdict(
+        handling="allow", risk_noul=0.9, stakes="destructive",
+        confidence=0.1, tool_name="terminal",
+    )
+    assert r == "escalate"
+
+
+def test_destructive_high_risk_malformed_low_confidence_escalates():
+    # Malformed stakes (None) normalizes to destructive; malformed risk to
+    # 1.0; confidence 0 -> still escalate, never deny.
+    r = triage.verdict(
+        handling="allow", risk_noul=None, stakes=None,
+        confidence=0.0, tool_name="terminal",
+    )
+    assert r == "escalate"
+
+
 # --- stakes gating --------------------------------------------------------
 
 

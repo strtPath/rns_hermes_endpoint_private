@@ -326,19 +326,30 @@ else
                 "$BRIDGE_HOME" "$BRIDGE_BIN" "$BRIDGE_VENV" <<'PYEOF'
 import sys
 src, dst, home, bridge_bin, bridge_venv = sys.argv[1:6]
+
+def _sysd_quote(value):  # systemd-style value quoting (handles whitespace)
+    if value and not any(c.isspace() for c in value):
+        return value
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
 with open(src, encoding="utf-8") as fh:
     lines = fh.readlines()
 out = []
 for line in lines:
     line = line.replace("/opt/rns_hermes_endpoint", home)
-    if line.startswith("ExecStart="):
-        line = f"ExecStart={bridge_bin} run\n"
+    if line.startswith("ExecStart=") and bridge_bin:
+        # bridge_bin may contain whitespace (e.g. a venv path or checkout
+        # under a directory with a space); quote it so systemd doesn't split
+        # the executable path while parsing ExecStart.
+        line = f"ExecStart={_sysd_quote(bridge_bin)} run\n"
     if line.startswith("Environment=HOME="):
-        line = f"Environment=HOME={home}\n"
+        line = f"Environment=HOME={_sysd_quote(home)}\n"
     out.append(line)
     if line.startswith("EnvironmentFile="):
         if bridge_venv:
-            out.append(f"Environment=PATH={bridge_venv}/bin:/usr/bin:/bin\n")
+            out.append(
+                f"Environment=PATH={_sysd_quote(bridge_venv + '/bin')}:/usr/bin:/bin\n"
+            )
         else:
             out.append("Environment=PATH=/usr/local/bin:/usr/bin:/bin\n")
 with open(dst, "w", encoding="utf-8") as fh:

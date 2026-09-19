@@ -1,6 +1,7 @@
 """LXMF Message Bridge — connects Reticulum/LXMF to Hermes Agent."""
 
 import logging
+import math
 import os
 import signal
 import threading
@@ -200,11 +201,11 @@ class LXMFBridge:
             raise ValueError(
                 f"Invalid RETICULUM_ANNOUNCE_INTERVAL={raw_env_interval!r}: "
                 f"expected a number of minutes (e.g. 20, 30, 60; 0 disables)."
-            )
-        if env_interval < 0:
+            ) from None
+        if not math.isfinite(env_interval) or env_interval < 0:
             raise ValueError(
                 f"Invalid RETICULUM_ANNOUNCE_INTERVAL={raw_env_interval!r}: "
-                f"must be >= 0."
+                f"must be a finite number >= 0 (nan/inf are not valid cadences)."
             )
         if 0 < env_interval < MIN_ANNOUNCE_INTERVAL_MIN:
             raise ValueError(
@@ -347,6 +348,15 @@ class LXMFBridge:
             # Keep the current live cadence (preserves a /announce <min>
             # override instead of snapping back to the env default).
             interval_min = self.announce_interval_min
+        # Reject non-finite before touching scheduler state. nan/inf pass the
+        # `0 < i < MIN` check below (every comparison with nan is False), so
+        # they would otherwise reach self.announce_interval_min and create a
+        # timer whose wait never completes (or disables announcements).
+        if not math.isfinite(interval_min) or interval_min < 0:
+            raise ValueError(
+                f"Interval must be a finite number >= 0: {interval_min!r} "
+                f"(nan/inf are not valid cadences)."
+            )
         if 0 < interval_min < MIN_ANNOUNCE_INTERVAL_MIN:
             raise ValueError(
                 f"Interval too small: {interval_min} min "

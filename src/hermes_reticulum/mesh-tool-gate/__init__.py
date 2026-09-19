@@ -123,6 +123,34 @@ _GATE_TIMEOUT = float(os.environ.get("MESH_GATE_TIMEOUT", "900"))
 # Fetches on import so a restart picks up a changed toggle.
 TRIAGE_MODE = os.environ.get("MESH_GATE_TRIAGE", "off").strip().lower()
 TRIAGE_CONF_FLOOR = float(os.environ.get("MESH_GATE_TRIAGE_CONF", "0.6"))
+
+# Validate the triage mode strictly at import. A misspelled mode other than
+# off/hint_only would otherwise flow into the auto-allow branch as if
+# allow_benign were selected (Jev's verdict applied without the dry-run or
+# the human gate). Any value outside the three documented modes FAILS SAFE
+# to 'off' — the gate behaves exactly as before — and logs a loud error so
+# the operator notices the mistake, rather than silently enabling auto-allow.
+_VALID_TRIAGE_MODES = ("off", "hint_only", "allow_benign")
+if TRIAGE_MODE not in _VALID_TRIAGE_MODES:
+    logger.error(
+        "mesh-tool-gate: MESH_GATE_TRIAGE=%r is not a valid mode "
+        "(expected one of off/hint_only/allow_benign). Failing safe to 'off' — "
+        "the human gate stays fully active. Fix the value and restart.",
+        TRIAGE_MODE,
+    )
+    TRIAGE_MODE = "off"
+
+# TRIAGE_CONF_FLOOR must be a finite number in [0, 1]. float() accepts nan
+# and inf, and `confidence < nan` is always False — a NaN floor would defeat
+# the confidence gate and let an uncertain cloud verdict auto-allow a call.
+if not math.isfinite(TRIAGE_CONF_FLOOR) or not (0.0 <= TRIAGE_CONF_FLOOR <= 1.0):
+    logger.error(
+        "mesh-tool-gate: MESH_GATE_TRIAGE_CONF=%r is not a finite value in "
+        "[0, 1] (got %r). Failing safe to 0.6. Fix the value and restart.",
+        os.environ.get("MESH_GATE_TRIAGE_CONF", "0.6"),
+        TRIAGE_CONF_FLOOR,
+    )
+    TRIAGE_CONF_FLOOR = 0.6
 # NOTE: no MESH_GATE_TRIAGE_EXEC read here — execute_code is ALWAYS
 # human-gated (opaque payload); the triage stage may only deny it, never
 # auto-allow it. The env var is reserved/inert for backwards compatibility.
