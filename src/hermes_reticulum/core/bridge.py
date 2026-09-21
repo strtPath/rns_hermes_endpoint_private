@@ -5,8 +5,8 @@ import os
 import signal
 import threading
 import time
-from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 
 import LXMF
@@ -15,8 +15,8 @@ import RNS
 from hermes_reticulum.core.adapter import prepare_reply, split_message
 from hermes_reticulum.core.bridge_liveness import BridgeLiveness
 from hermes_reticulum.core.downlink import (
-    DownlinkTracker,
     MIN_CHUNK_INTERVAL_MS,
+    DownlinkTracker,
     sequence_chunks,
 )
 from hermes_reticulum.core.profiler import ChannelMetrics, ChannelProfiler

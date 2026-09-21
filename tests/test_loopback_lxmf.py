@@ -35,9 +35,8 @@ import re
 import sys
 import time
 
-import RNS
 import LXMF
-
+import RNS
 
 TEST_IDENTITY_FILE = os.path.expanduser("~/.lxmf/testloopback_identity")
 TEST_STORAGE_DIR = os.path.expanduser("~/.lxmf/testloopback_storage")
@@ -53,7 +52,7 @@ def discover_bridge_destination() -> str:
     """Pull the most recent announced bridge destination from the log."""
     if os.path.exists(BRIDGE_LOG):
         try:
-            with open(BRIDGE_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            with open(BRIDGE_LOG, encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
         except OSError:
             pass

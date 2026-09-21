@@ -10,8 +10,6 @@ import importlib.util
 import os
 import sys
 
-import pytest
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN_DIR = os.path.normpath(
     os.path.join(_HERE, "..", "src", "hermes_reticulum", "mesh-tool-gate")

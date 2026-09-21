@@ -199,8 +199,8 @@ class TestBridgeLiveness:
         lv.stop()
 
     def test_tick_healthy_writes_marker_and_pings(self, tmp_path):
-        import os
         import json
+        import os
         lv, sent = self._lv(tmp_path, healthy=True)
         lv.start()
         sent.clear()
@@ -252,15 +252,17 @@ class TestBridgeLiveness:
             recv.close()
 
     def test_default_probe_fresh(self, monkeypatch):
-        import RNS
         import time
+
+        import RNS
         monkeypatch.setattr(RNS.Transport, "interface_last_jobs", time.time())
         from hermes_reticulum.core.bridge_liveness import default_rns_probe
         assert default_rns_probe() is True
 
     def test_default_probe_stale(self, monkeypatch):
-        import RNS
         import time
+
+        import RNS
         monkeypatch.setattr(RNS.Transport, "interface_last_jobs", time.time() - 9999)
         from hermes_reticulum.core.bridge_liveness import default_rns_probe
         assert default_rns_probe() is False

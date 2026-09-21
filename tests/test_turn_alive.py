@@ -119,26 +119,26 @@ class TestGuardWithMarker(unittest.TestCase):
 
     def _write_child(self, body, gen=None):
         child = os.path.join(self.dir.name, "child.py")
+        marker = self.marker
+        sess = "mesh-guard-test"
+        gen_val = gen if gen is not None else 0
+        preamble = (
+            "import time, json, os, sys\n"
+            "marker = " + repr(marker) + "\n"
+            "sess = " + repr(sess) + "\n"
+            "gen = " + repr(gen_val) + "\n"
+            "def beat(s):\n"
+            "    payload = {'session': s, 'ts': time.time(), "
+            "'phase': 'tool'}\n"
+            "    if gen is not None:\n"
+            "        payload['gen'] = gen\n"
+            "    with open(marker + '.tmp', 'w') as fh:\n"
+            "        json.dump(payload, fh)\n"
+            "    os.replace(marker + '.tmp', marker)\n"
+            "\n"
+        )
         with open(child, "w", encoding="utf-8") as f:
-            f.write(
-                "import time, json, os, sys\n"
-                "marker = %r\n"
-                "sess = %r\n"
-                "gen = %r\n"
-                "def beat(s):\n"
-                "    payload = {'session': s, 'ts': time.time(), "
-                "'phase': 'tool'}\n"
-                "    if gen is not None:\n"
-                "        payload['gen'] = gen\n"
-                "    with open(marker + '.tmp', 'w') as fh:\n"
-                "        json.dump(payload, fh)\n"
-                "    os.replace(marker + '.tmp', marker)\n"
-                "\n"
-                "%s\n"
-                "print('child-done')\n"
-                "sys.exit(0)\n"
-                % (self.marker, "mesh-guard-test", gen, body)
-            )
+            f.write(preamble + body + "print('child-done')\nsys.exit(0)\n")
         return child
 
     def test_slow_turn_with_fresh_marker_completes(self):

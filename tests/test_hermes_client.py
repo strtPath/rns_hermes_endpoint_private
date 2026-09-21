@@ -105,7 +105,10 @@ class TestChatGuardKillRetry(unittest.TestCase):
             if len(calls) == 1:
                 c._guard_killed = True
                 c._stop_requested = True
-                return "⏱️ Turn exceeded the liveness window (600s) — the model may be busy or stalled. Please retry."
+                return (
+                    "⏱️ Turn exceeded the liveness window (600s) — "
+                    "the model may be busy or stalled. Please retry."
+                )
             c._guard_killed = False
             return "second-attempt-reply"
 
@@ -137,7 +140,10 @@ class TestChatGuardKillRetry(unittest.TestCase):
             c._last_run_ms = 601_000.0
             c._guard_killed = True
             c._stop_requested = True
-            return "⏱️ Turn exceeded the liveness window (600s) — the model may be busy or stalled. Please retry."
+            return (
+                "⏱️ Turn exceeded the liveness window (600s) — "
+                "the model may be busy or stalled. Please retry."
+            )
 
         c._run_with_liveness_guard = fake_full_window_kill
         import hermes_reticulum.core.hermes_client as hc
@@ -385,7 +391,6 @@ class TestStepWatcherStoppedOnException(unittest.TestCase):
 
         # Capture the stop event handed to the watcher thread.
         recorded = {}
-        real_watcher = client._run_step_watcher
 
         def spy(sid, stop_evt):
             recorded["stop_evt"] = stop_evt
@@ -600,7 +605,10 @@ class TestToolRecapTurnScoping(unittest.TestCase):
         self._add_msg(sid, "user", content="turn A")
         self._add_msg(
             sid, "assistant",
-            tool_calls='[{"id": "c1", "function": {"name": "terminal", "arguments": "{\"command\": \"ls\"}"}}]',
+            tool_calls=(
+                '[{"id": "c1", "function": '
+                '{"name": "terminal", "arguments": "{\\"command\\": \\"ls\\"}"}}]'
+            ),
             content="",
         )
         self._add_msg(sid, "tool", tool_name="terminal",
@@ -641,7 +649,10 @@ class TestToolRecapTurnScoping(unittest.TestCase):
         self._add_msg(sid, "user", content="turn B")
         self._add_msg(
             sid, "assistant",
-            tool_calls='[{"id": "b1", "function": {"name": "terminal", "arguments": "{\\"command\\": \\"pwd\\"}"}}]',
+            tool_calls=(
+                '[{"id": "b1", "function": '
+                '{"name": "terminal", "arguments": "{\\\\\\"command\\\\\\": \\\\\\"pwd\\\\\\"}"}}]'
+            ),
             content="",
         )
         self._add_msg(sid, "tool", tool_name="terminal",
