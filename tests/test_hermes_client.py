@@ -649,10 +649,7 @@ class TestToolRecapTurnScoping(unittest.TestCase):
         self._add_msg(sid, "user", content="turn B")
         self._add_msg(
             sid, "assistant",
-            tool_calls=(
-                '[{"id": "b1", "function": '
-                '{"name": "terminal", "arguments": "{\\\\\\"command\\\\\\": \\\\\\"pwd\\\\\\"}"}}]'
-            ),
+            tool_calls='[{"id": "b1", "function": {"name": "terminal", "arguments": "{\\"command\\": \\"pwd\\"}"}}]',
             content="",
         )
         self._add_msg(sid, "tool", tool_name="terminal",
