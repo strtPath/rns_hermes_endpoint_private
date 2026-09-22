@@ -5,7 +5,7 @@ parity with the Hermes **Telegram** gateway, so the mesh endpoint is a first-cla
 way to talk to the agent, not a degraded one. This is a living doc — update the
 Status column as we land items._
 
-_Last updated: 2026-09-19. Owner: Holo + user._
+_The doc was synced on 2026-09-19 and has since been updated: CI (4.6) landed on main via PR #11, merged 2026-09-22 (merge commit `bc67f09`). Owner: Holo + user._
 
 ---
 
@@ -195,7 +195,7 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | 4.3 | **`/status` health endpoint** | ✅ done | `GET /status` on control server (commit `4ce5db8`): model + session + uptime + ACL mode. Bridge `/status` also shows `Bridge: up Xh Ym` + session-cumulative tool total (commit `cc232e8`). |
 | 4.4 | **Structured logging of commands** | ⚠️ partial | Commands log to journal (`Command from <id>: /new`) but not to the session DB. Consider a lightweight audit log. |
 | 4.5 | **Watchdog / auto-restart** | ✅ done | **Option 3b** (see `docs/mesh-bridge-findings-2026-09-09-watchdog-option-1-archived.md` for why Option 1 was shelved). `core/bridge_liveness.py` `BridgeLiveness` runs a daemon thread in the bridge that probes RNS liveness (`RNS.Transport.interface_last_jobs`, refreshed every 5s) and pings systemd's watchdog (`sd_notify(WATCHDOG=1)`) each tick; on a stale probe it stops pinging so systemd kills + `Restart=on-failure` restarts. Also writes an idle-heartbeat marker (`~/.hermes/.reticulum-idle-heartbeat`, mtime-authoritative) for `/status` + post-mortem. Service files flipped to `Type=notify` + `NotifyAccess=all` + `WatchdogSec=90` (same unit — no new service). `/status` shows `Watchdog: ✓ RNS alive (heartbeat Xs ago)` / `✗ RNS not responsive`. Env: `HERMES_BRIDGE_LIVENESS_INTERVAL` (30s), `HERMES_BRIDGE_RNS_PROBE_MAX_AGE` (30s), `HERMES_BRIDGE_HEARTBEAT_FILE`. 10 tests in `TestBridgeLiveness`; end-to-verified against a live RNS daemon (probe `False` pre-RNS → `True` post-RNS, pings flow). Catches: RNS-wedged-but-process-alive, and total process freeze. |
-| 4.6 | **CI on the fork** | ⬜ open | Lint/import check before PR. Currently manual. |
+| 4.6 | **CI on the fork** | ✅ done | GitHub Actions lint + test pipeline (PR #11, `ci/workflows` → `main`, merged 2026-09-22, merge commit `bc67f09`): `ruff check src/ tests/`, `scripts/check_imports.py` import guard (no rns/lxmf imports in pure-logic modules), `pytest tests/ -q` on Python 3.11. Triggers on push to `main`, `dev`, `feat/*` and on PRs to `main`/`dev`; all actions SHA-pinned. Repo is public, so no secret exposure in the workflow. |
 | 4.7 | **Pre-execution approval gate** | ✅ done | `mesh-tool-gate` `pre_tool_call` plugin in repo (commit `f8b0c69`): risky tools POST to `/gate/notify` pre-execution; verdict rendered over LXMF. Session-name mismatch fixed (`6d5d0a1`); `/deny` aligned to Telegram block-and-continue (`63e753f`); timeout vs explicit deny distinguished (`c80645a`). Alias normalization fixed (`4a2fd06`). Three-timeout alignment: `HERMES_MESH_APPROVAL_TIMEOUT=480`, `MESH_GATE_TIMEOUT=480`, `plugins.hook_callback_timeout=490` (deny clock fires before the hook wrapper; 600s wrapper clamp makes higher values impossible) — see `docs/pre-tool-callback-timeout-issue.md` and `docs/mesh-bridge-findings-2026-09-18-unanswered-gate-wedges-turn.md`. Gate-reliability batch landed in PR #8: split deny vs timeout block messages (`d0cebc5`), fail loudly on mis-ordered timeouts (`8a25dbd`), validator rejects non-positive/infinite timeouts (`309389c`), plugin timeout validated against the control server's reported value (`b92e93b`). |
 
 ---
@@ -224,7 +224,7 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 2. ~~**Tier 2 high-value batch** — `/status`, `/stop`, `/pause`, `/approve`/`/deny`,
    `/retry`, `/whoami`, `/usage`, `/version`.~~ ✅ done (all except `/whoami` — deferred)
 3. **Tier 3** — tool-call / clarify / accept-deny rendering over plain text. (Tool-call visibility landed via step-watcher; clarify/accept-deny rendering still open.)
-4. **Tier 4** — CI (4.6). (4.3 health endpoint ✅, 4.5 watchdog ✅, 4.7 pre-exec gate ✅.)
+4. ~~**Tier 4** — CI (4.6).~~ ✅ done (4.3 health endpoint ✅, 4.4 audit log still partial, 4.5 watchdog ✅, 4.6 CI ✅ via PR #11, 4.7 pre-exec gate ✅.)
 5. **Tier 2 fuller session control** — the full non-`cli_only` session set
    (`/resume`, `/branch`, `/compress`, `/undo`, `/queue`, `/background`,
    `/sessions`, …) once the core batch is stable.
@@ -232,7 +232,7 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
    reusing the same RNS-Resource transfer code, then a shared spike on the
    inbound path for voice-in (5.2) and image-in (5.5). See the transport
    constraints below before committing to the inbound side.
-7. Then cut the upstream PR from the clean branch (after Tier 4).
+7. ~~**Then cut the upstream PR from the clean branch (after Tier 4).**~~ Tier 4 is done, so the upstream PR is unblocked. The private fork's own PR (#11, CI) landed first — the upstream PR to the public repo is still to be cut.
 
 ---
 
