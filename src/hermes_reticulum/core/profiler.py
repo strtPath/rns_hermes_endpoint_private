@@ -18,7 +18,8 @@ logger = logging.getLogger("hermes_reticulum.profiler")
 # ═══════════════════════════════════════════════════════════════
 # Bitrate thresholds (bits per second)
 # ═══════════════════════════════════════════════════════════════
-LORA_MAX_BITRATE = 50_000       # LoRa SF12: ~250bps, SF7: ~5.5kbps; threshold separating LoRa from TCP
+# LoRa SF12: ~250bps, SF7: ~5.5kbps; threshold separating LoRa from TCP
+LORA_MAX_BITRATE = 50_000
 
 # ═══════════════════════════════════════════════════════════════
 # RSSI thresholds (dBm)

@@ -87,7 +87,6 @@ class TestOperatorOverrides(unittest.TestCase):
             self.assertEqual(tool_emoji("read_file"), "📖")  # unoverridden tools untouched
 
     def test_unreadable_override_file_is_ignored(self):
-        import json
         import tempfile
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:

@@ -568,11 +568,11 @@ def _scrub_triage_desc(desc: str) -> str:
     import re
 
     # Prefer keeping a placeholder so Jev still sees *something* was hidden.
-    _REDACT = "<redacted>"
+    redact = "<redacted>"
     # Bearer/token/basic Authorization headers and inline values.
     desc = re.sub(
         r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}",
-        r"\1 " + _REDACT,
+        r"\1 " + redact,
         desc,
         flags=re.IGNORECASE,
     )
@@ -581,7 +581,7 @@ def _scrub_triage_desc(desc: str) -> str:
     desc = re.sub(
         r"\b((?:api[_-]?key|token|password|passwd|secret|auth|private[_-]?key|"
         r"client[_-]?secret|ssh[_-]?key)\b\s*[=:]\s*)\S+",
-        r"\1" + _REDACT,
+        r"\1" + redact,
         desc,
         flags=re.IGNORECASE,
     )
@@ -589,7 +589,7 @@ def _scrub_triage_desc(desc: str) -> str:
     # base64/hex/typical secret alphabet) — redact rather than ship.
     desc = re.sub(
         r"(?<![A-Za-z0-9])[A-Za-z0-9._~+/=-]{30,}(?![A-Za-z0-9])",
-        _REDACT,
+        redact,
         desc,
     )
     return desc

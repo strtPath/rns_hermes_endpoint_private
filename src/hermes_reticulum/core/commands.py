@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
+from hermes_reticulum.core.bridge import MIN_ANNOUNCE_INTERVAL_MIN
+from hermes_reticulum.core.control_server import ControlServer
 from hermes_reticulum.core.hermes_client import HermesClient
 from hermes_reticulum.core.model_command import ModelCommandHandler
-from hermes_reticulum.core.control_server import ControlServer
-from hermes_reticulum.core.bridge import MIN_ANNOUNCE_INTERVAL_MIN
 
 logger = logging.getLogger("hermes_reticulum.commands")
 

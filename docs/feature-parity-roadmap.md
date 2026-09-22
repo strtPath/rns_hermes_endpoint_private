@@ -5,7 +5,7 @@ parity with the Hermes **Telegram** gateway, so the mesh endpoint is a first-cla
 way to talk to the agent, not a degraded one. This is a living doc — update the
 Status column as we land items._
 
-_Last updated: 2026-09-12. Owner: Holo + user._
+_Last updated: 2026-09-19. Owner: Holo + user._
 
 ---
 
@@ -40,7 +40,7 @@ the gap, grouped into four tiers by effort/value:
 | 1.5 | **Startup loud-fail on missing `hermes`** | ✅ done | `core/preflight.py` — `run_preflight()` checks binary (+`--version`), storage, config, plugins. CLI `run` logs all checks; missing binary → `sys.exit(1)` before RNS starts. Mesh `/status` shows `Preflight: ✓ ok` or `✗ N error(s)` with the error lines. CLI `status` subcommand renders the full preflight. |
 | 1.6 | **SIGTERM clean exit** | ✅ done | `_handle_signal()` → daemon thread → `_clean_exit()`: `stop()` → `RNS.exit(0)`, `os._exit(0)` last resort. Verified: `kill -TERM` exits within 3s (was: indefinite hang). Commit `36d94bb`. |
 | 1.7 | **Downlink acks / RSSI/SNR profiler** | ✅ acks done / ⬜ profiler | **Downlink acks (v2)** re-landed 2026-09-12 (commit `b07bc90`): per-chunk `register_delivery_callback`, `[p<N> i/N]` sequence tagging, 500ms pacing (failed-send-safe), ack-timeout sweep (`HERMES_DOWNLINK_ACK_TIMEOUT_S`, default 300s). Live-verified on TCP: `Downlink ack seq=1 → ... state=delivered (DELIVERED)` in 1s. A–F regression fixes documented in `docs/mesh-bridge-findings-2026-09-12-reminder-tool-calls-never-arrived.md`. **RSSI/SNR profiler** (reading `RNS.Transport.local_client_rssi_cache`) still open — separate concern, needs a real RNode radio to populate the cache. |
-| 1.8 | **Liveness heartbeat (generation-scoped)** | ✅ done | Per-child generation counter; marker requires session match + gen match + mtime. Slow-but-working child stays warm; genuinely wedged child still killed. Commit `a154d7c`. |
+| 1.8 | **Liveness heartbeat (generation-scoped)** | ✅ done | Per-child generation counter; marker requires session match + gen match + mtime. Slow-but-working child stays warm; genuinely wedged child still killed. Commit `a154d7c`. Follow-up 2026-09-16: the CLI step watcher now refreshes the marker on every `chat()` exit path, so a working `-q` turn with tool calls but no stdout no longer gets killed mid-turn (commit `f23fe59`; see `docs/mesh-bridge-findings-2026-09-16-liveness-guard-kill-working-turn.md`). |
 
 ---
 
@@ -71,6 +71,13 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | `/verbose` | ✅ done (2026-08-22, toggles detailed tool recaps) |
 | `/steps on\|off` | ✅ done (2026-08-22, step-through mode: full tool call + full output chunked across multiple LXMF posts; model instructed to announce each tool before running it) |
 | `/hold` / `/go` | ✅ done (2026-08-22, checkpoint gate: holds the final reply until /go or 30-min timeout; auto-releases) |
+| `/announce` | ✅ done (2026-09-18, PR #7: periodic re-announce cadence; cadence from `RETICULUM_ANNOUNCE_INTERVAL`, invalid values rejected) |
+
+### Recently landed (since 2026-09-12)
+
+- **Tool-emoji parity** — `tool_emoji.py` mirrors the gateway's per-tool emoji registry (`📖 read_file`, `💻 terminal`, ...), with an override file (`HERMES_TOOL_EMOJIS`, default `~/.hermes/reticulum_tool_emojis.json`) and a drift test against the installed gateway. Commit `f7c4d15`; see `docs/mesh-bridge-findings-2026-09-15-tool-emoji-parity.md`.
+- **Jev triage in the gate** — `mesh-tool-gate` routes risky calls through the TypeSafe Jev decisions endpoint (OpenRouter `typesafe/jev-1.13`); calibration rounds 1–2 keep `MESH_GATE_TRIAGE_CONF=0.60` on a stable plateau. See `docs/mesh-bridge-findings-2026-09-18-jev-gate-triage.md` and `...-round2.md`.
+- **Dependency floors** — RNS 1.5.4 / LXMF current-release floors in `pyproject.toml` (PR #9, commit `6176097`).
 
 ### Not `cli_only` — in parity scope (grouped, with mesh priority)
 
@@ -189,7 +196,7 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 | 4.4 | **Structured logging of commands** | ⚠️ partial | Commands log to journal (`Command from <id>: /new`) but not to the session DB. Consider a lightweight audit log. |
 | 4.5 | **Watchdog / auto-restart** | ✅ done | **Option 3b** (see `docs/mesh-bridge-findings-2026-09-09-watchdog-option-1-archived.md` for why Option 1 was shelved). `core/bridge_liveness.py` `BridgeLiveness` runs a daemon thread in the bridge that probes RNS liveness (`RNS.Transport.interface_last_jobs`, refreshed every 5s) and pings systemd's watchdog (`sd_notify(WATCHDOG=1)`) each tick; on a stale probe it stops pinging so systemd kills + `Restart=on-failure` restarts. Also writes an idle-heartbeat marker (`~/.hermes/.reticulum-idle-heartbeat`, mtime-authoritative) for `/status` + post-mortem. Service files flipped to `Type=notify` + `NotifyAccess=all` + `WatchdogSec=90` (same unit — no new service). `/status` shows `Watchdog: ✓ RNS alive (heartbeat Xs ago)` / `✗ RNS not responsive`. Env: `HERMES_BRIDGE_LIVENESS_INTERVAL` (30s), `HERMES_BRIDGE_RNS_PROBE_MAX_AGE` (30s), `HERMES_BRIDGE_HEARTBEAT_FILE`. 10 tests in `TestBridgeLiveness`; end-to-verified against a live RNS daemon (probe `False` pre-RNS → `True` post-RNS, pings flow). Catches: RNS-wedged-but-process-alive, and total process freeze. |
 | 4.6 | **CI on the fork** | ⬜ open | Lint/import check before PR. Currently manual. |
-| 4.7 | **Pre-execution approval gate** | ✅ done | `mesh-tool-gate` `pre_tool_call` plugin in repo (commit `f8b0c69`): risky tools POST to `/gate/notify` pre-execution; verdict rendered over LXMF. Session-name mismatch fixed (`6d5d0a1`); `/deny` aligned to Telegram block-and-continue (`63e753f`); timeout vs explicit deny distinguished (`c80645a`). Alias normalization fixed (`4a2fd06`). Three-timeout alignment documented (590/600). |
+| 4.7 | **Pre-execution approval gate** | ✅ done | `mesh-tool-gate` `pre_tool_call` plugin in repo (commit `f8b0c69`): risky tools POST to `/gate/notify` pre-execution; verdict rendered over LXMF. Session-name mismatch fixed (`6d5d0a1`); `/deny` aligned to Telegram block-and-continue (`63e753f`); timeout vs explicit deny distinguished (`c80645a`). Alias normalization fixed (`4a2fd06`). Three-timeout alignment: `HERMES_MESH_APPROVAL_TIMEOUT=480`, `MESH_GATE_TIMEOUT=480`, `plugins.hook_callback_timeout=490` (deny clock fires before the hook wrapper; 600s wrapper clamp makes higher values impossible) — see `docs/pre-tool-callback-timeout-issue.md` and `docs/mesh-bridge-findings-2026-09-18-unanswered-gate-wedges-turn.md`. Gate-reliability batch landed in PR #8: split deny vs timeout block messages (`d0cebc5`), fail loudly on mis-ordered timeouts (`8a25dbd`), validator rejects non-positive/infinite timeouts (`309389c`), plugin timeout validated against the control server's reported value (`b92e93b`). |
 
 ---
 
@@ -232,7 +239,9 @@ platform (Telegram *and* the mesh) unless it is marked `cli_only=True`. So the
 ## Tier 5 — Voice & media over LXMF (transport-constrained)
 
 **Verified transport facts** (RNS 1.4.2 + LXMF 1.1.1, read from the venv,
-2026-08-20):
+2026-08-20; dependency floors since raised to RNS 1.5.4 / LXMF current —
+PR #9, commit `6176097`; the cap and Resource/rngit architecture below are
+unchanged on the current releases):
 
 - **LXMF is a tiny-message protocol, not a streaming one.** Each message carries
   **~368 bytes of content max** (documented in `LXMessage.py`: ~112B fixed

@@ -9,10 +9,11 @@ import queue
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("hermes_reticulum.control_server")
@@ -45,7 +46,7 @@ class ToolStep:
 
     name: str
     args: Any = None
-    result: Optional[str] = None
+    result: str | None = None
     is_error: bool = False
 
     def summary(self) -> str:
@@ -101,44 +102,44 @@ class ControlServer:
         self,
         port: int = DEFAULT_CONTROL_PORT,
         host: str = "127.0.0.1",
-        token: Optional[str] = None,
-        storage_path: Optional[str] = None,
+        token: str | None = None,
+        storage_path: str | None = None,
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
     ):
         self.port = port
         self.host = host
         self.approval_timeout = approval_timeout
         self.state = ControlState()
-        self._server: Optional[ThreadingHTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
         # Wired by the CLI: called with the mesh session name when an
         # approval gate is denied (abort the in-flight hermes child).
-        self.on_deny: Optional[Callable[[str], None]] = None
+        self.on_deny: Callable[[str], None] | None = None
         # Wired by the CLI: called with (mesh session, ToolStep) for every
         # step the hook reports — the bridge uses this to push a live
         # "🔧 tool" message to the mesh peer.
-        self.on_step: Optional[Callable[[str, Any], None]] = None
+        self.on_step: Callable[[str, Any], None] | None = None
         # Wired by the CLI: called with (mesh session, full_text) for
         # step-through mode — the bridge chunks this into multiple LXMF
         # posts (user-approved bandwidth cost).
-        self.on_full_step: Optional[Callable[[str, str], None]] = None
+        self.on_full_step: Callable[[str, str], None] | None = None
         # Wired by the CLI: called when a gate opens, so the bridge can
         # push a "⏸️ waiting for /approve" message to the mesh.
         # Signature: (session, tool, command, description). The /step ack
         # gate passes (session, label, "", ""); /gate/notify (pre-exec)
         # passes the real tool/command/description.
-        self.on_gate_open: Optional[Callable[[str, str, str, str], None]] = None
+        self.on_gate_open: Callable[[str, str, str, str], None] | None = None
         self._token = token or secrets.token_urlsafe(32)
-        self._token_path: Optional[Path] = None
+        self._token_path: Path | None = None
         if storage_path:
             self._persist_token(storage_path)
         # Bounded so a flood can't grow memory unboundedly; drop + log when full.
-        self._relay_q: "queue.Queue" = queue.Queue(maxsize=256)
-        self._relay_worker: Optional[threading.Thread] = None
+        self._relay_q: queue.Queue = queue.Queue(maxsize=256)
+        self._relay_worker: threading.Thread | None = None
         # /status payload: monotonic start (uptime) + model id the bridge
         # serves (null until the CLI wires it through).
         self._started = time.monotonic()
-        self._model: Optional[str] = None
+        self._model: str | None = None
 
 
     def _persist_token(self, storage_path: str) -> None:
@@ -152,7 +153,7 @@ class ControlServer:
             logger.warning("Could not persist control token: %s", e)
 
     @property
-    def token_path(self) -> Optional[Path]:
+    def token_path(self) -> Path | None:
         return self._token_path
 
 
@@ -250,8 +251,8 @@ class ControlServer:
         self,
         session_name: str,
         tool_name: str,
-        timeout: Optional[float] = None,
-        on_wait: Optional[Callable[[], None]] = None,
+        timeout: float | None = None,
+        on_wait: Callable[[], None] | None = None,
     ) -> str:
         """Block until the operator approves or denies a risky tool.
 
@@ -304,7 +305,7 @@ class ControlServer:
     def queue_steer(self, session_name: str, text: str) -> None:
         self.state.steer_text[session_name] = text
 
-    def pop_steer(self, session_name: str) -> Optional[str]:
+    def pop_steer(self, session_name: str) -> str | None:
         return self.state.steer_text.pop(session_name, None)
 
     def record_step(self, session_name: str, step: ToolStep) -> None:
