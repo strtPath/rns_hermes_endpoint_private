@@ -199,7 +199,7 @@ class TestClarifyRoundTrip(unittest.TestCase):
         # Disable step-mode detection (reads real state file) so no
         # step-through prefix is prepended to the prompt.
         client.is_step_mode = lambda: False
-        reply = client.chat("what was the answer?")
+        client.chat("what was the answer?")
         # The command should contain the injected prefix.
         self.assertEqual(len(captured_cmds), 1)
         cmd = captured_cmds[0]
