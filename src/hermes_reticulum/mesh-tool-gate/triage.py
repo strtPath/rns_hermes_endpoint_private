@@ -78,8 +78,11 @@ def verdict(
 
     DENY only when Jev itself confidently says deny (handling == 'deny' and
     confidence >= conf_floor) OR the call is destructive at high risk
-    (risk_noul > 0.8) — Jev's own "must be blocked". An uncertain denial
-    still escalates so a human reviews it.
+    (risk_noul > 0.8) AND Jev is confident (confidence >= 0.9) — Jev's own
+    "must be blocked". An uncertain denial — including one deduced from a
+    malformed risk/stakes payload that only normalizes to max-risk + destructive
+    on missing data — still escalates so a human reviews it. Never start
+    blocking on a verdict Jev isn't sure of.
 
     Everything else — Jev error, low confidence, escalate, unknown — is
     'escalate' (the human gate stays the backstop; never auto-allow on doubt).
@@ -103,9 +106,16 @@ def verdict(
         return "escalate"
 
     # Highest stakes command with high asserted risk → deny (Jev's "must
-    # block" reads on the call, not the human's choice).
+    # block" reads on the call, not the human's choice). This deny must NOT
+    # fire on an uncertain verdict: if Jev's risk/stakes fields are missing
+    # or malformed, _noul/classify_stakes normalize to max risk + destructive
+    # but aggregate confidence is 0 — an unconditional deny there would
+    # permanently block the call with no human review. Escalate instead so a
+    # human still sees it (same rule as the confident-DENY branch above).
     if stakes_bucket == "destructive" and risk > 0.8:
-        return "deny"
+        if confidence >= max(conf_floor, 0.9):
+            return "deny"
+        return "escalate"
 
     if handling != HANDLING_ALLOW:
         # explicit escalate (or non-token value) → human decides

@@ -67,7 +67,7 @@ def discover_models() -> list[str]:
     if not config_path.exists():
         return []
     try:
-        with open(config_path, "r", encoding="utf-8") as fh:
+        with open(config_path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError) as e:
         logger.warning("Could not read Hermes config for model list: %s", e)

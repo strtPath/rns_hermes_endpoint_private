@@ -22,9 +22,9 @@ import pytest
 
 
 def _load_plugin():
-    _HERE = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.abspath(__file__))
     plugin_dir = os.path.normpath(
-        os.path.join(_HERE, "..", "src", "hermes_reticulum", "mesh-tool-gate")
+        os.path.join(here, "..", "src", "hermes_reticulum", "mesh-tool-gate")
     )
     init_file = os.path.join(plugin_dir, "__init__.py")
     ns = types.ModuleType("hermes_plugins")

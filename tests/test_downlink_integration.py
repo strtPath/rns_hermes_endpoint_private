@@ -11,7 +11,6 @@ state-mapping and timeout-sweep logic in isolation.
 
 import logging
 import re
-import tempfile
 import time
 from unittest.mock import MagicMock, patch
 

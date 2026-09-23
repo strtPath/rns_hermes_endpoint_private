@@ -9,15 +9,12 @@ import logging
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from hermes_reticulum.core.downlink import (
     DownlinkTracker,
-    sequence_chunks,
     _state_name,
     _state_outcome,
+    sequence_chunks,
 )
-
 
 # ---------------------------------------------------------------------------
 # sequence_chunks
@@ -257,7 +254,6 @@ class TestTimeoutSweep:
 
     def test_fresh_seq_not_timed_out(self):
         t = DownlinkTracker(ack_timeout_s=300)
-        seq = t.next_seq()
         t.next_seq()  # Triggers sweep.
         assert t.stats()["timeout"] == 0
 

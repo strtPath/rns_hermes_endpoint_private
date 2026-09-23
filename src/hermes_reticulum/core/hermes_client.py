@@ -1506,7 +1506,7 @@ class HermesClient:
             )
             if result.returncode != 0:
                 return f"⚠️ pause failed: {result.stderr.strip()[:200]}"
-            return f"⏸️ Hermes paused. New work halted. Use /resume to lift."
+            return "⏸️ Hermes paused. New work halted. Use /resume to lift."
         except Exception as e:
             return f"⚠️ pause error: {e}"
 
