@@ -435,7 +435,7 @@ class HermesClient:
     #      stale question can't swallow a later message as an answer.
 
     CLARIFY_ANSWER_TIMEOUT_S = float(
-        os.environ.get("HERMES_MESH_CLARIFY_TIMEOUT", "1800")
+        os.environ.get("HERMES_MESH_CLARIFY_TIMEOUT", "3600")
     )
 
     def _format_clarify(self, args_raw) -> str:
