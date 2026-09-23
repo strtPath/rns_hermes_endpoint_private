@@ -207,6 +207,17 @@ class HermesClient:
         # Checkpoint gate: while set, chat() blocks before returning the
         # reply until /go (or the hold timeout). Set by /hold.
         self._hold_gate = False
+        # Clarify round-trip (Tier 3): when the step watcher sees a clarify
+        # call in this turn it sets _clarify_pending. The NEXT incoming mesh
+        # message is then treated as the answer to that question (not a new
+        # turn), stashed in _clarify_answer and injected into the next prompt
+        # via _pending_input (the same prefix path steer uses). Cleared when
+        # consumed, at turn end, and after the timeout, so a stale question
+        # can never swallow a later message as an answer.
+        self._clarify_pending: bool = False
+        self._clarify_deadline: float = 0.0
+        self._clarify_answer: str | None = None
+        self._pending_input: list[str] = []
         # Push callback: callable(text: str) → sends a message to the mesh
         # peer. Set by the bridge (cli.py); the hook can't push directly
         # (it runs in the gateway process, not the bridge).
@@ -407,6 +418,108 @@ class HermesClient:
     # pushes each tool call + its output as its own 💻 message, exactly
     # like the gateway's progress bubble. No gateway, no hook needed.
 
+    # ── Clarify round-trip (Tier 3) ──────────────────────────────────
+    #
+    # WHY THIS EXISTS: a clarify call from the mesh child blocks the agent
+    # until the user answers it. The step watcher sees the clarify TOOL CALL
+    # (with its JSON arguments) but currently pushes the raw JSON blob — the
+    # mesh user has no way to answer. So:
+    #   1. the watcher reformats the question + numbered choices and pushes
+    #      it (piece 1), and
+    #   2. it arms _clarify_pending so the NEXT incoming mesh message is
+    #      treated as the answer (not a new turn). cli.handle_message calls
+    #      capture_clarify_answer() before command dispatch; if it returns a
+    #      string, the answer is stashed in _clarify_answer and a turn is
+    #      started whose prompt has the answer injected as a prefix (via
+    #      pop_clarify_answer in chat()). A deadline bounds the wait so a
+    #      stale question can't swallow a later message as an answer.
+
+    CLARIFY_ANSWER_TIMEOUT_S = float(
+        os.environ.get("HERMES_MESH_CLARIFY_TIMEOUT", "1800")
+    )
+
+    def _format_clarify(self, args_raw) -> str:
+        """Render a clarify tool call as a readable question with numbered
+        choices, ready to push to the mesh.
+
+        The arguments are either a dict ({"questions": [...]}) or a bare
+        question string. Handles both the multi-question and single-question
+        shapes, and falls back to the raw args if the shape is unexpected.
+        """
+        args = args_raw
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                return f"❓ {args}"
+        if isinstance(args, dict):
+            questions = args.get("questions")
+            if isinstance(questions, list) and questions:
+                blocks = []
+                for i, q in enumerate(questions, 1):
+                    if isinstance(q, dict):
+                        text = q.get("question", "")
+                        choices = q.get("choices", [])
+                    elif isinstance(q, str):
+                        text = q
+                        choices = []
+                    else:
+                        continue
+                    lines = [f"{i}. {text}"] if text else [f"{i}."]
+                    if choices:
+                        for j, c in enumerate(choices, 1):
+                            lines.append(f"   {j}. {c}")
+                    blocks.append("\n".join(lines))
+                body = "\n\n".join(b for b in blocks if b.strip())
+                if body:
+                    return f"❓ Question\n{body}\n\nReply with your choice (e.g. '1. 2' or '2')."
+        # Fallback: show the raw args so nothing is lost.
+        try:
+            return f"❓ {json.dumps(args, ensure_ascii=False)}"
+        except (TypeError, ValueError):
+            return f"❓ {args}"
+
+    def capture_clarify_answer(self, text: str) -> str | None:
+        """If a clarify answer is pending, consume the incoming message as the
+        answer and return it (to be injected into the next prompt). Returns
+        None if no clarify is pending — the message is then a normal turn.
+
+        Called from cli.handle_message BEFORE command dispatch, so the reply
+        is treated as the answer to the open question, not as a new prompt.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        # Stale-question guard: if the deadline passed, drop this answer and
+        # clear the pending flag (the question stays open; the agent may
+        # re-ask). This prevents a stale question from swallowing a later
+        # unrelated message as its answer.
+        if self._clarify_deadline and time.time() > self._clarify_deadline:
+            self._clarify_pending = False
+            self._clarify_deadline = 0.0
+            logger.info("Clarify answer timed out — clearing pending")
+            return None
+        if not self._clarify_pending:
+            return None
+        self._clarify_pending = False
+        self._clarify_deadline = 0.0
+        self._clarify_answer = text
+        logger.info("Captured clarify answer (%d chars)", len(text))
+        return text
+
+    def pop_clarify_answer(self) -> str | None:
+        """Return and clear the captured clarify answer (consumed in chat())."""
+        ans = self._clarify_answer
+        self._clarify_answer = None
+        return ans
+
+    def arm_clarify_wait(self) -> None:
+        """Arm the clarify gate: the next incoming message is the answer.
+        Called by the step watcher when it sees a clarify tool call."""
+        self._clarify_pending = True
+        self._clarify_deadline = time.time() + self.CLARIFY_ANSWER_TIMEOUT_S
+        logger.info("Clarify pending — waiting for mesh answer")
+
     def _push_step(self, name: str, args_raw, result: str, is_error: bool) -> None:
         """Push one tool call (emoji + name) and its output to the mesh peer."""
         if not self._push_callback:
@@ -428,6 +541,13 @@ class HermesClient:
         # Same per-tool emoji the gateway shows on Telegram; ❌ for a failed call.
         from hermes_reticulum.core.tool_emoji import tool_label
         head = tool_label(name, is_error)
+        # Clarify: the raw JSON blob is useless to the mesh user. Render it as
+        # a readable question with numbered choices, and arm the clarify gate
+        # so the NEXT incoming message is treated as the answer (not a new
+        # turn). See the clarify round-trip block above.
+        if name == "clarify" and not is_error:
+            self._push_step_clarify(args_raw)
+            return
         body = f"{head}\n{args_text}"
         if result:
             body += f"\n{result}"
@@ -437,6 +557,21 @@ class HermesClient:
         except Exception as e:  # noqa: BLE001 — a push failure must not kill the turn
             _diag(f"  push_step({name}) callback raised: {e}")
             logger.warning("Step push failed for %s: %s", name, e)
+
+    def _push_step_clarify(self, args_raw) -> None:
+        """Push a clarify call as a readable question + numbered choices and
+        arm the clarify gate so the next mesh message is treated as the answer.
+        """
+        from hermes_reticulum.core.tool_emoji import tool_label
+        head = tool_label("clarify", False)
+        body = f"{head}\n{self._format_clarify(args_raw)}"
+        logger.info("Pushing clarify question (%d chars)", len(body))
+        if self._push_callback is not None:
+            try:
+                self._push_callback(body)
+            except Exception as e:  # noqa: BLE001 — a push failure must not kill the turn
+                logger.warning("Clarify push failed: %s", e)
+        self.arm_clarify_wait()
 
     def _run_step_watcher(self, sid: str, stop_evt: threading.Event) -> None:
         """Poll state.db for new tool rows in this session and push each.
@@ -967,6 +1102,15 @@ class HermesClient:
         if steer:
             message = f"[Operator steering] {steer}\n\n{message}"
             logger.info("Injected steering: %s", steer[:80])
+
+        # Clarify round-trip: if the mesh user answered an open clarify
+        # question (captured by capture_clarify_answer in cli.handle_message),
+        # inject the answer as a prefix to this prompt so the agent receives
+        # it as a follow-up to the question it asked. Consumed once.
+        clarify_answer = self.pop_clarify_answer()
+        if clarify_answer is not None:
+            message = f"[User's answer to your question: {clarify_answer}]\n\n{message}"
+            logger.info("Injected clarify answer: %s", clarify_answer[:80])
 
         # Step-through mode: instruct the model to NOT narrate step-by-step —
         # the CLI-side watcher delivers each tool call + output as its own

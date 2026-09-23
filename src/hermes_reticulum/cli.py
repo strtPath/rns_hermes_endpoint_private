@@ -330,6 +330,24 @@ def cmd_run(args):
         except Exception:
             pass
 
+        # Clarify round-trip (Tier 3): if a clarify question is open, treat
+        # this message as the answer to it (not a command or a new turn).
+        # capture_clarify_answer stashes the answer on the client and returns
+        # it. We then start a turn that injects the answer as a prefix to the
+        # prompt (pop_clarify_answer in hermes.chat) so the agent — which is
+        # blocked in its session waiting for this answer — receives it and
+        # can proceed. This is the same prefix path /steer uses.
+        clarify_answer = hermes.capture_clarify_answer(content)
+        if clarify_answer is not None:
+            logger.info(
+                "Captured clarify answer from %s (%d chars)",
+                source_hash[:16], len(clarify_answer),
+            )
+            reply = hermes.chat(
+                "The user answered your earlier question. Continue."
+            )
+            return reply or "✅ Answer received."
+
         # Slash commands — handled locally, never sent to the LLM.
         command_reply = dispatcher.handle(content)
         if command_reply is not None:
