@@ -609,6 +609,116 @@ class TestStepWatcherRowSelection(unittest.TestCase):
         self.assertIn("terminal", pushed[0])
         self.assertNotIn("write_file", " ".join(pushed))
 
+    def test_step_body_includes_result_when_rows_land_together(self):
+        """An assistant tool-call row and its result row arriving in the SAME
+        poll must still produce a step body containing the output.
+
+        Rows are processed in ascending id order, so the assistant row is seen
+        before its result. Pushing on first sight sent the call with an empty
+        tail and marked the row done, permanently omitting the output even
+        though both rows were in the same batch.
+        """
+        import json as _json
+        sid = "sess-together"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-together"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "terminal", "arguments": '{"command": "date"}'}}]
+        )
+
+        def writer():
+            # Both rows written before the watcher's next poll, so they land
+            # in a single fetched batch.
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            self._insert(sid, "tool", time.time(), tool_name="terminal",
+                         content="UNIQUE-RESULT-MARKER", tool_call_id=cid)
+
+        pushed = self._run_watcher_until(client, sid, writer)
+
+        self.assertEqual(len(pushed), 1, f"expected one step, got {pushed!r}")
+        self.assertIn("terminal", pushed[0])
+        self.assertIn(
+            "UNIQUE-RESULT-MARKER", pushed[0],
+            "step body omitted the tool result that was in the same batch",
+        )
+
+    def test_step_body_includes_result_arriving_later(self):
+        """Result row landing in a LATER poll than its assistant row must still
+        be delivered — the assistant row is held, not marked done."""
+        import json as _json
+        sid = "sess-later"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-later"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "read_file", "arguments": "{}"}}]
+        )
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            # Give the watcher at least one poll with only the call visible.
+            time.sleep(1.6)
+            self._insert(sid, "tool", time.time(), tool_name="read_file",
+                         content="LATE-RESULT-MARKER", tool_call_id=cid)
+
+        pushed = self._run_watcher_until(client, sid, writer, settle=5.0)
+
+        self.assertEqual(len(pushed), 1, f"expected one step, got {pushed!r}")
+        self.assertIn(
+            "LATE-RESULT-MARKER", pushed[0],
+            "step body omitted a result that arrived after the call row",
+        )
+
+    def test_step_body_pushed_when_result_is_empty(self):
+        """A tool that legitimately returns nothing still gets pushed.
+
+        The result row is the signal that the call finished; its TEXT may be
+        empty (a silent command, a write with no stdout). Treating "empty
+        text" as "result not here yet" held the row forever and the call
+        never reached the mesh — the same class of bug being fixed.
+        """
+        import json as _json
+        sid = "sess-empty-result"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-empty"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "terminal", "arguments": '{"command": "true"}'}}]
+        )
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            # Result row present, content empty.
+            self._insert(sid, "tool", time.time(), tool_name="terminal",
+                         content="", tool_call_id=cid)
+
+        pushed = self._run_watcher_until(client, sid, writer)
+
+        self.assertEqual(
+            len(pushed), 1,
+            f"tool with an empty result was not pushed: {pushed!r}",
+        )
+        self.assertIn("terminal", pushed[0])
+
     def test_pushes_row_exactly_once_across_polls(self):
         """The window re-queries every poll; pushed_ids must dedup."""
         import json as _json
@@ -676,7 +786,7 @@ class TestStepWatcherStoppedOnException(unittest.TestCase):
         # Capture the stop event handed to the watcher thread.
         recorded = {}
 
-        def spy(sid, stop_evt):
+        def spy(sid, stop_evt, *args, **kwargs):
             recorded["stop_evt"] = stop_evt
             # Do not actually run the polling loop; we only need the event ref.
 
@@ -706,7 +816,7 @@ class TestStepWatcherStoppedOnException(unittest.TestCase):
 
         recorded = {}
 
-        def spy(sid, stop_evt):
+        def spy(sid, stop_evt, *args, **kwargs):
             recorded["stop_evt"] = stop_evt
 
         client._run_step_watcher = spy

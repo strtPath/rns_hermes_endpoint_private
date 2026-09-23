@@ -150,14 +150,101 @@ class TestClarifyRoundTrip(unittest.TestCase):
         self.assertTrue(client._clarify_pending)
         self.assertGreater(client._clarify_deadline, time.time())
 
-    def test_push_step_clarify_skips_push_without_callback(self):
-        """No push callback → no push, but the gate is still armed."""
+    def test_push_step_clarify_does_not_arm_without_delivery(self):
+        """No push callback → the question was never delivered, so the gate
+        must stay UNARMED. Arming anyway would consume the peer's next
+        unrelated message as an answer to a question they never saw."""
         client = self._client()
         client._push_callback = None
         args = {"questions": [{"question": "Q?", "choices": ["A"]}]}
         client._push_step_clarify(args)
-        # Gate armed even without a push callback.
+        self.assertFalse(client._clarify_pending)
+
+    def test_push_step_clarify_does_not_arm_when_push_raises(self):
+        """A push that raises means the peer never saw the question — the
+        gate must stay unarmed."""
+        client = self._client()
+
+        def boom(_body):
+            raise RuntimeError("mesh down")
+
+        client._push_callback = boom
+        args = {"questions": [{"question": "Q?", "choices": ["A"]}]}
+        client._push_step_clarify(args)
+        self.assertFalse(client._clarify_pending)
+
+    def test_push_step_clarify_records_owning_peer(self):
+        """The gate records which peer was asked, so another peer's message
+        cannot be consumed as the answer."""
+        client = self._client()
+        client._push_callback = lambda _b: None
+        client._active_peer = "<peer-A>"
+        client._push_step_clarify(
+            {"questions": [{"question": "Q?"}]}, client._active_peer
+        )
         self.assertTrue(client._clarify_pending)
+        self.assertEqual(client._clarify_source, "<peer-A>")
+        # A different peer's message is NOT the answer.
+        self.assertIsNone(client.capture_clarify_answer("hi", "<peer-B>"))
+        self.assertTrue(client._clarify_pending)
+        # The asking peer's message is.
+        self.assertEqual(client.capture_clarify_answer("B", "<peer-A>"), "B")
+
+    def test_watcher_starts_for_clarify_with_step_mode_off(self):
+        """Clarify must work with step-through OFF (the default).
+
+        The clarify gate is armed by the step watcher, so gating that watcher
+        on step mode made the round-trip dead in the normal configuration:
+        the question was neither formatted nor armed. The watcher now starts
+        whenever a push callback exists.
+        """
+        client = self._client()
+        client._push_callback = lambda _b: None
+        client._step_mode = False
+        client.is_step_mode = lambda: False
+        client._resume_id = None
+        client._resolve_session_id = lambda: "sess-1"
+
+        started = []
+        real_watcher = client._run_step_watcher
+
+        def spy(sid, stop_evt, push_steps=True):
+            started.append((sid, push_steps))
+
+        client._run_step_watcher = spy
+        client._run_with_liveness_guard = lambda cmd, anchor=None: "ok"
+        try:
+            client.chat("hello")
+        finally:
+            client._run_step_watcher = real_watcher
+
+        self.assertEqual(len(started), 1, f"watcher not started: {started!r}")
+        # Step mode off → the watcher runs in clarify-only mode.
+        self.assertFalse(started[0][1], "push_steps should be False when step mode is off")
+
+    def test_watcher_pushes_steps_when_step_mode_on(self):
+        """With step mode ON the watcher still pushes the per-tool messages."""
+        client = self._client()
+        client._push_callback = lambda _b: None
+        client.is_step_mode = lambda: True
+        client._resume_id = None
+        client._resolve_session_id = lambda: "sess-1"
+
+        started = []
+        real_watcher = client._run_step_watcher
+
+        def spy(sid, stop_evt, push_steps=True):
+            started.append((sid, push_steps))
+
+        client._run_step_watcher = spy
+        client._run_with_liveness_guard = lambda cmd: "ok"
+        try:
+            client.chat("hello")
+        finally:
+            client._run_step_watcher = real_watcher
+
+        self.assertEqual(len(started), 1, f"watcher not started: {started!r}")
+        self.assertTrue(started[0][1], "push_steps should be True when step mode is on")
 
     def test_push_step_routes_clarify_to_dedicated_path(self):
         """_push_step for a clarify tool call must delegate to

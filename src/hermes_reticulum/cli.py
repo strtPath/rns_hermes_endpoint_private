@@ -314,7 +314,10 @@ def cmd_run(args):
             logger.info("Message from %s rejected by ACL", source_hash[:16])
             return "⛔ Access not authorized."
 
-        # Track this peer so live tool events can be pushed to it.
+        # Track this peer so live tool events can be pushed to it, and tell
+        # the client which peer this turn serves (the clarify gate is armed
+        # for that peer only, so a question asked of A can't be answered by B).
+        hermes.set_active_peer(source_hash)
         try:
             import RNS  # noqa: F401
 
@@ -337,7 +340,7 @@ def cmd_run(args):
         # prompt (pop_clarify_answer in hermes.chat) so the agent — which is
         # blocked in its session waiting for this answer — receives it and
         # can proceed. This is the same prefix path /steer uses.
-        clarify_answer = hermes.capture_clarify_answer(content)
+        clarify_answer = hermes.capture_clarify_answer(content, source_hash)
         if clarify_answer is not None:
             logger.info(
                 "Captured clarify answer from %s (%d chars)",
