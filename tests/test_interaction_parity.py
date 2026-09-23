@@ -208,7 +208,7 @@ class TestClarifyRoundTrip(unittest.TestCase):
         started = []
         real_watcher = client._run_step_watcher
 
-        def spy(sid, stop_evt, push_steps=True):
+        def spy(sid, stop_evt, push_steps=True, turn_peer=None):
             started.append((sid, push_steps))
 
         client._run_step_watcher = spy
@@ -233,11 +233,11 @@ class TestClarifyRoundTrip(unittest.TestCase):
         started = []
         real_watcher = client._run_step_watcher
 
-        def spy(sid, stop_evt, push_steps=True):
+        def spy(sid, stop_evt, push_steps=True, turn_peer=None):
             started.append((sid, push_steps))
 
         client._run_step_watcher = spy
-        client._run_with_liveness_guard = lambda cmd: "ok"
+        client._run_with_liveness_guard = lambda cmd, anchor=None: "ok"
         try:
             client.chat("hello")
         finally:

@@ -510,10 +510,11 @@ class TestStepWatcherRowSelection(unittest.TestCase):
         """Start the watcher, run `writer` (which persists rows) on this
         thread, then stop the watcher and return what it pushed.
 
-        The writer fires inside the race window: after the watcher thread
-        has begun its first poll (so the old code's seed snapshot has already
-        been taken on an empty tail) and before it has completed that poll's
-        push pass. Rows are therefore invisible to the old seed.
+        Runs for the WHOLE settle window rather than stopping at the first
+        push: a "pushed exactly once" test has to observe later polls, and a
+        helper that returns the moment _pushed is non-empty can never see a
+        duplicate. Callers that only care about the first push still work;
+        they just wait out the window.
         """
         stop_evt = threading.Event()
         t = threading.Thread(
@@ -525,9 +526,7 @@ class TestStepWatcherRowSelection(unittest.TestCase):
             # its MAX(id) seed here; the new code has no seed at all.
             time.sleep(0.2)
             writer()
-            deadline = time.time() + settle
-            while time.time() < deadline and not client._pushed:
-                time.sleep(0.05)
+            time.sleep(settle)
         finally:
             stop_evt.set()
             t.join(timeout=5)
@@ -718,6 +717,113 @@ class TestStepWatcherRowSelection(unittest.TestCase):
             f"tool with an empty result was not pushed: {pushed!r}",
         )
         self.assertIn("terminal", pushed[0])
+
+    def test_clarify_pushed_on_sight_without_result_row(self):
+        """A clarify call must be delivered before its result row exists.
+
+        The call blocks the agent until the user answers, and the answer can
+        only arrive once the question is pushed and the gate armed — so
+        waiting for the clarify result row is a deadlock: the row never
+        appears because the agent is still blocked.
+        """
+        import json as _json
+        sid = "sess-clarify-sight"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-clarify"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "clarify",
+                           "arguments": '{"questions": [{"question": "Which?"}]}'}}]
+        )
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            # Deliberately NO tool result row — the agent is blocked on it.
+
+        pushed = self._run_watcher_until(client, sid, writer)
+
+        self.assertEqual(
+            len(pushed), 1,
+            f"clarify question never delivered (deadlock): {pushed!r}",
+        )
+        self.assertIn("Which?", pushed[0])
+        self.assertTrue(client._clarify_pending, "gate was not armed")
+
+    def test_clarify_delivered_once_not_repushed_by_deferral(self):
+        """The clarify question is pushed exactly once.
+
+        A later poll must not re-deliver it (which would spam the peer and
+        re-arm the gate after the answer was already consumed).
+        """
+        import json as _json
+        sid = "sess-clarify-once"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-clarify-once"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "clarify",
+                           "arguments": '{"questions": [{"question": "Once?"}]}'}}]
+        )
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+
+        pushed = self._run_watcher_until(client, sid, writer, settle=4.0)
+
+        self.assertEqual(
+            len(pushed), 1,
+            f"clarify question pushed more than once: {pushed!r}",
+        )
+
+    def test_sibling_result_does_not_repush_completed_call(self):
+        """A call whose result landed must not be re-pushed while a SIBLING
+        call in the same row is still waiting for its result.
+
+        Row-level dedup is not enough: the row stays deferred for the missing
+        sibling, so per-call dedup is what stops the completed call repeating.
+        """
+        import json as _json
+        sid = "sess-siblings"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid_done, cid_wait = "call-done", "call-wait"
+        calls = _json.dumps([
+            {"id": cid_done, "call_id": cid_done,
+             "function": {"name": "terminal", "arguments": '{"command": "date"}'}},
+            {"id": cid_wait, "call_id": cid_wait,
+             "function": {"name": "read_file", "arguments": "{}"}},
+        ])
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            # Only the FIRST call's result lands; the sibling is still running.
+            self._insert(sid, "tool", time.time(), tool_name="terminal",
+                         content="DONE-MARKER", tool_call_id=cid_done)
+
+        pushed = self._run_watcher_until(client, sid, writer, settle=4.0)
+
+        done_pushes = [p for p in pushed if "DONE-MARKER" in p]
+        self.assertEqual(
+            len(done_pushes), 1,
+            f"completed call was re-pushed: {pushed!r}",
+        )
 
     def test_pushes_row_exactly_once_across_polls(self):
         """The window re-queries every poll; pushed_ids must dedup."""

@@ -597,6 +597,10 @@ class HermesClient:
         # so the NEXT incoming message is treated as the answer (not a new
         # turn). See the clarify round-trip block above.
         if name == "clarify" and not is_error:
+            # Routed here only in step mode (the watcher's clarify path calls
+            # _push_step_clarify directly, on sight, without waiting for a
+            # result). Pass the turn's peer when the watcher set one; fall back
+            # to the shared field for any other caller.
             self._push_step_clarify(args_raw, self._active_peer)
             return
         body = f"{head}\n{args_text}"
@@ -642,6 +646,7 @@ class HermesClient:
         sid: str | None,
         stop_evt: threading.Event,
         push_steps: bool = True,
+        turn_peer: str | None = None,
     ) -> None:
         """Poll state.db for new tool rows in this session and push each.
 
@@ -653,6 +658,13 @@ class HermesClient:
         spots a ``clarify`` call and arms the gate (so the round-trip works
         with step-through OFF, which is the default), but does not push the
         other per-step messages.
+
+        ``turn_peer`` is the peer this turn belongs to, captured by chat()
+        before the thread started. The clarify gate is armed for that peer. It
+        is a parameter rather than a read of ``_active_peer`` because the
+        bridge handles messages on a thread pool — a second inbound message
+        would otherwise rewrite the shared field mid-turn and arm this turn's
+        question for the wrong peer.
 
         ``sid`` may be None: the first turn of a brand-new session has no
         resolvable id when chat() starts the watcher (the session does not
@@ -703,6 +715,12 @@ class HermesClient:
             except (sqlite3.Error, OSError):
                 window_from = 0.0
         pushed_ids: set = set()
+        # Per-CALL dedup, separate from per-row. One assistant row can carry
+        # several calls; if one result lands before its siblings, that call is
+        # already pushed while the row stays deferred for the others. Without
+        # this set the completed call would be re-pushed on every later poll
+        # until every sibling finished.
+        pushed_cids: set = set()
         pushed = 0
         while not stop_evt.is_set():
             if stop_evt.wait(1.0):
@@ -790,8 +808,13 @@ class HermesClient:
             # poll, so the step body always carries its output rather than an
             # empty tail. Note this keys off seen_results, not the text: a
             # tool that returns nothing still delivered its result row.
+            #
+            # clarify is the exception and MUST NOT wait for a result row: the
+            # call blocks the agent until the user answers, and the answer can
+            # only arrive once the question is pushed and the gate armed. If it
+            # waited on its own result nothing would ever fire.
             still_deferred: set = set()
-            for rid, calls in fresh_calls:
+            for _rid, calls in fresh_calls:
                 missing = False
                 for call in calls:
                     if not isinstance(call, dict) or "function" not in call:
@@ -800,6 +823,17 @@ class HermesClient:
                     cname = fn.get("name", "?")
                     cargs = fn.get("arguments")
                     cid = call.get("id") or call.get("call_id")
+                    if cid in pushed_cids:
+                        continue
+                    if cname == "clarify":
+                        # Deliver on sight and arm the gate for THIS turn's
+                        # peer. Marked per-call so the deferral retry cannot
+                        # deliver the question twice.
+                        if self._clarify_enabled():
+                            self._push_step_clarify(cargs, turn_peer)
+                            pushed += 1
+                        pushed_cids.add(cid)
+                        continue
                     if cid not in seen_results:
                         missing = True
                         continue
@@ -807,13 +841,16 @@ class HermesClient:
                     is_error = bool(result_text) and result_text.strip().startswith(
                         ("❌", "Error", "error:")
                     )
-                    if cname == "clarify" or push_steps:
+                    if push_steps:
                         self._push_step(cname, cargs, result_text, is_error)
                         pushed += 1
+                    pushed_cids.add(cid)
                 if missing:
-                    still_deferred.add(rid)
+                    still_deferred.add(_rid)
             # Mark every row seen as pushed, EXCEPT a held assistant row whose
             # result has not landed — that one is re-examined next poll.
+            # A row whose clarify call was just delivered is NOT held: the gate
+            # is already armed, so waiting on its result would deadlock.
             for rid, _role, _tc, _tn, _c, _cid in fresh:
                 if rid in still_deferred:
                     continue
@@ -1335,9 +1372,16 @@ class HermesClient:
         # watcher, and clarify must work with step-through OFF (the default).
         # With step mode off the watcher runs in clarify-only mode — it arms
         # the gate on a clarify call but pushes no per-step messages.
+        #
+        # The peer is captured HERE, as a local for this invocation, and handed
+        # to the watcher. Reading the shared _active_peer at push time would be
+        # racy: the bridge fans out on a thread pool, so a second inbound
+        # message can overwrite it while this turn is still running, arming
+        # this turn's question for the wrong peer.
         watcher_stop = threading.Event()
         watcher_sid = self._resume_id or self._resolve_session_id()
         step_mode = self.is_step_mode()
+        turn_peer = self._active_peer
         if self._push_callback and (step_mode or self._clarify_enabled()):
             _diag(
                 f"step watcher start (step_mode={step_mode}, "
@@ -1345,7 +1389,7 @@ class HermesClient:
             )
             threading.Thread(
                 target=self._run_step_watcher,
-                args=(watcher_sid, watcher_stop, step_mode),
+                args=(watcher_sid, watcher_stop, step_mode, turn_peer),
                 daemon=True,
                 name="hermes-step-watcher",
             ).start()
