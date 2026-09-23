@@ -353,6 +353,290 @@ class TestMarkerScopingDiag(unittest.TestCase):
             tmp.cleanup()
 
 
+class TestStepWatcherFirstTurnSid(unittest.TestCase):
+    """The first turn of a fresh session starts the watcher with sid=None
+    (the session does not exist until the child creates it, and this build
+    has no --create-if-missing). The watcher must resolve the id once the
+    turn adopts the session, then stream that turn's tools.
+
+    Old behavior: sid=None was passed straight into `WHERE session_id = NULL`,
+    which matches no row, so every tool call of a first turn was dropped
+    silently while the log read `sid=None ... pushed=0`. Live evidence
+    2026-09-23: the 06:45 turn ran terminal + web_search and pushed nothing;
+    the 09:32 turn on the same (now-adopted) session streamed normally.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+            "tool_calls TEXT, tool_name TEXT, content TEXT, tool_call_id TEXT, "
+            "timestamp REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, "
+            "source TEXT, started_at REAL, last_activity_at REAL)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def _insert(self, sid, role, timestamp, tool_calls=None, tool_name=None,
+                content=None, tool_call_id=None):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, tool_name, "
+            "content, tool_call_id, timestamp) VALUES (?,?,?,?,?,?,?)",
+            (sid, role, tool_calls, tool_name, content, tool_call_id, timestamp),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_first_turn_streams_after_sid_resolves(self):
+        import json as _json
+        sid = "sess-first"
+        title = "mesh-thread"
+        cid = "call-first"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "terminal", "arguments": '{"command": "date"}'}}]
+        )
+
+        client = make_client()
+        client.session_name = title
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+        client._resume_id = None
+
+        stop_evt = threading.Event()
+        # Start with no sid — exactly what chat() does on a fresh session.
+        t = threading.Thread(
+            target=client._run_step_watcher, args=(None, stop_evt), daemon=True
+        )
+        t.start()
+        try:
+            time.sleep(0.3)
+            # The child creates + adopts the session mid-turn, persisting the
+            # titled session row, then runs a tool.
+            conn = sqlite3.connect(self._db)
+            conn.execute(
+                "INSERT INTO sessions (id, title, source, started_at) "
+                "VALUES (?,?,?,?)",
+                (sid, title, "cli", time.time()),
+            )
+            conn.commit()
+            conn.close()
+            self._insert(sid, "user", time.time(), content="what time is it")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            self._insert(sid, "tool", time.time(), tool_name="terminal",
+                         content='{"output": "ok"}', tool_call_id=cid)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not client._pushed:
+                time.sleep(0.05)
+        finally:
+            stop_evt.set()
+            t.join(timeout=5)
+
+        self.assertEqual(
+            len(client._pushed), 1,
+            f"first-turn tool was not streamed: {client._pushed!r}",
+        )
+        self.assertIn("terminal", client._pushed[0])
+
+
+class TestStepWatcherRowSelection(unittest.TestCase):
+    """The watcher must push THIS turn's tool rows even when the user prompt
+    row is persisted AFTER the watcher starts.
+
+    The watcher thread is started in chat() BEFORE the turn lock is taken and
+    before the child is spawned, so the user row and the tool rows can land
+    after any snapshot taken at watcher start. The old id seed (MAX(id) at
+    start) then equals the prior turn's last row, the first row the watcher
+    sees is the no-op user row, and advancing `last_pushed` past that user
+    row can swallow the turn's entire tool batch silently (pushed=0).
+
+    Live evidence 2026-09-23: the 09:32 turn's watcher ran 09:32:38 to
+    09:33:24 while its user row was written 09:32:54 and its assistant row
+    09:33:20 — the turn ran two tools and pushed nothing.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._db = os.path.join(self._tmp.name, "state.db")
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+            "tool_calls TEXT, tool_name TEXT, content TEXT, tool_call_id TEXT, "
+            "timestamp REAL)"
+        )
+        conn.commit()
+        conn.close()
+        self._prev_db = os.environ.get("HERMES_STATE_DB")
+        os.environ["HERMES_STATE_DB"] = self._db
+
+    def tearDown(self):
+        if self._prev_db is None:
+            os.environ.pop("HERMES_STATE_DB", None)
+        else:
+            os.environ["HERMES_STATE_DB"] = self._prev_db
+        self._tmp.cleanup()
+
+    def _insert(self, sid, role, timestamp, tool_calls=None, tool_name=None,
+                content=None, tool_call_id=None):
+        conn = sqlite3.connect(self._db)
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, tool_name, "
+            "content, tool_call_id, timestamp) VALUES (?,?,?,?,?,?,?)",
+            (sid, role, tool_calls, tool_name, content, tool_call_id, timestamp),
+        )
+        conn.commit()
+        conn.close()
+
+    def _run_watcher_until(self, client, sid, writer, settle=3.0):
+        """Start the watcher, run `writer` (which persists rows) on this
+        thread, then stop the watcher and return what it pushed.
+
+        The writer fires inside the race window: after the watcher thread
+        has begun its first poll (so the old code's seed snapshot has already
+        been taken on an empty tail) and before it has completed that poll's
+        push pass. Rows are therefore invisible to the old seed.
+        """
+        stop_evt = threading.Event()
+        t = threading.Thread(
+            target=client._run_step_watcher, args=(sid, stop_evt), daemon=True
+        )
+        t.start()
+        try:
+            # Let the watcher thread reach its first poll. The old code takes
+            # its MAX(id) seed here; the new code has no seed at all.
+            time.sleep(0.2)
+            writer()
+            deadline = time.time() + settle
+            while time.time() < deadline and not client._pushed:
+                time.sleep(0.05)
+        finally:
+            stop_evt.set()
+            t.join(timeout=5)
+        return list(client._pushed)
+
+    def test_pushes_turn_rows_written_after_watcher_start(self):
+        import json as _json
+        sid = "sess-race"
+        now = time.time()
+
+        # Prior turn: ends with an assistant text row. This is the row the old
+        # seed would land on (its id), and the next row is this turn's user
+        # prompt — the no-op row that swallowed the batch.
+        self._insert(sid, "assistant", now - 60, content="prior turn reply")
+
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-abc"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "terminal", "arguments": '{"command": "date"}'}}]
+        )
+
+        def writer():
+            # User prompt lands 1s after the watcher started (the real
+            # sequence: prompt persisted, then the child runs tools).
+            self._insert(sid, "user", time.time(), content="what time is it")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            self._insert(sid, "tool", time.time(), tool_name="terminal",
+                         content='{"output": "ok"}', tool_call_id=cid)
+
+        pushed = self._run_watcher_until(client, sid, writer)
+
+        self.assertEqual(len(pushed), 1, f"expected one step push, got {pushed!r}")
+        self.assertIn("terminal", pushed[0])
+
+    def test_does_not_replay_prior_turn_rows(self):
+        """The recap-bug guarantee must survive: prior turns' tool rows are
+        never re-pushed, even though the window is now time-based."""
+        import json as _json
+        sid = "sess-replay"
+        now = time.time()
+        old_cid = "call-old"
+        self._insert(
+            sid, "assistant", now - 3600,
+            tool_calls=_json.dumps(
+                [{"id": old_cid, "call_id": old_cid,
+                  "function": {"name": "write_file", "arguments": "{}"}}]
+            ),
+        )
+        self._insert(sid, "tool", now - 3599, tool_name="write_file",
+                     content="old result", tool_call_id=old_cid)
+
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-new"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "terminal", "arguments": '{"command": "date"}'}}]
+        )
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            self._insert(sid, "tool", time.time(), tool_name="terminal",
+                         content="new result", tool_call_id=cid)
+
+        pushed = self._run_watcher_until(client, sid, writer)
+
+        self.assertEqual(len(pushed), 1, f"expected only the new step, got {pushed!r}")
+        self.assertIn("terminal", pushed[0])
+        self.assertNotIn("write_file", " ".join(pushed))
+
+    def test_pushes_row_exactly_once_across_polls(self):
+        """The window re-queries every poll; pushed_ids must dedup."""
+        import json as _json
+        sid = "sess-dedup"
+        client = make_client()
+        client.session_name = "mesh-test"
+        client._pushed = []
+        client._push_callback = client._pushed.append
+        client.turn_alive_file = os.path.join(self._tmp.name, ".turn-alive")
+
+        cid = "call-once"
+        calls = _json.dumps(
+            [{"id": cid, "call_id": cid,
+              "function": {"name": "read_file", "arguments": "{}"}}]
+        )
+
+        def writer():
+            self._insert(sid, "user", time.time(), content="hi")
+            self._insert(sid, "assistant", time.time(), tool_calls=calls)
+            self._insert(sid, "tool", time.time(), tool_name="read_file",
+                         content="ok", tool_call_id=cid)
+
+        # Generous settle so several 1s polls happen over the same rows.
+        pushed = self._run_watcher_until(client, sid, writer, settle=4.5)
+
+        self.assertEqual(len(pushed), 1, f"row pushed more than once: {pushed!r}")
+
+
 class TestStepWatcherStoppedOnException(unittest.TestCase):
     """The step watcher must be stopped on EVERY exit path of chat(), not just
     the happy path. If subprocess setup or turn processing raises, the daemon

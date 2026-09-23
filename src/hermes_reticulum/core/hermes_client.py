@@ -573,37 +573,48 @@ class HermesClient:
                 logger.warning("Clarify push failed: %s", e)
         self.arm_clarify_wait()
 
-    def _run_step_watcher(self, sid: str, stop_evt: threading.Event) -> None:
+    def _run_step_watcher(self, sid: str | None, stop_evt: threading.Event) -> None:
         """Poll state.db for new tool rows in this session and push each.
 
         Runs in a daemon thread for the lifetime of one chat() turn. Tracks
-        the last pushed row id so a tool batch is pushed exactly once.
+        the pushed row ids so a tool batch is pushed exactly once.
         Best-effort: any error is logged and the loop continues.
+
+        ``sid`` may be None: the first turn of a brand-new session has no
+        resolvable id when chat() starts the watcher (the session does not
+        exist until the child creates it, and this Hermes build has no
+        --create-if-missing so chat() cannot pre-create it either). The old
+        code handed None straight to the queries, where ``session_id = NULL``
+        matches no row, so EVERY tool call of a first turn was silently
+        dropped while the log showed ``sid=None ... pushed=0``. Seen live
+        2026-09-23: the 06:45 turn ran terminal + web_search and pushed
+        nothing, then the 09:32 turn on the same session (now adopted, so its
+        id resolved) streamed normally. Resolve lazily instead: poll
+        ``_resolve_session_id()`` until the adopted session appears, then
+        watch it. Bounded by the turn's own lifetime.
+
+        Row selection is scoped by the turn's START TIME rather than an id
+        seed taken at watcher start. An id seed is racy in the other
+        direction too: the user prompt row and the child's rows are written
+        asynchronously, so a seed snapshot taken at start can land on the
+        prior turn's last row and let the first poll skip the batch.
+        Dedup is by pushed row id (tool rows are never renumbered);
+        ``timestamp`` is only the window filter.
         """
         db_path = os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
-        _diag(f"step-watcher start sid={sid}")
-        # Seed at the session's existing MAX id so we only push THIS turn's
-        # rows. state.db `messages` is session-global, so a fresh watcher on
-        # the 2nd+ turn of a session would otherwise replay the whole prior
-        # tool history as a one-second burst (recap bug — see
-        # docs/mesh-bridge-findings-2026-08-29-step-watcher-recap-bug.md).
-        # Safe to seed at start: the user message is persisted before the
-        # watcher runs, so rows with id <= seed belong to earlier turns.
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            row = conn.execute(
-                "SELECT MAX(id) FROM messages WHERE session_id = ?", (sid,)
-            ).fetchone()
-            last_pushed = row[0] if row and row[0] else 0
-            conn.close()
-        except (sqlite3.Error, OSError):
-            last_pushed = 0
-        pushed = 0
-        while not stop_evt.is_set():
-            if stop_evt.wait(1.0):
-                break
+        started_at = time.time()
+        _diag(f"step-watcher start sid={sid} since={started_at:.3f}")
+        # Only rows created at/after the turn started are ours. The 1s slack
+        # covers clock skew and a row persisted a beat before we start.
+        window_from = started_at - 1.0
+        # Some stores (and the older test fixtures) have no `timestamp`
+        # column. Detect once and fall back to an id seed for those, so the
+        # watcher degrades to the previous selection rule instead of
+        # silently matching nothing.
+        has_timestamp = self._messages_has_column(db_path, "timestamp")
+        if not has_timestamp:
             try:
                 conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                 try:
@@ -611,35 +622,66 @@ class HermesClient:
                         "SELECT MAX(id) FROM messages WHERE session_id = ?",
                         (sid,),
                     ).fetchone()
-                    last_id = row[0] if row and row[0] else 0
+                    window_from = float(row[0]) if row and row[0] else 0.0
+                finally:
+                    conn.close()
+                _diag("step-watcher: no timestamp column, using id seed")
+            except (sqlite3.Error, OSError):
+                window_from = 0.0
+        pushed_ids: set = set()
+        pushed = 0
+        while not stop_evt.is_set():
+            if stop_evt.wait(1.0):
+                break
+            if sid is None:
+                # First turn of a fresh session: the child creates and adopts
+                # the session mid-turn. Keep looking until it exists, then
+                # fall through to the normal poll on the next iteration.
+                sid = self._resolve_session_id()
+                if sid is None:
+                    continue
+                _diag(f"step-watcher resolved sid={sid} (was None)")
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    if has_timestamp:
+                        rows = conn.execute(
+                            "SELECT id, role, tool_calls, tool_name, content, "
+                            "tool_call_id "
+                            "FROM messages WHERE session_id = ? "
+                            "AND timestamp >= ? ORDER BY id ASC",
+                            (sid, window_from),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT id, role, tool_calls, tool_name, content, "
+                            "tool_call_id "
+                            "FROM messages WHERE session_id = ? AND id > ? "
+                            "ORDER BY id ASC",
+                            (sid, int(window_from)),
+                        ).fetchall()
                 finally:
                     conn.close()
             except (sqlite3.Error, OSError) as e:
                 _diag(f"step-watcher query error: {e}")
                 continue
-            if last_id is None or last_id <= last_pushed:
-                continue
-            # New rows since the last push — fetch the tail (all roles) and
-            # extract tool calls (assistant rows) + their results
-            # (role='tool' rows, linked by tool_call_id).
-            try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                try:
-                    rows = conn.execute(
-                        "SELECT id, role, tool_calls, tool_name, content, "
-                        "tool_call_id "
-                        "FROM messages WHERE session_id = ? AND id > ? "
-                        "ORDER BY id ASC",
-                        (sid, last_pushed),
-                    ).fetchall()
-                finally:
-                    conn.close()
-            except (sqlite3.Error, OSError) as e:
-                _diag(f"step-watcher fetch error: {e}")
+            if not rows:
                 continue
             results_by_cid: dict = {}
             saw_tool_activity = False
-            for rid, role, tool_calls, tool_name, content, tool_call_id in rows:
+            fresh: list = []
+            for row in rows:
+                rid = row[0]
+                if rid in pushed_ids:
+                    # Result may have arrived after the assistant row that
+                    # issued it was first seen — refresh the map before using.
+                    if row[1] == "tool" and row[5]:
+                        results_by_cid[row[5]] = row[4] or ""
+                    continue
+                fresh.append(row)
+            if not fresh:
+                continue
+            for rid, role, tool_calls, tool_name, content, tool_call_id in fresh:
                 if role == "tool" and tool_call_id:
                     # A tool RESULT row: the model's last call ran. This is
                     # real tool progress — mark it (heartbeat below) and keep
@@ -668,18 +710,15 @@ class HermesClient:
                         )
                         self._push_step(cname, cargs, result_text, is_error)
                         pushed += 1
+                pushed_ids.add(rid)
             # Only refresh the liveness marker if this batch actually contained
-            # tool activity. MAX(id) advances for ANY new row in the session
-            # (user, system, text-only assistant, tool), so a blind refresh on
-            # last_id > last_pushed would let unrelated rows keep a stalled
-            # child alive until the hard cap. A working turn emits tool rows;
-            # only those should warm the heartbeat. The gateway agent:step hook
-            # never fires for a CLI child, so this in-process refresh is what
-            # keeps a working -q turn's marker fresh (scoped by session + gen).
+            # tool activity. A working turn emits tool rows; only those should
+            # warm the heartbeat. The gateway agent:step hook never fires for a
+            # CLI child, so this in-process refresh is what keeps a working -q
+            # turn's marker fresh (scoped by session + gen).
             # Best-effort: a write failure degrades to the bytes-only guard.
             if saw_tool_activity:
                 self.write_turn_alive_marker(phase="tool")
-            last_pushed = last_id
         _diag(f"step-watcher stop sid={sid} pushed={pushed}")
 
     def _step_prompt_prefix(self) -> str | None:
@@ -860,6 +899,26 @@ class HermesClient:
         return os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
+
+    def _messages_has_column(self, db_path: str, column: str) -> bool:
+        """True if the ``messages`` table has ``column``.
+
+        Schemas differ across Hermes builds (and test fixtures): older stores
+        omitting ``timestamp`` would make a timestamp-filtered query match no
+        rows at all, silently dropping every step push. Callers degrade to an
+        id-based selection when the column is absent.
+        """
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                cols = {
+                    r[1] for r in conn.execute("PRAGMA table_info(messages)")
+                }
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError):
+            return False
+        return column in cols
 
     def _session_ids(self) -> set[str]:
         """Snapshot of all session ids, used to detect the session a fresh
@@ -1165,9 +1224,8 @@ class HermesClient:
         # per-tool 💻 messages the user sees. Gated on step-mode ON + a push
         # callback (only the bridge sets one).
         watcher_stop = threading.Event()
-        watcher_sid = None
+        watcher_sid = self._resume_id or self._resolve_session_id()
         if self.is_step_mode() and self._push_callback:
-            watcher_sid = self._resume_id or self._resolve_session_id()
             _diag(
                 f"step-mode ON, push set, sid={watcher_sid} "
                 f"resume_id={self._resume_id}"
