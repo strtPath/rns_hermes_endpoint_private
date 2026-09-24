@@ -21,9 +21,20 @@ env/
 *.swo
 
 # Environment / secrets
+# .env.bak* covers timestamped backups (e.g. .env.bak.20260918221011); the
+# narrow *.bak rule below does not match `.env.bak.<stamp>` because the
+# extension is the stamp, not `bak`.
 .env
 .env.local
 .env.*.local
+.env.bak*
+*.env.bak*
+secrets/
+identity-registry-local.txt
+
+# Agent working documents (plans written by the `plan` skill).
+# Working drafts, not published docs; the repo's public surface is docs/.
+.hermes/
 
 # Reticulum / LXMF runtime data
 .reticular/
