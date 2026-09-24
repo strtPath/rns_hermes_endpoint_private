@@ -207,6 +207,24 @@ class HermesClient:
         # Checkpoint gate: while set, chat() blocks before returning the
         # reply until /go (or the hold timeout). Set by /hold.
         self._hold_gate = False
+        # Clarify round-trip (Tier 3): when the step watcher sees a clarify
+        # call in this turn it sets _clarify_pending. The NEXT incoming mesh
+        # message is then treated as the answer to that question (not a new
+        # turn), stashed in _clarify_answer and injected into the next prompt
+        # via _pending_input (the same prefix path steer uses). Cleared when
+        # consumed, at turn end, and after the timeout, so a stale question
+        # can never swallow a later message as an answer.
+        self._clarify_pending: bool = False
+        self._clarify_deadline: float = 0.0
+        self._clarify_answer: str | None = None
+        # Which peer the open question was delivered to. Only that peer's next
+        # message is accepted as the answer; another authorized peer's message
+        # must not be injected into this session.
+        self._clarify_source: str | None = None
+        # Peer the current turn is serving (set by the bridge per message).
+        # Used to scope the clarify gate to the peer that was asked.
+        self._active_peer: str | None = None
+        self._pending_input: list[str] = []
         # Push callback: callable(text: str) → sends a message to the mesh
         # peer. Set by the bridge (cli.py); the hook can't push directly
         # (it runs in the gateway process, not the bridge).
@@ -369,6 +387,16 @@ class HermesClient:
         self._step_mode = bool(enabled)
         logger.info("Step-through mode: %s", "ON" if enabled else "OFF")
 
+    def _clarify_enabled(self) -> bool:
+        """Whether the clarify round-trip watcher should run.
+
+        Clarify is a standalone feature (Tier 3) and is NOT gated on
+        step-through mode: the watcher is the only thing that arms the clarify
+        gate, so tying it to step mode made the round-trip dead in the default
+        configuration. Disable with HERMES_MESH_CLARIFY=0 if ever needed.
+        """
+        return os.environ.get("HERMES_MESH_CLARIFY", "1") != "0"
+
     def _step_mode_file_path(self) -> str:
         """Path of the state file that is the source of truth for step mode.
 
@@ -396,6 +424,16 @@ class HermesClient:
         """Register a push callback: callable(text: str) → send to mesh peer."""
         self._push_callback = callback
 
+    def set_active_peer(self, source_hash: str | None) -> None:
+        """Record which peer the current turn is serving.
+
+        The clarify gate is armed for exactly this peer, so an answer is only
+        accepted from whoever was asked. The bridge sets this per inbound
+        message (it owns the peer mapping); the client has no other way to
+        know who is on the other end.
+        """
+        self._active_peer = source_hash
+
     # ── CLI-side step-through watcher ────────────────────────────────
     #
     # WHY THIS EXISTS: the ``agent:step`` hook only fires in the *gateway*
@@ -406,6 +444,132 @@ class HermesClient:
     # push path) polls state.db for new tool rows while the child runs and
     # pushes each tool call + its output as its own 💻 message, exactly
     # like the gateway's progress bubble. No gateway, no hook needed.
+
+    # ── Clarify round-trip (Tier 3) ──────────────────────────────────
+    #
+    # WHY THIS EXISTS: a clarify call from the mesh child blocks the agent
+    # until the user answers it. The step watcher sees the clarify TOOL CALL
+    # (with its JSON arguments) but currently pushes the raw JSON blob — the
+    # mesh user has no way to answer. So:
+    #   1. the watcher reformats the question + numbered choices and pushes
+    #      it (piece 1), and
+    #   2. it arms _clarify_pending so the NEXT incoming mesh message is
+    #      treated as the answer (not a new turn). cli.handle_message calls
+    #      capture_clarify_answer() before command dispatch; if it returns a
+    #      string, the answer is stashed in _clarify_answer and a turn is
+    #      started whose prompt has the answer injected as a prefix (via
+    #      pop_clarify_answer in chat()). A deadline bounds the wait so a
+    #      stale question can't swallow a later message as an answer.
+
+    CLARIFY_ANSWER_TIMEOUT_S = float(
+        os.environ.get("HERMES_MESH_CLARIFY_TIMEOUT", "3600")
+    )
+
+    def _format_clarify(self, args_raw) -> str:
+        """Render a clarify tool call as a readable question with numbered
+        choices, ready to push to the mesh.
+
+        The arguments are either a dict ({"questions": [...]}) or a bare
+        question string. Handles both the multi-question and single-question
+        shapes, and falls back to the raw args if the shape is unexpected.
+        """
+        args = args_raw
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                return f"❓ {args}"
+        if isinstance(args, dict):
+            questions = args.get("questions")
+            if isinstance(questions, list) and questions:
+                blocks = []
+                for i, q in enumerate(questions, 1):
+                    if isinstance(q, dict):
+                        text = q.get("question", "")
+                        choices = q.get("choices", [])
+                    elif isinstance(q, str):
+                        text = q
+                        choices = []
+                    else:
+                        continue
+                    lines = [f"{i}. {text}"] if text else [f"{i}."]
+                    if choices:
+                        for j, c in enumerate(choices, 1):
+                            lines.append(f"   {j}. {c}")
+                    blocks.append("\n".join(lines))
+                body = "\n\n".join(b for b in blocks if b.strip())
+                if body:
+                    return f"❓ Question\n{body}\n\nReply with your choice (e.g. '1. 2' or '2')."
+        # Fallback: show the raw args so nothing is lost.
+        try:
+            return f"❓ {json.dumps(args, ensure_ascii=False)}"
+        except (TypeError, ValueError):
+            return f"❓ {args}"
+
+    def capture_clarify_answer(self, text: str, source_hash: str | None = None) -> str | None:
+        """If a clarify answer is pending for THIS peer, consume the incoming
+        message as the answer and return it (to be injected into the next
+        prompt). Returns None otherwise — the message is then a normal turn.
+
+        Called from cli.handle_message BEFORE command dispatch, so the reply
+        is treated as the answer to the open question, not as a new prompt.
+
+        ``source_hash`` is the sending peer. When the gate was armed for a
+        specific peer, only that peer's message is accepted; another peer's
+        message falls through to normal dispatch instead of being injected
+        into someone else's session.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        # Stale-question guard: if the deadline passed, drop this answer and
+        # clear the pending flag (the question stays open; the agent may
+        # re-ask). This prevents a stale question from swallowing a later
+        # unrelated message as its answer.
+        if self._clarify_deadline and time.time() > self._clarify_deadline:
+            self._clarify_pending = False
+            self._clarify_deadline = 0.0
+            self._clarify_source = None
+            logger.info("Clarify answer timed out — clearing pending")
+            return None
+        if not self._clarify_pending:
+            return None
+        # Ownership: a question asked of peer A must not be answered by peer B.
+        if self._clarify_source and source_hash and source_hash != self._clarify_source:
+            logger.info(
+                "Clarify question is owned by another peer — treating message "
+                "from %s as a normal turn", source_hash[:16],
+            )
+            return None
+        self._clarify_pending = False
+        self._clarify_deadline = 0.0
+        self._clarify_source = None
+        self._clarify_answer = text
+        logger.info("Captured clarify answer (%d chars)", len(text))
+        return text
+
+    def pop_clarify_answer(self) -> str | None:
+        """Return and clear the captured clarify answer (consumed in chat())."""
+        ans = self._clarify_answer
+        self._clarify_answer = None
+        return ans
+
+    def arm_clarify_wait(self, source_hash: str | None = None) -> None:
+        """Arm the clarify gate: the next incoming message is the answer.
+
+        ``source_hash`` records which peer the question was delivered to. Only
+        that peer's next message is consumed as the answer; any other
+        authorized peer's message is a normal turn. Without this, a pending
+        question asked of peer A would swallow peer B's unrelated message and
+        inject it into A's session.
+        """
+        self._clarify_pending = True
+        self._clarify_source = source_hash
+        self._clarify_deadline = time.time() + self.CLARIFY_ANSWER_TIMEOUT_S
+        logger.info(
+            "Clarify pending — waiting for answer from %s",
+            (source_hash or "<any>")[:16],
+        )
 
     def _push_step(self, name: str, args_raw, result: str, is_error: bool) -> None:
         """Push one tool call (emoji + name) and its output to the mesh peer."""
@@ -428,6 +592,17 @@ class HermesClient:
         # Same per-tool emoji the gateway shows on Telegram; ❌ for a failed call.
         from hermes_reticulum.core.tool_emoji import tool_label
         head = tool_label(name, is_error)
+        # Clarify: the raw JSON blob is useless to the mesh user. Render it as
+        # a readable question with numbered choices, and arm the clarify gate
+        # so the NEXT incoming message is treated as the answer (not a new
+        # turn). See the clarify round-trip block above.
+        if name == "clarify" and not is_error:
+            # Routed here only in step mode (the watcher's clarify path calls
+            # _push_step_clarify directly, on sight, without waiting for a
+            # result). Pass the turn's peer when the watcher set one; fall back
+            # to the shared field for any other caller.
+            self._push_step_clarify(args_raw, self._active_peer)
+            return
         body = f"{head}\n{args_text}"
         if result:
             body += f"\n{result}"
@@ -438,37 +613,94 @@ class HermesClient:
             _diag(f"  push_step({name}) callback raised: {e}")
             logger.warning("Step push failed for %s: %s", name, e)
 
-    def _run_step_watcher(self, sid: str, stop_evt: threading.Event) -> None:
+    def _push_step_clarify(self, args_raw, source_hash: str | None = None) -> None:
+        """Push a clarify call as a readable question + numbered choices and
+        arm the clarify gate so the next message from that peer is the answer.
+
+        The gate is armed ONLY if the question was actually delivered. If no
+        push callback is set, or the callback raises, the peer never saw the
+        question — arming anyway would consume their next unrelated message as
+        an answer to a question they were never asked.
+        """
+        from hermes_reticulum.core.tool_emoji import tool_label
+        head = tool_label("clarify", False)
+        body = f"{head}\n{self._format_clarify(args_raw)}"
+        logger.info("Pushing clarify question (%d chars)", len(body))
+        delivered = False
+        if self._push_callback is not None:
+            try:
+                self._push_callback(body)
+                delivered = True
+            except Exception as e:  # noqa: BLE001 — a push failure must not kill the turn
+                logger.warning("Clarify push failed: %s", e)
+        else:
+            logger.warning(
+                "Clarify question not delivered (no push callback) — "
+                "gate left unarmed"
+            )
+        if delivered:
+            self.arm_clarify_wait(source_hash)
+
+    def _run_step_watcher(
+        self,
+        sid: str | None,
+        stop_evt: threading.Event,
+        push_steps: bool = True,
+        turn_peer: str | None = None,
+    ) -> None:
         """Poll state.db for new tool rows in this session and push each.
 
         Runs in a daemon thread for the lifetime of one chat() turn. Tracks
-        the last pushed row id so a tool batch is pushed exactly once.
+        the pushed row ids so a tool batch is pushed exactly once.
         Best-effort: any error is logged and the loop continues.
+
+        ``push_steps`` False runs the watcher in clarify-only mode: it still
+        spots a ``clarify`` call and arms the gate (so the round-trip works
+        with step-through OFF, which is the default), but does not push the
+        other per-step messages.
+
+        ``turn_peer`` is the peer this turn belongs to, captured by chat()
+        before the thread started. The clarify gate is armed for that peer. It
+        is a parameter rather than a read of ``_active_peer`` because the
+        bridge handles messages on a thread pool — a second inbound message
+        would otherwise rewrite the shared field mid-turn and arm this turn's
+        question for the wrong peer.
+
+        ``sid`` may be None: the first turn of a brand-new session has no
+        resolvable id when chat() starts the watcher (the session does not
+        exist until the child creates it, and this Hermes build has no
+        --create-if-missing so chat() cannot pre-create it either). The old
+        code handed None straight to the queries, where ``session_id = NULL``
+        matches no row, so EVERY tool call of a first turn was silently
+        dropped while the log showed ``sid=None ... pushed=0``. Seen live
+        2026-09-23: the 06:45 turn ran terminal + web_search and pushed
+        nothing, then the 09:32 turn on the same session (now adopted, so its
+        id resolved) streamed normally. Resolve lazily instead: poll
+        ``_resolve_session_id()`` until the adopted session appears, then
+        watch it. Bounded by the turn's own lifetime.
+
+        Row selection is scoped by the turn's START TIME rather than an id
+        seed taken at watcher start. An id seed is racy in the other
+        direction too: the user prompt row and the child's rows are written
+        asynchronously, so a seed snapshot taken at start can land on the
+        prior turn's last row and let the first poll skip the batch.
+        Dedup is by pushed row id (tool rows are never renumbered);
+        ``timestamp`` is only the window filter.
         """
         db_path = os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
-        _diag(f"step-watcher start sid={sid}")
-        # Seed at the session's existing MAX id so we only push THIS turn's
-        # rows. state.db `messages` is session-global, so a fresh watcher on
-        # the 2nd+ turn of a session would otherwise replay the whole prior
-        # tool history as a one-second burst (recap bug — see
-        # docs/mesh-bridge-findings-2026-08-29-step-watcher-recap-bug.md).
-        # Safe to seed at start: the user message is persisted before the
-        # watcher runs, so rows with id <= seed belong to earlier turns.
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            row = conn.execute(
-                "SELECT MAX(id) FROM messages WHERE session_id = ?", (sid,)
-            ).fetchone()
-            last_pushed = row[0] if row and row[0] else 0
-            conn.close()
-        except (sqlite3.Error, OSError):
-            last_pushed = 0
-        pushed = 0
-        while not stop_evt.is_set():
-            if stop_evt.wait(1.0):
-                break
+        started_at = time.time()
+        _diag(f"step-watcher start sid={sid} since={started_at:.3f}")
+        # Only rows created at/after the turn started are ours. The 1s slack
+        # covers clock skew and a row persisted a beat before we start.
+        window_from = started_at - 1.0
+        # Some stores (and the older test fixtures) have no `timestamp`
+        # column. Detect once and fall back to an id seed for those, so the
+        # watcher degrades to the previous selection rule instead of
+        # silently matching nothing.
+        has_timestamp = self._messages_has_column(db_path, "timestamp")
+        if not has_timestamp:
             try:
                 conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                 try:
@@ -476,35 +708,85 @@ class HermesClient:
                         "SELECT MAX(id) FROM messages WHERE session_id = ?",
                         (sid,),
                     ).fetchone()
-                    last_id = row[0] if row and row[0] else 0
+                    window_from = float(row[0]) if row and row[0] else 0.0
+                finally:
+                    conn.close()
+                _diag("step-watcher: no timestamp column, using id seed")
+            except (sqlite3.Error, OSError):
+                window_from = 0.0
+        pushed_ids: set = set()
+        # Per-CALL dedup, separate from per-row. One assistant row can carry
+        # several calls; if one result lands before its siblings, that call is
+        # already pushed while the row stays deferred for the others. Without
+        # this set the completed call would be re-pushed on every later poll
+        # until every sibling finished.
+        pushed_cids: set = set()
+        pushed = 0
+        while not stop_evt.is_set():
+            if stop_evt.wait(1.0):
+                break
+            if sid is None:
+                # First turn of a fresh session: the child creates and adopts
+                # the session mid-turn. Keep looking until it exists, then
+                # fall through to the normal poll on the next iteration.
+                sid = self._resolve_session_id()
+                if sid is None:
+                    continue
+                _diag(f"step-watcher resolved sid={sid} (was None)")
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    if has_timestamp:
+                        rows = conn.execute(
+                            "SELECT id, role, tool_calls, tool_name, content, "
+                            "tool_call_id "
+                            "FROM messages WHERE session_id = ? "
+                            "AND timestamp >= ? ORDER BY id ASC",
+                            (sid, window_from),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT id, role, tool_calls, tool_name, content, "
+                            "tool_call_id "
+                            "FROM messages WHERE session_id = ? AND id > ? "
+                            "ORDER BY id ASC",
+                            (sid, int(window_from)),
+                        ).fetchall()
                 finally:
                     conn.close()
             except (sqlite3.Error, OSError) as e:
                 _diag(f"step-watcher query error: {e}")
                 continue
-            if last_id is None or last_id <= last_pushed:
-                continue
-            # New rows since the last push — fetch the tail (all roles) and
-            # extract tool calls (assistant rows) + their results
-            # (role='tool' rows, linked by tool_call_id).
-            try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                try:
-                    rows = conn.execute(
-                        "SELECT id, role, tool_calls, tool_name, content, "
-                        "tool_call_id "
-                        "FROM messages WHERE session_id = ? AND id > ? "
-                        "ORDER BY id ASC",
-                        (sid, last_pushed),
-                    ).fetchall()
-                finally:
-                    conn.close()
-            except (sqlite3.Error, OSError) as e:
-                _diag(f"step-watcher fetch error: {e}")
+            if not rows:
                 continue
             results_by_cid: dict = {}
+            # Cids whose result row has actually been SEEN, regardless of
+            # whether its text was empty. Distinct from results_by_cid:
+            # a tool that legitimately returns nothing still counts as
+            # delivered, so the call is not held forever waiting on a
+            # result that already arrived.
+            seen_results: set = set()
             saw_tool_activity = False
-            for rid, role, tool_calls, tool_name, content, tool_call_id in rows:
+            fresh: list = []
+            for row in rows:
+                rid = row[0]
+                if rid in pushed_ids:
+                    # Result may have arrived after the assistant row that
+                    # issued it was first seen — refresh the map before using.
+                    if row[1] == "tool" and row[5]:
+                        results_by_cid[row[5]] = row[4] or ""
+                        seen_results.add(row[5])
+                    continue
+                fresh.append(row)
+            if not fresh:
+                continue
+            # Results must be collected BEFORE any assistant row is pushed:
+            # rows come back in ascending id order, so an assistant row is
+            # always seen before the result row that answers it. Pushing on
+            # first sight would send the call with an empty result and mark
+            # the row done, permanently omitting the output.
+            fresh_calls: list = []
+            for rid, role, tool_calls, tool_name, content, tool_call_id in fresh:
                 if role == "tool" and tool_call_id:
                     # A tool RESULT row: the model's last call ran. This is
                     # real tool progress — mark it (heartbeat below) and keep
@@ -520,31 +802,67 @@ class HermesClient:
                         continue
                     if calls:
                         saw_tool_activity = True
-                    for call in calls:
-                        if not isinstance(call, dict) or "function" not in call:
-                            continue
-                        fn = call.get("function") or {}
-                        cname = fn.get("name", "?")
-                        cargs = fn.get("arguments")
-                        cid = call.get("id") or call.get("call_id")
-                        result_text = results_by_cid.get(cid, "")
-                        is_error = bool(result_text) and result_text.strip().startswith(
-                            ("❌", "Error", "error:")
-                        )
+                    fresh_calls.append((rid, calls))
+            # Push each call. A call whose result row has not landed yet is
+            # held (its id goes in `still_deferred`) and retried on a later
+            # poll, so the step body always carries its output rather than an
+            # empty tail. Note this keys off seen_results, not the text: a
+            # tool that returns nothing still delivered its result row.
+            #
+            # clarify is the exception and MUST NOT wait for a result row: the
+            # call blocks the agent until the user answers, and the answer can
+            # only arrive once the question is pushed and the gate armed. If it
+            # waited on its own result nothing would ever fire.
+            still_deferred: set = set()
+            for _rid, calls in fresh_calls:
+                missing = False
+                for call in calls:
+                    if not isinstance(call, dict) or "function" not in call:
+                        continue
+                    fn = call.get("function") or {}
+                    cname = fn.get("name", "?")
+                    cargs = fn.get("arguments")
+                    cid = call.get("id") or call.get("call_id")
+                    if cid in pushed_cids:
+                        continue
+                    if cname == "clarify":
+                        # Deliver on sight and arm the gate for THIS turn's
+                        # peer. Marked per-call so the deferral retry cannot
+                        # deliver the question twice.
+                        if self._clarify_enabled():
+                            self._push_step_clarify(cargs, turn_peer)
+                            pushed += 1
+                        pushed_cids.add(cid)
+                        continue
+                    if cid not in seen_results:
+                        missing = True
+                        continue
+                    result_text = results_by_cid.get(cid, "") or ""
+                    is_error = bool(result_text) and result_text.strip().startswith(
+                        ("❌", "Error", "error:")
+                    )
+                    if push_steps:
                         self._push_step(cname, cargs, result_text, is_error)
                         pushed += 1
+                    pushed_cids.add(cid)
+                if missing:
+                    still_deferred.add(_rid)
+            # Mark every row seen as pushed, EXCEPT a held assistant row whose
+            # result has not landed — that one is re-examined next poll.
+            # A row whose clarify call was just delivered is NOT held: the gate
+            # is already armed, so waiting on its result would deadlock.
+            for rid, _role, _tc, _tn, _c, _cid in fresh:
+                if rid in still_deferred:
+                    continue
+                pushed_ids.add(rid)
             # Only refresh the liveness marker if this batch actually contained
-            # tool activity. MAX(id) advances for ANY new row in the session
-            # (user, system, text-only assistant, tool), so a blind refresh on
-            # last_id > last_pushed would let unrelated rows keep a stalled
-            # child alive until the hard cap. A working turn emits tool rows;
-            # only those should warm the heartbeat. The gateway agent:step hook
-            # never fires for a CLI child, so this in-process refresh is what
-            # keeps a working -q turn's marker fresh (scoped by session + gen).
+            # tool activity. A working turn emits tool rows; only those should
+            # warm the heartbeat. The gateway agent:step hook never fires for a
+            # CLI child, so this in-process refresh is what keeps a working -q
+            # turn's marker fresh (scoped by session + gen).
             # Best-effort: a write failure degrades to the bytes-only guard.
             if saw_tool_activity:
                 self.write_turn_alive_marker(phase="tool")
-            last_pushed = last_id
         _diag(f"step-watcher stop sid={sid} pushed={pushed}")
 
     def _step_prompt_prefix(self) -> str | None:
@@ -725,6 +1043,26 @@ class HermesClient:
         return os.path.expanduser(
             os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db")
         )
+
+    def _messages_has_column(self, db_path: str, column: str) -> bool:
+        """True if the ``messages`` table has ``column``.
+
+        Schemas differ across Hermes builds (and test fixtures): older stores
+        omitting ``timestamp`` would make a timestamp-filtered query match no
+        rows at all, silently dropping every step push. Callers degrade to an
+        id-based selection when the column is absent.
+        """
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                cols = {
+                    r[1] for r in conn.execute("PRAGMA table_info(messages)")
+                }
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError):
+            return False
+        return column in cols
 
     def _session_ids(self) -> set[str]:
         """Snapshot of all session ids, used to detect the session a fresh
@@ -968,6 +1306,15 @@ class HermesClient:
             message = f"[Operator steering] {steer}\n\n{message}"
             logger.info("Injected steering: %s", steer[:80])
 
+        # Clarify round-trip: if the mesh user answered an open clarify
+        # question (captured by capture_clarify_answer in cli.handle_message),
+        # inject the answer as a prefix to this prompt so the agent receives
+        # it as a follow-up to the question it asked. Consumed once.
+        clarify_answer = self.pop_clarify_answer()
+        if clarify_answer is not None:
+            message = f"[User's answer to your question: {clarify_answer}]\n\n{message}"
+            logger.info("Injected clarify answer: %s", clarify_answer[:80])
+
         # Step-through mode: instruct the model to NOT narrate step-by-step —
         # the CLI-side watcher delivers each tool call + output as its own
         # mesh message (the equivalent of the gateway's 💻 progress bubble).
@@ -1018,25 +1365,37 @@ class HermesClient:
         # CLI-side step-through watcher: push each tool call + output as its
         # own mesh message while the child runs. The gateway hook (agent:step)
         # can't fire for a CLI child, so this is what actually delivers the
-        # per-tool 💻 messages the user sees. Gated on step-mode ON + a push
-        # callback (only the bridge sets one).
+        # per-tool 💻 messages the user sees.
+        #
+        # It runs whenever a push callback exists (only the bridge sets one),
+        # NOT only in step mode: the clarify round-trip is armed by this same
+        # watcher, and clarify must work with step-through OFF (the default).
+        # With step mode off the watcher runs in clarify-only mode — it arms
+        # the gate on a clarify call but pushes no per-step messages.
+        #
+        # The peer is captured HERE, as a local for this invocation, and handed
+        # to the watcher. Reading the shared _active_peer at push time would be
+        # racy: the bridge fans out on a thread pool, so a second inbound
+        # message can overwrite it while this turn is still running, arming
+        # this turn's question for the wrong peer.
         watcher_stop = threading.Event()
-        watcher_sid = None
-        if self.is_step_mode() and self._push_callback:
-            watcher_sid = self._resume_id or self._resolve_session_id()
+        watcher_sid = self._resume_id or self._resolve_session_id()
+        step_mode = self.is_step_mode()
+        turn_peer = self._active_peer
+        if self._push_callback and (step_mode or self._clarify_enabled()):
             _diag(
-                f"step-mode ON, push set, sid={watcher_sid} "
-                f"resume_id={self._resume_id}"
+                f"step watcher start (step_mode={step_mode}, "
+                f"clarify=enabled) sid={watcher_sid} resume_id={self._resume_id}"
             )
             threading.Thread(
                 target=self._run_step_watcher,
-                args=(watcher_sid, watcher_stop),
+                args=(watcher_sid, watcher_stop, step_mode, turn_peer),
                 daemon=True,
                 name="hermes-step-watcher",
             ).start()
         else:
             _diag(
-                f"step watcher NOT started (step_mode={self.is_step_mode()}, "
+                f"step watcher NOT started (step_mode={step_mode}, "
                 f"push={self._push_callback is not None})"
             )
 
