@@ -6,11 +6,8 @@ to enable Reticulum as a first-class messaging platform alongside Telegram,
 Discord, WhatsApp, etc.
 """
 
-from hermes_reticulum.plugin.adapter import (
-    ReticulumPlatformAdapter,
-    check_reticulum_requirements,
-)
-from hermes_reticulum.plugin.registration import register
+from hermes_reticulum.plugin.adapter import ReticulumPlatformAdapter
+from hermes_reticulum.plugin.registration import check_reticulum_requirements, register
 
 # Back-compat alias — the class was renamed to ReticulumPlatformAdapter to
 # match the gateway's BasePlatformAdapter contract, but older docs and tests
