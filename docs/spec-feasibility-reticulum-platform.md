@@ -3,7 +3,7 @@ title: Reticulum as a Gateway Platform, Feasibility
 level: sub-spec
 parent: spec-rns-hermes-endpoint.md
 subsystem: feasibility
-status: DRAFT
+status: SETTLED — superseded by spec-reticulum-platform-adapter.md
 ---
 
 # Reticulum as a Gateway Platform: Feasibility
@@ -15,10 +15,15 @@ current spawn-a-child bridge. States what fits, what strains, and what genuinely
 Sub-specs describe today's system; the intended-interaction spec states the target; this
 document judges whether the target is reachable and at what cost.
 
-Status: DRAFT, revised 2026-09-24. Established by reading both codebases against the installed
-sources (rns 1.5.4, lxmf 1.1.1), not by prototyping. No adapter has been written or run. The
-delivery-confirmation question raised in the first draft is now answered from source; see
-section 4. Evidence notes: `_notes-reticulum-fit.md`, `_notes-delivery-confirmation.md`.
+**This document is settled history as of 2026-09-24.** The question it asks is answered, the
+delivery gate it left open is closed, and the decision was taken to build the adapter. Design
+questions now belong in `spec-reticulum-platform-adapter.md`; read that one to build. This one
+is kept for the reasoning and for the corrections in section 9.
+
+Status: SETTLED, revised 2026-09-24. Established by reading both codebases against the installed
+sources (rns 1.5.4, lxmf 1.1.1), not by prototyping. The delivery-confirmation question raised
+in the first draft is now answered from source; see section 4. Evidence notes:
+`_notes-reticulum-fit.md`, `_notes-delivery-confirmation.md`.
 
 ## 1. The question
 
