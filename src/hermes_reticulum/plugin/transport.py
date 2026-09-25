@@ -202,8 +202,11 @@ class ReticulumTransport:
         self.reticulum = RNS.Reticulum(**reticulum_kwargs)
         self._log_instance_state()
 
+        # No identity argument: RNS 1.5.4's Reticulum exposes no identity to
+        # hand over (there is no `internal_identity`), and LXMRouter takes the
+        # delivery identity at register_delivery_identity below. This matches
+        # how core/bridge.py constructs the router in production.
         self.router = LXMF.LXMRouter(
-            identity=self.reticulum.internal_identity(),
             storagepath=str(self.storage_path),
         )
 
@@ -229,9 +232,19 @@ class ReticulumTransport:
         # messages (the adapter drains them into its queue).
         self.router.register_delivery_callback(self._on_router_delivery)
 
-        # RNS has no router start/stop API: the transport thread is the
-        # stack lifecycle.
-        RNS.Transport.start(self.reticulum)
+        # The transport thread is the stack lifecycle, and only the process
+        # that OWNS the RNS instance may start it. Attached to a shared
+        # instance the daemon already runs Transport, so starting it here
+        # re-registers its internal destinations and raises KeyError. The
+        # production bridge never starts it, for the same reason (spec
+        # section 11: do not fight the shared instance).
+        if not self.reticulum.is_connected_to_shared_instance:
+            RNS.Transport.start(self.reticulum)
+        else:
+            logger.info(
+                "Attached to a shared RNS instance; the daemon owns the "
+                "transport thread, so it is not started here"
+            )
 
         self._started = True
         logger.info(
