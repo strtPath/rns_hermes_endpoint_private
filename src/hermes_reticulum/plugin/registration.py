@@ -21,11 +21,34 @@ from gateway.platforms._shared import (
 logger = logging.getLogger("hermes_reticulum.registration")
 
 # (ENV_VAR, extra_key, converter) table consumed by seed_extra_from_env.
-# display_name is not in the table: env_enablement requires it and returns
-# None when it is absent (platform not minimally configured).
+# This must list every var the transport reads, or the README and the install
+# scripts document a shorter list than the code honours.
+#
+# display_name is deliberately NOT in the table: env_enablement requires it
+# and returns None when it is absent (the platform is then not minimally
+# configured and never registers).
 _ENV_TABLE = (
     ("RETICULUM_ANNOUNCE_INTERVAL", "announce_interval", float),
+    ("RETICULUM_STORAGE_PATH", "storage_path", None),
+    ("RETICULUM_RNS_CONFIG_PATH", "rns_config_path", None),
 )
+
+# The bridge's name for the storage path. Kept as a fallback so an operator
+# migrating an existing bridge .env does not silently get the plugin default
+# because the variable was spelled differently. RETICULUM_STORAGE_PATH wins
+# when both are set.
+_LEGACY_STORAGE_ENV = "RETICULUM_STORAGE"
+
+
+def _seed_extra() -> dict:
+    """``PlatformConfig.extra`` seeded from env, including the legacy key and
+    the home channel used for cron delivery to the mesh."""
+    seed = _seed_extra_from_env(_ENV_TABLE, home_env="RETICULUM_HOME_CHANNEL")
+    if "storage_path" not in seed:
+        legacy = (_get_scoped_secret(_LEGACY_STORAGE_ENV, "") or "").strip()
+        if legacy:
+            seed["storage_path"] = legacy
+    return seed
 
 
 def check_reticulum_requirements() -> bool:
@@ -66,7 +89,7 @@ def _env_enablement() -> dict | None:
         # No display name configured: the platform is not minimally set up,
         # matching the IRC example's env_enablement contract.
         return None
-    seed = _seed_extra_from_env(_ENV_TABLE, home_env="RETICULUM_HOME_CHANNEL")
+    seed = _seed_extra()
     return {"display_name": display, **seed}
 
 
