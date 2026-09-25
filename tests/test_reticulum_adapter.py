@@ -148,6 +148,66 @@ def test_fake_transport_is_still_injectable():
     assert adapter._transport_factory is FakeTransport
 
 
+# ── Capability flags: the streaming gate ──────────────────────────────────
+# The gateway asks the adapter whether it can EDIT a sent message before it
+# chooses a streaming transport:
+#
+#     _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+#
+# The default is True. LXMF cannot edit or retract anything, so leaving this
+# unset made the gateway stream the turn into the adapter: every delta left as
+# its own LXMF message, cut off mid-sentence, still carrying the streaming
+# cursor, and the clean final was suppressed because the consumer believed its
+# content had been delivered. Tool calls went the same way.
+#
+# These flags are facts about the platform, not preferences, so they are
+# asserted rather than left to config.
+
+
+def test_adapter_declares_it_cannot_edit_messages():
+    adapter = ReticulumPlatformAdapter(PlatformConfig())
+    assert adapter.SUPPORTS_MESSAGE_EDITING is False
+
+
+def test_adapter_declares_no_native_streaming():
+    """No cumulative-update message type exists in LXMF."""
+    adapter = ReticulumPlatformAdapter(PlatformConfig())
+    assert adapter.SUPPORTS_NATIVE_STREAMING is False
+
+
+def test_adapter_does_not_claim_the_gateway_default_for_editing():
+    """Guard the exact mechanism: the gateway's getattr default is True.
+
+    If the class attribute is ever removed, the gateway silently reverts to
+    treating this platform as editable. Asserting the attribute EXISTS (not
+    just that getattr is falsy) is the difference between catching that and
+    passing on a class that has quietly lost the flag.
+    """
+    assert "SUPPORTS_MESSAGE_EDITING" in vars(ReticulumPlatformAdapter), (
+        "SUPPORTS_MESSAGE_EDITING must be declared on the adapter class itself; "
+        "an inherited or absent attribute makes the gateway's "
+        "'getattr(adapter, \"SUPPORTS_MESSAGE_EDITING\", True)' fall back to True "
+        "and stream the turn into a platform that cannot edit."
+    )
+    assert getattr(ReticulumPlatformAdapter, "SUPPORTS_MESSAGE_EDITING", True) is False
+
+
+def test_adapter_does_not_override_edit_message_with_a_lying_stub():
+    """The inherited edit_message reports failure, which is the truth.
+
+    LXMF has no edit API. The base class returns
+    ``SendResult(success=False, error="Not supported")`` and callers fall back
+    to sending anew. An override that reported success would be worse than no
+    edit support at all: the stream consumer would finalize against a message
+    that never changed.
+    """
+    assert "edit_message" not in vars(ReticulumPlatformAdapter), (
+        "the adapter must not override edit_message: the inherited "
+        "implementation reports failure, and a success-reporting stub would "
+        "let the stream consumer finalize against an unedited message"
+    )
+
+
 # ── Inbound thread bridge (spec section 10) ────────────────────────────────
 
 

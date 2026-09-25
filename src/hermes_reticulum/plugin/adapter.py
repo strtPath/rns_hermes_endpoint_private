@@ -110,7 +110,23 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
     Capability flags follow spec section 2; ``supports_status_text`` and
     ``REQUIRES_EDIT_FINALIZE`` intentionally stay at their inherited
     ``False`` defaults (no typing indicator, no edit support on LXMF).
+
+    ``SUPPORTS_MESSAGE_EDITING`` is ``False`` because LXMF has no edit API: a
+    sent message cannot be altered or retracted. This is a fact about the
+    platform, not a preference. With it unset the gateway assumed editable
+    (``getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)``) and streamed the
+    turn into the adapter, so every delta went out as its own LXMF message,
+    cut off mid-sentence and still carrying the streaming cursor.
     """
+
+    # LXMF cannot edit or retract a message once sent. Declaring this stops the
+    # gateway choosing a streaming transport for this platform.
+    SUPPORTS_MESSAGE_EDITING = False
+    # No native streaming transport either (no cumulative-update message type).
+    SUPPORTS_NATIVE_STREAMING = False
+    # Do NOT declare edit_message(): there is nothing to edit. A stub that
+    # silently succeeded would let the consumer believe its edits landed.
+    supports_status_text = False
 
     # The mesh can start a fresh turn after a previous one ended.
     supports_async_delivery = True
