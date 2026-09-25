@@ -25,22 +25,19 @@ import contextlib
 import datetime
 import inspect
 import logging
-import threading
 import uuid
-from typing import Any, Dict, Optional
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
+from gateway.config import Platform
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.config import Platform
 
+from hermes_reticulum.plugin import delivery
 from hermes_reticulum.plugin.identity import (
     IdentityMap,
     is_valid_destination,
-    is_parseable_inbound,
 )
-from hermes_reticulum.plugin import delivery
 from hermes_reticulum.plugin.transport import ReticulumTransport
 
 logger = logging.getLogger("hermes_reticulum.adapter")
@@ -172,7 +169,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # Per-send tag for the ``[p<N> i/N]`` chunk prefixes. Monotonic for the
         # life of the adapter so a recipient can spot a dropped tail. Kept
         # across reconnects alongside the pending set, for the same reason.
-        self._chunk_tag: Optional[int] = None
+        self._chunk_tag: int | None = None
 
         # Inbound handler slot. Declared here rather than assumed from the base
         # class: see deliver_inbound() for why the adapter owns this hop.
@@ -182,7 +179,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # RNS thread and are shuttled to the asyncio loop through a queue
         # drained by a task.
         self._queue = None
-        self._drain_task: Optional[asyncio.Task] = None
+        self._drain_task: asyncio.Task | None = None
 
         # Identity map (spec section 4): chat_id is the destination hash
         # itself; the adapter owns the hash → display-name map.
@@ -195,7 +192,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         return "Reticulum"
 
     @property
-    def _names(self) -> Dict[str, str]:
+    def _names(self) -> dict[str, str]:
         # Backward-compatible view of the identity map so existing tests
         # (and future code) can read/write ``adapter._names[hash]`` directly.
         return self._identity._names
@@ -363,8 +360,8 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """Send text to a destination hash.
 
@@ -428,7 +425,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # one unconfirmed message rather than N fragments.
         return self._seam_acceptance(chat_id, content)
 
-    def _chunk_content(self, content: str) -> Optional[list]:
+    def _chunk_content(self, content: str) -> list | None:
         """Split outbound content for transmission.
 
         Returns the parts (a single-element list when the content fits), an
@@ -469,7 +466,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         state: int,
-        reason: Optional[str] = None,
+        reason: str | None = None,
     ) -> SendResult:
         """Map one LXMF delivery-state callback into a ``SendResult``.
 
@@ -483,7 +480,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         )
 
     @property
-    def delivery_stats(self) -> Dict[str, int]:
+    def delivery_stats(self) -> dict[str, int]:
         """Counters for the propagation pending set (spec section 6): the
         unconfirmed set plus delivered/failed tallies. This is the surface a
         user inspects to answer "did that message actually go"."""
@@ -495,7 +492,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
 
     # ── Chat info ────────────────────────────────────────────────────────
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Name and type for a destination hash. Never raises; unknown
         hashes get a fallback built from the hash itself (spec section 10).
         """
@@ -505,7 +502,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
 
     # ── Access control helpers (spec section 7) ─────────────────────────
 
-    def _allowlist(self) -> Optional[list]:
+    def _allowlist(self) -> list | None:
         """Read the allowlist from the platform gate env (multiplex-safe).
 
         Returns None when the allowlist is unset/empty (allow-all or no

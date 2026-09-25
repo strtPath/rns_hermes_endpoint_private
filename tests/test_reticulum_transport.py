@@ -227,12 +227,14 @@ def fake_rns(monkeypatch):
 
     fake_rns_mod = types.ModuleType("RNS")
     fake_rns_mod.__version__ = "1.5.4"
-    _make_ret = lambda: mock.Mock(
-        is_shared_instance=True,
-        is_connected_to_shared_instance=False,
-        is_standalone_instance=False,
-        internal_identity=mock.Mock(return_value=None),
-    )
+
+    def _make_ret():
+        return mock.Mock(
+            is_shared_instance=True,
+            is_connected_to_shared_instance=False,
+            is_standalone_instance=False,
+            internal_identity=mock.Mock(return_value=None),
+        )
     fake_rns_mod.Reticulum = mock.Mock(side_effect=_make_ret)
     fake_rns_mod.Destination = _FakeDestination
     fake_rns_mod.Transport = _FakeTransport
@@ -259,7 +261,6 @@ def fake_rns(monkeypatch):
 
 class TestSendTo:
     def _started_transport(self, fake_rns, tmp_path):
-        holder = FakeTransportHolder
         t = transport_module.ReticulumTransport(
             storage_path=str(tmp_path / "storage")
         )

@@ -126,7 +126,44 @@ else:
     _shared_stub.get_scoped_secret = (
         lambda name, default=None, **kw: os.environ.get(name, default)
     )
-    _shared_stub.seed_extra_from_env = lambda *a, **kw: {}
+
+    def _stub_seed_extra_from_env(spec, *, home_env=None, home_default=""):
+        """Mirror the real ``seed_extra_from_env`` closely enough to test.
+
+        The real one walks the (ENV_VAR, extra_key, conv) table, skips blank
+        or unconvertible values, and seeds ``home_channel`` from ``home_env``.
+        Returning a bare ``{}`` (the previous stub) made every env-seeding
+        assertion untestable on CI: the values were read by the test but never
+        seeded, so the suite was green locally and red in CI for reasons that
+        had nothing to do with the code under test.
+        """
+        seed = {}
+        for env_var, key, conv in spec:
+            raw = str(os.environ.get(env_var, "") or "").strip()
+            if not raw:
+                continue
+            try:
+                seed[key] = conv(raw) if conv else raw
+            except ValueError:
+                continue
+        if home_env:
+            home = str(os.environ.get(home_env, "") or "").strip() or home_default
+            if home:
+                seed["home_channel"] = {
+                    "chat_id": home,
+                    "name": os.environ.get(f"{home_env}_NAME", "Home"),
+                }
+        return seed
+
+    _shared_stub.seed_extra_from_env = _stub_seed_extra_from_env
+
+    # The adapter reads its allowlist through platform_gate_env, not
+    # get_scoped_secret. Without this the import fails, _allowlist() returns
+    # None, and the allowlist silently stops gating — a stub gap that makes
+    # the suite green in CI while the gate is not exercised at all.
+    _shared_stub.platform_gate_env = (
+        lambda name, default="": str(os.environ.get(name, default) or "").strip()
+    )
 
     class _SendResult:
         def __init__(self, success, error=None, retryable=False, error_kind=None):

@@ -15,6 +15,8 @@ import logging
 
 from gateway.platforms._shared import (
     get_scoped_secret as _get_scoped_secret,
+)
+from gateway.platforms._shared import (
     seed_extra_from_env as _seed_extra_from_env,
 )
 

@@ -23,8 +23,8 @@ initiative (spec section 16 invariant).
 
 import logging
 import threading
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 from gateway.platforms.base import SendResult
 

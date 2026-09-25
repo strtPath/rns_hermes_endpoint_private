@@ -30,14 +30,15 @@ profile's value).
 import logging
 import math
 import os
-import time
 import threading
-from typing import Any, Callable, Optional
+import time
+from collections.abc import Callable
+from typing import Any
 
-import RNS
 import LXMF
-
+import RNS
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+
 from hermes_reticulum.utils import expand_path
 
 logger = logging.getLogger("hermes_reticulum.transport")
@@ -96,10 +97,10 @@ class ReticulumTransport:
         self,
         display_name: str = "Hermes for Reticulum",
         announce_interval_min: Any = DEFAULT_ANNOUNCE_INTERVAL_MIN,
-        storage_path: Optional[str] = None,
-        rns_config_path: Optional[str] = None,
-        require_shared_instance: Optional[bool] = None,
-        extra: Optional[dict] = None,
+        storage_path: str | None = None,
+        rns_config_path: str | None = None,
+        require_shared_instance: bool | None = None,
+        extra: dict | None = None,
     ):
         """Build the transport. ``extra`` (the adapter's PlatformConfig.extra)
         takes precedence; missing settings fall back to the scoped env
@@ -142,17 +143,17 @@ class ReticulumTransport:
             else bool(extra.get("require_shared_instance", False))
         )
 
-        self.reticulum: Optional[RNS.Reticulum] = None
-        self.router: Optional[LXMF.LXMRouter] = None
-        self.identity: Optional[RNS.Identity] = None
-        self.destination: Optional[RNS.Destination] = None
+        self.reticulum: RNS.Reticulum | None = None
+        self.router: LXMF.LXMRouter | None = None
+        self.identity: RNS.Identity | None = None
+        self.destination: RNS.Destination | None = None
         self._started = False
 
         # Per-message delivery/failure callbacks registered through the
         # protocol. LXMF fires the per-message callback with the message
         # itself, so we wrap each registration.
-        self._delivery_cb: Optional[Callable] = None
-        self._failed_cb: Optional[Callable] = None
+        self._delivery_cb: Callable | None = None
+        self._failed_cb: Callable | None = None
 
     # ── Display name ───────────────────────────────────────────────────
 

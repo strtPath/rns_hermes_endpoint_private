@@ -20,7 +20,6 @@ Covers:
 - Empty / degenerate input -> log and send nothing (no zero-length packet).
 """
 
-import asyncio
 import os
 import sys
 
@@ -28,14 +27,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
 
-from gateway.platforms.base import SendResult
-
+from hermes_reticulum.plugin import delivery
 from hermes_reticulum.plugin.adapter import (
     FakeTransport,
     ReticulumPlatformAdapter,
 )
-from hermes_reticulum.plugin import delivery
-
 
 # ── Fixtures ───────────────────────────────────────────────────────────────
 

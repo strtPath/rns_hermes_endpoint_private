@@ -18,7 +18,6 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
-
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from hermes_reticulum.plugin.adapter import (
@@ -143,7 +142,7 @@ def test_default_transport_factory_is_the_real_transport():
 
 def test_fake_transport_is_still_injectable():
     """Tests pass the fake explicitly; that seam must keep working."""
-    from hermes_reticulum.plugin.adapter import ReticulumPlatformAdapter, FakeTransport
+    from hermes_reticulum.plugin.adapter import FakeTransport, ReticulumPlatformAdapter
 
     adapter = ReticulumPlatformAdapter(PlatformConfig(), transport_factory=FakeTransport)
     assert adapter._transport_factory is FakeTransport

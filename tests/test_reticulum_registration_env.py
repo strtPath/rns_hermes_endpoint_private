@@ -6,7 +6,6 @@ variable names are used instead, and that a missing display name disables the
 platform entirely.
 """
 
-import os
 
 import pytest
 

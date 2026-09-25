@@ -8,7 +8,6 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import pytest
 
 
 # Use a placeholder 32-hex hash — never a real identity.
@@ -309,8 +308,9 @@ def test_record_announce_invalid_hash_not_stored():
     from hermes_reticulum.plugin.identity import IdentityMap, record_announce
     m = IdentityMap()
     app_data = _synthetic_app_data("some-name")
-    name = record_announce(m, "too-short", app_data)
+    result = record_announce(m, "too-short", app_data)
     # Name decoded but hash invalid → not stored.
+    assert result is not None, "the call should return the decoded name"
     assert m.get_name("too-short") == "too-short"  # fallback, not stored
 
 
