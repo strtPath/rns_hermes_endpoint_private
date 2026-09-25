@@ -65,8 +65,24 @@ class Transport(Protocol):
         """
         ...
 
-    def register_delivery_callback(self, callback) -> None:
-        """Register ``callback(receipt)`` fired on delivery state changes."""
+    def register_inbound_callback(self, callback) -> None:
+        """Register ``callback(source_hash, payload)`` for messages from peers.
+
+        Fired when a message is addressed to US, on the transport's own
+        thread. This is inbound traffic only. It is deliberately a different
+        slot from the outbound outcome callback: one slot serving both ran the
+        inbound parser over our own outgoing message and echoed every reply
+        back into the inbound queue (see the 2026-09-25 findings doc).
+        """
+        ...
+
+    def register_outbound_callback(self, callback) -> None:
+        """Register ``callback(payload, state)`` for our own sent messages.
+
+        Fired when a message WE sent reaches a terminal state, so the adapter
+        can report delivery honestly instead of treating acceptance as
+        delivery. Distinct from inbound for the reason above.
+        """
         ...
 
     def register_failed_callback(self, callback) -> None:
@@ -93,7 +109,10 @@ class FakeTransport:
         self.started = False
         self.stopped = False
         self.sent = []
-        self._delivery_cb = None
+        # Two slots, mirroring the real transport. Collapsing them is what
+        # echoed every reply back in as inbound traffic.
+        self._inbound_cb = None
+        self._outbound_cb = None
         self._failed_cb = None
 
     def send_to(self, destination_hash: str, payload: str) -> bool:
@@ -103,11 +122,23 @@ class FakeTransport:
     def last_send_was_direct(self) -> bool:
         return True
 
-    def register_delivery_callback(self, callback):
-        self._delivery_cb = callback
+    def register_inbound_callback(self, callback):
+        self._inbound_cb = callback
+
+    def register_outbound_callback(self, callback):
+        self._outbound_cb = callback
 
     def register_failed_callback(self, callback):
         self._failed_cb = callback
+
+    # Test affordances: drive the slots the way the real transport would.
+    def deliver_inbound(self, source_hash: str, payload: str):
+        if self._inbound_cb is not None:
+            self._inbound_cb(source_hash, payload)
+
+    def report_outbound(self, payload: str, state: int):
+        if self._outbound_cb is not None:
+            self._outbound_cb(payload, state)
 
     def start(self) -> None:
         self.started = True
@@ -199,6 +230,10 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # is needed. The gateway's ledger is wrong in both directions on a
         # mesh; this set is the record that stays true (spec section 16).
         self._pending = delivery.PropagationPendingSet()
+        # The destination of the most recent send. Outcome callbacks fire with
+        # the message, not the chat id, so this is what lets a receipt be
+        # matched back to the peer it was addressed to.
+        self._last_outbound_chat: str | None = None
 
         # Per-send tag for the ``[p<N> i/N]`` chunk prefixes. Monotonic for the
         # life of the adapter so a recipient can spot a dropped tail. Kept
@@ -250,12 +285,22 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
                 await self.disconnect()
 
         transport = self._transport_factory()
-        # RNS callbacks arrive from the transport thread; both push events
-        # onto the asyncio queue for the drain task (spec section 5).
+        # RNS callbacks arrive from the transport thread; push events onto the
+        # asyncio queue for the drain task (spec section 5). Two separate
+        # registrations: inbound (a peer messaged us) and outbound (a message
+        # we sent reached a terminal state). Sharing one slot made every reply
+        # we delivered re-enter as if a peer had sent it.
         self._queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
-        transport.register_delivery_callback(
-            lambda receipt: loop.call_soon_threadsafe(self._queue.put_nowait, receipt)
+        transport.register_inbound_callback(
+            lambda source_hash, payload: loop.call_soon_threadsafe(
+                self._queue.put_nowait, (source_hash, payload)
+            )
+        )
+        transport.register_outbound_callback(
+            lambda payload, state: loop.call_soon_threadsafe(
+                self._queue.put_nowait, ("outbound", payload, state)
+            )
         )
         transport.register_failed_callback(
             lambda reason: loop.call_soon_threadsafe(
@@ -296,7 +341,16 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             while True:
                 event = await self._queue.get()
                 try:
-                    await self._dispatch_inbound(event)
+                    if (
+                        isinstance(event, tuple)
+                        and len(event) == 3
+                        and event[0] == "outbound"
+                    ):
+                        # A message WE sent reached a terminal state. Not
+                        # inbound: no source peer, nothing to dispatch.
+                        self._handle_outbound_outcome(event[1], event[2])
+                    else:
+                        await self._dispatch_inbound(event)
                 except Exception as e:
                     # Never let one malformed inbound kill the drain loop
                     # (spec section 14).
@@ -441,6 +495,9 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error="empty message", error_kind="bad_format"
             )
+        # Remember the peer so an asynchronous delivery receipt can be matched
+        # back to it (outcome callbacks carry the message, not the chat id).
+        self._last_outbound_chat = chat_id
         for index, part in enumerate(parts):
             if not self._transport.send_to(chat_id, part):
                 # No path / no interface: transient, let the base-class retry
@@ -513,6 +570,31 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
     def _is_valid_hash(destination_hash: str) -> bool:
         """A destination is 32 hex characters (LXMF hash). Kept for compat."""
         return is_valid_destination(destination_hash)
+
+    def _handle_outbound_outcome(self, payload: str, state: int) -> None:
+        """Record the terminal state of a message WE sent.
+
+        ``payload`` is the text we handed to the transport; ``state`` is the
+        integer LXMF state. The transport passes the VALUE, not a name: LXMF
+        exposes state constants but no name function of its own, so the
+        mapping lives in :mod:`hermes_reticulum.plugin.delivery`.
+
+        This resolves the pending entry so a send can be reported as delivered
+        rather than merely accepted. Never raises: it runs on the drain task
+        and one bad receipt must not stop the loop.
+        """
+        try:
+            state_int = state if isinstance(state, int) else delivery.state_from_name(state)
+            result = self._record_receipt(
+                self._last_outbound_chat or "", payload, state_int, None
+            )
+            logger.info(
+                "Reticulum: outbound message reached %s (%s)",
+                delivery.state_name(state_int),
+                "delivered" if result.success else "not delivered",
+            )
+        except Exception as e:
+            logger.warning("Reticulum: could not record outbound outcome: %s", e)
 
     # ── Delivery mapping (spec section 6) ───────────────────────────────
 

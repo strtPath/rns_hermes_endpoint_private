@@ -224,6 +224,34 @@ def _state_name(state: int) -> str:
     return _STATE_NAMES.get(state, f"state_{state:02x}")
 
 
+def state_name(state) -> str:
+    """Public form of :func:`_state_name` for callers outside this module.
+
+    LXMF exposes state constants but no name function of its own, so this
+    module owns the mapping both ways (:func:`state_from_name` is the inverse).
+    A non-integer state yields ``state_none`` rather than raising.
+    """
+    if not isinstance(state, int):
+        return "state_none"
+    return _state_name(state)
+
+
+def state_from_name(name: str) -> int:
+    """Map an LXMF state NAME string back to its value.
+
+    The transport reports outcomes as names (``LXMF.LXMessage.state_name``),
+    so the adapter needs the inverse of :func:`_state_name` to reach
+    :func:`map_receipt`. An unknown name maps to ``STATE_FAILED``: a state we
+    cannot classify must not be reported as delivered.
+    """
+    if not isinstance(name, str):
+        return STATE_FAILED
+    for value, label in _STATE_NAMES.items():
+        if label == name.upper():
+            return value
+    return STATE_FAILED
+
+
 _STATE_OUTCOMES = {
     STATE_DELIVERED: _OUTCOME_DELIVERED,
     STATE_SENT: _OUTCOME_PROPAGATED,

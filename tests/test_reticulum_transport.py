@@ -122,9 +122,17 @@ class TestConstruction:
         t = transport_module.ReticulumTransport.__new__(
             transport_module.ReticulumTransport
         )
-        # Protocol is structural: check the required callables exist.
-        for method in ("send_to", "register_delivery_callback",
-                       "register_failed_callback", "start", "stop"):
+        # Protocol is structural: check the required callables exist. Inbound
+        # and outbound are separate slots by design (the collision between them
+        # echoed every reply back in as inbound traffic).
+        for method in (
+            "send_to",
+            "register_inbound_callback",
+            "register_outbound_callback",
+            "register_failed_callback",
+            "start",
+            "stop",
+        ):
             assert callable(getattr(type(t), method))
 
 
@@ -340,9 +348,15 @@ class TestSendTo:
         fake_rns.Identity.recall.return_value = fake_identity
         t = self._started_transport(fake_rns, tmp_path)
 
-        received = []
+        inbound = []
+        outbound = []
         failed = []
-        t.register_delivery_callback(lambda receipt: received.append(receipt))
+        t.register_inbound_callback(
+            lambda source, payload: inbound.append((source, payload))
+        )
+        t.register_outbound_callback(
+            lambda payload, state: outbound.append((payload, state))
+        )
         t.register_failed_callback(lambda reason: failed.append(reason))
 
         assert t.send_to(FAKE_HASH, "hello mesh") is True
@@ -354,13 +368,27 @@ class TestSendTo:
         assert callable(msg.delivery_callback)
         assert callable(msg.failed_callback)
 
-        # Simulate the RNS thread firing the per-message callbacks.
+        # The per-message callback reports OUR OWN message's fate, so it must
+        # land in the outbound slot. Routing it to the inbound handler is the
+        # defect that echoed every reply back in as peer traffic.
+        msg.state = _FakeLXMessage.DELIVERED
+        msg.delivery_callback(msg)
+        assert outbound == [("hello mesh", _FakeLXMessage.DELIVERED)]
+        assert inbound == [], (
+            "an outgoing message must never reach the inbound slot; that is "
+            "the echo defect (2026-09-25 findings)"
+        )
+
+        # A genuine inbound message arrives on the ROUTER callback instead.
         class _FakeInbound:
             source_hash = bytes.fromhex(FAKE_HASH2)
+
             def content_as_string(self):
                 return "ping"
-        msg.delivery_callback(_FakeInbound())
-        assert received == [(FAKE_HASH2, "ping")]
+
+        t._on_router_delivery(_FakeInbound())
+        assert inbound == [(FAKE_HASH2, "ping")]
+        assert len(outbound) == 1, "inbound must not add an outbound outcome"
 
         msg.failed_callback(mock.Mock(state=3))
         assert len(failed) == 1
@@ -522,7 +550,11 @@ class TestPropagationPolicy:
         assert t.router.autopeer is True
         assert t.router.outbound_propagation_node is None
 
-    def test_unset_defaults_to_auto(self, fake_rns, tmp_path):
+    def test_unset_defaults_to_auto(self, fake_rns, tmp_path, monkeypatch):
+        # Isolate the env: a real machine running the bridge has this set in
+        # .env, and a config reader that falls through to the live environment
+        # would flip this test's answer without any code change.
+        monkeypatch.delenv("RETICULUM_PROPAGATION_NODE", raising=False)
         t = self._started_transport(fake_rns, tmp_path)
         assert t.propagation_mode == "auto"
 

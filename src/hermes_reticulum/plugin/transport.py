@@ -39,6 +39,7 @@ import LXMF
 import RNS
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 
+from hermes_reticulum.plugin import delivery
 from hermes_reticulum.utils import expand_path
 
 logger = logging.getLogger("hermes_reticulum.transport")
@@ -204,7 +205,8 @@ class ReticulumTransport:
         # Per-message delivery/failure callbacks registered through the
         # protocol. LXMF fires the per-message callback with the message
         # itself, so we wrap each registration.
-        self._delivery_cb: Callable | None = None
+        self._inbound_cb: Callable | None = None
+        self._outbound_cb: Callable | None = None
         self._failed_cb: Callable | None = None
 
     # ── Display name ───────────────────────────────────────────────────
@@ -562,11 +564,11 @@ class ReticulumTransport:
             )
             # Per-message callbacks (they live on LXMessage, not the router).
             # Register BEFORE dispatch so an immediate failure is not missed.
-            # They fire on the RNS thread; the adapter hops threads.
-            if self._delivery_cb is not None:
-                lxm.register_delivery_callback(
-                    lambda msg, _cb=self._delivery_cb: _cb(self._extract_inbound(msg))
-                )
+            # These fire on the RNS thread and report OUR OWN message's fate,
+            # so they go to the outbound slot -- NOT the inbound one, which
+            # would feed our outgoing message back in as peer traffic.
+            if self._outbound_cb is not None:
+                lxm.register_delivery_callback(self._on_message_outcome)
             if self._failed_cb is not None:
                 lxm.register_failed_callback(
                     lambda msg, _cb=self._failed_cb: _cb(self._extract_reason(msg))
@@ -655,20 +657,49 @@ class ReticulumTransport:
             return (None, None)
 
     @staticmethod
+    def _extract_payload(message) -> str:
+        """The text of a message WE sent (used for outcome reporting)."""
+        content = getattr(message, "content", None)
+        if content is None:
+            return ""
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+        return str(content)
+
+    @staticmethod
     def _extract_reason(message) -> str:
+        """Human-readable failure reason: the STATE NAME, from the repo's map.
+
+        LXMF exposes state constants but no name function, so the mapping
+        lives in ``plugin.delivery`` alongside the state values. Falling back
+        to the raw integer keeps a malformed message from raising here.
+        """
         state = getattr(message, "state", None)
-        name = getattr(message, "state", "unknown")
         try:
-            return str(LXMF.LXMessage.state_name(state))
+            return delivery.state_name(state)
         except Exception:
-            return str(name)
+            return str(state)
 
     # ── Protocol callback registration ─────────────────────────────────
 
-    def register_delivery_callback(self, callback) -> None:
-        """Store the adapter's callback; fired from LXMessage delivery
-        callbacks (RNS thread) with the inbound (source_hash, text)."""
-        self._delivery_cb = callback
+    def register_inbound_callback(self, callback) -> None:
+        """Store the adapter's inbound callback.
+
+        Fired from the router's delivery callback (RNS thread) with
+        ``(source_hash, payload)`` when a message is addressed to US.
+        """
+        self._inbound_cb = callback
+
+    def register_outbound_callback(self, callback) -> None:
+        """Store the adapter's outbound-outcome callback.
+
+        Fired from a per-message LXMessage delivery callback (RNS thread) with
+        ``(payload, state_name)`` for a message WE sent. Separate from inbound
+        because the two carry different things: inbound has a source hash,
+        outbound has a terminal state. One slot serving both ran the inbound
+        parser over our own outgoing message (2026-09-25 findings).
+        """
+        self._outbound_cb = callback
 
     def register_failed_callback(self, callback) -> None:
         """Store the adapter's callback; fired from LXMessage failed
@@ -680,9 +711,29 @@ class ReticulumTransport:
     def _on_router_delivery(self, message) -> None:
         """Router-level delivery callback for messages that reach our
         identity (runs on the RNS thread). Forwards to the stored
-        delivery callback; never raises into RNS internals."""
+        inbound callback; never raises into RNS internals."""
         try:
-            if self._delivery_cb is not None:
-                self._delivery_cb(self._extract_inbound(message))
+            if self._inbound_cb is not None:
+                self._inbound_cb(*self._extract_inbound(message))
         except Exception as e:
-            logger.error("Delivery callback error: %s", e)
+            logger.error("Inbound callback error: %s", e)
+
+    def _on_message_outcome(self, message) -> None:
+        """Per-message callback for a message WE sent (RNS thread).
+
+        Reports the terminal state to the outbound slot so a caller can tell
+        delivery from mere acceptance, and so a receipt can be matched back to
+        the peer it was addressed to.
+
+        Passes the INTEGER state: LXMF's LXMessage has no state-name method
+        (only the constants), so the adapter maps it with the repo's own
+        ``delivery.state_from_name`` counterpart. Never raises into RNS
+        internals.
+        """
+        try:
+            if self._outbound_cb is not None:
+                self._outbound_cb(
+                    self._extract_payload(message), getattr(message, "state", None)
+                )
+        except Exception as e:
+            logger.error("Outbound outcome callback error: %s", e)

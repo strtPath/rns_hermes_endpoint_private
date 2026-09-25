@@ -317,12 +317,12 @@ async def test_foreign_callback_reaches_handle_message_exactly_once(monkeypatch)
     assert await adapter.connect() is True
 
     # connect() installed the delivery callback on the fake transport and
-    # stashed it in FakeTransport._delivery_cb; fire it from a foreign
+    # stashed it in FakeTransport._inbound_cb; fire it from a foreign
     # thread to simulate the RNS callback thread.
     def fire():
-        cb = factory.transport._delivery_cb
+        cb = factory.transport._inbound_cb
         if cb:
-            cb(("0" * 32, "hello mesh"))
+            cb("0" * 32, "hello mesh")
 
     t = threading.Thread(target=fire)
     t.start()
@@ -450,7 +450,7 @@ async def test_allowlisted_peer_is_admitted(monkeypatch):
     adapter.set_message_handler(recorder)
     assert await adapter.connect() is True
 
-    factory.transport._delivery_cb(("a" * 32, "let me in"))
+    factory.transport._inbound_cb("a" * 32, "let me in")
     deadline = time.monotonic() + 5.0
     while not recorder.events and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
@@ -468,7 +468,7 @@ async def test_unlisted_peer_is_dropped_without_a_reply(monkeypatch):
     adapter.set_message_handler(recorder)
     assert await adapter.connect() is True
 
-    factory.transport._delivery_cb(("b" * 32, "not on the list"))
+    factory.transport._inbound_cb("b" * 32, "not on the list")
     await asyncio.sleep(0.5)
     await adapter.disconnect()
     assert recorder.events == []
@@ -487,7 +487,7 @@ async def test_allowlist_matching_is_case_and_colon_tolerant(monkeypatch):
     adapter.set_message_handler(recorder)
     assert await adapter.connect() is True
 
-    factory.transport._delivery_cb((("ab" * 16).lower(), "hi"))
+    factory.transport._inbound_cb(("ab" * 16).lower(), "hi")
     deadline = time.monotonic() + 5.0
     while not recorder.events and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
