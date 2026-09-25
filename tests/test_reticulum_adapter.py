@@ -126,6 +126,29 @@ async def test_is_reconnect_reinitialises_from_scratch():
     await adapter.disconnect()
 
 
+# ── Default transport must be the REAL one ────────────────────────────────
+# The gateway constructs the adapter with no transport_factory, so the
+# default decides what runs in production. Defaulting to FakeTransport
+# silently wires production to a no-op: the adapter logs "connected", RNS is
+# never imported, nothing is sent, and nothing looks wrong.
+
+
+def test_default_transport_factory_is_the_real_transport():
+    from hermes_reticulum.plugin.adapter import ReticulumPlatformAdapter
+    from hermes_reticulum.plugin.transport import ReticulumTransport
+
+    adapter = ReticulumPlatformAdapter(PlatformConfig())
+    assert adapter._transport_factory is ReticulumTransport
+
+
+def test_fake_transport_is_still_injectable():
+    """Tests pass the fake explicitly; that seam must keep working."""
+    from hermes_reticulum.plugin.adapter import ReticulumPlatformAdapter, FakeTransport
+
+    adapter = ReticulumPlatformAdapter(PlatformConfig(), transport_factory=FakeTransport)
+    assert adapter._transport_factory is FakeTransport
+
+
 # ── Inbound thread bridge (spec section 10) ────────────────────────────────
 
 

@@ -41,6 +41,7 @@ from hermes_reticulum.plugin.identity import (
     is_parseable_inbound,
 )
 from hermes_reticulum.plugin import delivery
+from hermes_reticulum.plugin.transport import ReticulumTransport
 
 logger = logging.getLogger("hermes_reticulum.adapter")
 
@@ -151,11 +152,12 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         self.announce_interval = float(raw_interval)
         self.home_channel = extra.get("home_channel")
 
-        # The transport is a seam: a real LXMF-backed implementation lands in
-        # a later ticket. Until then the default is the in-repo fake so the
-        # adapter is fully exercisable without a mesh. ``transport_factory``
-        # lets tests (and the later real transport) substitute their own.
-        self._transport_factory = transport_factory or FakeTransport
+        # The transport is a seam, but the DEFAULT must be the real one: the
+        # gateway constructs this adapter with no transport_factory, so
+        # defaulting to FakeTransport silently wires production to a no-op
+        # (adapter logs "connected", RNS is never imported, nothing is sent).
+        # FakeTransport stays available for tests, which pass it explicitly.
+        self._transport_factory = transport_factory or ReticulumTransport
         self._transport = None
 
         # Propagation pending set (spec section 6): the authoritative delivery
