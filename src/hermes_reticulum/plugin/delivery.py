@@ -303,3 +303,36 @@ def map_chunk_overflow(total_bytes: int) -> SendResult:
         retryable=False,
         error_kind=_ERR_TOO_LONG,
     )
+
+
+def chunk_for_send(text: str, tag: str) -> list:
+    """Split ``text`` for transmission, returning ready-to-send parts.
+
+    This is the seam that joins the two halves of the ported chunking logic,
+    which are useless apart: :func:`_utf8_codepoint_chunks` splits on codepoint
+    boundaries, :func:`sequence_chunks` adds the ``[tag i/N]`` prefixes.
+
+    The prefix must be budgeted BEFORE splitting, not after. Splitting at the
+    full budget and letting ``sequence_chunks`` re-truncate silently drops the
+    bytes between the two cut points: the parts still look well-formed and each
+    fits the budget, but the reassembled text is shorter than the original.
+
+    That is why this predicts the prefix width up front and splits against
+    ``budget - prefix``. The part count feeds back into the prefix width, so a
+    first pass at the widest plausible prefix (``i/N`` with two-digit numbers)
+    decides the split, and the exact prefix is applied afterwards. Parts then
+    fit the budget with no re-truncation and no loss.
+    """
+    if not text:
+        return []
+    # Widest prefix this send could need: longest tag, two-digit index/total.
+    # Overestimating only makes the parts slightly shorter; underestimating
+    # would force sequence_chunks to truncate, which is the lossy path.
+    reserve = len(("[%s 99/99] " % tag).encode("utf-8"))
+    budget = _BLOCK_CONTENT_BUDGET - reserve
+    if budget <= 0:
+        return []
+    parts = _utf8_codepoint_chunks(text, budget)
+    if len(parts) > 1:
+        parts = sequence_chunks(parts, tag)
+    return parts

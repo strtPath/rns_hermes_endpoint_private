@@ -334,3 +334,49 @@ async def test_empty_content_sends_nothing():
     # Nothing reached the transport: no zero-length packet.
     assert transport.sent == []
     await adapter.disconnect()
+
+
+# ── chunk_for_send: the seam joining splitter to prefixer ─────────────────
+# These are the tests that were missing. The pieces existed and were tested
+# individually, but nothing joined them to adapter.send(), so a long reply
+# went out as one oversized packet. A test per piece cannot catch that.
+
+
+def test_chunk_for_send_short_message_unchanged():
+    assert delivery.chunk_for_send("hello", "p1") == ["hello"]
+
+
+def test_chunk_for_send_splits_long_message():
+    text = "a" * 2000
+    parts = delivery.chunk_for_send(text, "p1")
+    assert len(parts) > 1
+    # Every part must fit the block budget INCLUDING its prefix.
+    assert all(
+        len(p.encode("utf-8")) <= delivery._BLOCK_CONTENT_BUDGET for p in parts
+    )
+
+
+def test_chunk_for_send_parts_reassemble_to_original():
+    """Prefixes are overhead, not loss: stripping them must give the original."""
+    text = "the quick brown fox " * 100
+    parts = delivery.chunk_for_send(text, "p1")
+    assert len(parts) > 1
+    stripped = []
+    for p in parts:
+        assert p.startswith("[p1 ")
+        stripped.append(p.split("] ", 1)[1])
+    assert "".join(stripped) == text
+
+
+def test_chunk_for_send_multibyte_survives():
+    text = "héllo wörld 🎉 " * 200
+    parts = delivery.chunk_for_send(text, "p1")
+    assert len(parts) > 1
+    assert all("\ufffd" not in p for p in parts)
+    assert all(
+        len(p.encode("utf-8")) <= delivery._BLOCK_CONTENT_BUDGET for p in parts
+    )
+
+
+def test_chunk_for_send_empty_returns_no_parts():
+    assert delivery.chunk_for_send("", "p1") == []

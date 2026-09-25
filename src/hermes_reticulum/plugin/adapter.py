@@ -166,6 +166,11 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # mesh; this set is the record that stays true (spec section 16).
         self._pending = delivery.PropagationPendingSet()
 
+        # Per-send tag for the ``[p<N> i/N]`` chunk prefixes. Monotonic for the
+        # life of the adapter so a recipient can spot a dropped tail. Kept
+        # across reconnects alongside the pending set, for the same reason.
+        self._chunk_tag: Optional[int] = None
+
         # Thread bridge (spec section 5): transport callbacks arrive on the
         # RNS thread and are shuttled to the asyncio loop through a queue
         # drained by a task.
@@ -332,10 +337,12 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send text to a destination hash.
 
-        Foundation stage: the transport seam is exercised, but the receipt
-        mapping (DELIVERED/FAILED/SENT, spec section 6) waits on the real
-        transport, so every failure here returns a well-formed failing
-        ``SendResult`` — never a raised exception.
+        The content is split before transmission: a reply that fits goes out as
+        a single packet unchanged, a longer one goes out as several parts
+        prefixed ``[p<N> i/N]`` (spec section 14). Every failure returns a
+        well-formed failing ``SendResult`` — never a raised exception. On
+        success the send is recorded in the propagation pending set, because
+        node acceptance is not proof of delivery (spec section 6).
         """
         if not self.is_connected or self._transport is None:
             return SendResult(
@@ -357,22 +364,52 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
                 retryable=False,
                 error_kind="bad_format",
             )
-        sent = self._transport.send_to(chat_id, content)
-        if not sent:
-            # No path / no interface: transient, let the base-class retry
-            # logic and the ledger sweep behave (spec section 6).
+        # One packet carries less than a full reply. Split before sending, so a
+        # long reply arrives as several parts instead of being refused or
+        # silently truncated (spec section 14). A reply that fits comes back as
+        # a single part and is sent unchanged.
+        parts = self._chunk_content(content)
+        if parts is None:
+            return delivery.map_chunk_overflow(len(content.encode("utf-8")))
+        if not parts:
+            logger.warning("Reticulum: chunking produced no parts; sending none")
             return SendResult(
-                success=False,
-                error="no interface could carry the packet",
-                retryable=True,
-                error_kind="transient",
+                success=False, error="empty message", error_kind="bad_format"
             )
-        # The packet reached the transport. The real delivery outcome
+        for part in parts:
+            if not self._transport.send_to(chat_id, part):
+                # No path / no interface: transient, let the base-class retry
+                # logic and the ledger sweep behave (spec section 6).
+                return SendResult(
+                    success=False,
+                    error="no interface could carry the packet",
+                    retryable=True,
+                    error_kind="transient",
+                )
+        # The packet(s) reached the transport. The real delivery outcome
         # (DELIVERED vs SENT vs FAILED) arrives as a state callback from the
         # LXMF transport; this foundation-stage seam maps the node-acceptance
         # path. The real transport fires the state through _record_receipt,
         # which calls delivery.map_receipt against the pending set.
+        #
+        # The pending entry is recorded against the FINAL part under the full
+        # original content, so a propagated multi-part send stays inspectable as
+        # one unconfirmed message rather than N fragments.
         return self._seam_acceptance(chat_id, content)
+
+    def _chunk_content(self, content: str) -> Optional[list]:
+        """Split outbound content for transmission.
+
+        Returns the parts (a single-element list when the content fits), an
+        empty list when chunking degenerates, or ``None`` when the content
+        cannot be carried at all. The tag is per-adapter monotonic so a
+        recipient can spot a dropped tail without any protocol change.
+        """
+        if self._chunk_tag is None:
+            self._chunk_tag = 0
+        self._chunk_tag += 1
+        tag = "p%d" % self._chunk_tag
+        return delivery.chunk_for_send(content, tag)
 
     @staticmethod
     def _is_valid_hash(destination_hash: str) -> bool:
