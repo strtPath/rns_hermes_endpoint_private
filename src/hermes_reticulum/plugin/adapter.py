@@ -39,6 +39,7 @@ from hermes_reticulum.plugin.identity import (
     is_valid_destination,
     is_parseable_inbound,
 )
+from hermes_reticulum.plugin import delivery
 
 logger = logging.getLogger("hermes_reticulum.adapter")
 
@@ -155,6 +156,15 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # lets tests (and the later real transport) substitute their own.
         self._transport_factory = transport_factory or FakeTransport
         self._transport = None
+
+        # Propagation pending set (spec section 6): the authoritative delivery
+        # record for propagated (SENT) sends. Constructed ONCE here, not in
+        # connect(), so it survives disconnect()/connect() on the same
+        # instance — the reconnect path tears down and rebuilds everything
+        # else, and a set rebuilt in connect() would be lost exactly when it
+        # is needed. The gateway's ledger is wrong in both directions on a
+        # mesh; this set is the record that stays true (spec section 16).
+        self._pending = delivery.PropagationPendingSet()
 
         # Thread bridge (spec section 5): transport callbacks arrive on the
         # RNS thread and are shuttled to the asyncio loop through a queue
@@ -357,20 +367,63 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
                 retryable=True,
                 error_kind="transient",
             )
-        # Foundation-stage seam: the packet reached the transport. The real
-        # delivery outcome (DELIVERED vs SENT vs FAILED) is mapped by a
-        # follow-on ticket once the LXMF callbacks land here.
-        return SendResult(
-            success=False,
-            error="delivery receipt mapping pending (transport seam)",
-            retryable=True,
-            error_kind="unknown",
-        )
+        # The packet reached the transport. The real delivery outcome
+        # (DELIVERED vs SENT vs FAILED) arrives as a state callback from the
+        # LXMF transport; this foundation-stage seam maps the node-acceptance
+        # path. The real transport fires the state through _record_receipt,
+        # which calls delivery.map_receipt against the pending set.
+        return self._seam_acceptance(chat_id, content)
 
     @staticmethod
     def _is_valid_hash(destination_hash: str) -> bool:
         """A destination is 32 hex characters (LXMF hash). Kept for compat."""
         return is_valid_destination(destination_hash)
+
+    # ── Delivery mapping (spec section 6) ───────────────────────────────
+
+    def _seam_acceptance(self, chat_id: str, content: str) -> SendResult:
+        """Foundation-stage stand-in for the real delivery-outcome callback.
+
+        The real LXMF transport fires a state (DELIVERED / SENT / FAILED)
+        through :meth:`_record_receipt`. Until that lands, a successful
+        ``send_to`` is treated as node acceptance: ``SENT``. That is the
+        honest mapping at this stage — the packet was accepted by the
+        transport but not yet confirmed delivered — and it records the send
+        in the pending set so it stays inspectable (and survives
+        disconnect/reconnect). ``success=True`` because the gateway's
+        ``SendResult`` is binary and offers no third state for "accepted but
+        unconfirmed" (spec section 6).
+        """
+        return self._record_receipt(chat_id, content, delivery.STATE_SENT)
+
+    def _record_receipt(
+        self,
+        chat_id: str,
+        content: str,
+        state: int,
+        reason: Optional[str] = None,
+    ) -> SendResult:
+        """Map one LXMF delivery-state callback into a ``SendResult``.
+
+        This is the seam the real transport will drive. ``state`` is an LXMF
+        state value; ``reason`` carries the failure string for ``FAILED``.
+        The mapping is owned by :func:`hermes_reticulum.plugin.delivery.map_receipt`
+        and runs against the adapter's own pending set.
+        """
+        return delivery.map_receipt(
+            self._pending, state, chat_id, content, reason
+        )
+
+    @property
+    def delivery_stats(self) -> Dict[str, int]:
+        """Counters for the propagation pending set (spec section 6): the
+        unconfirmed set plus delivered/failed tallies. This is the surface a
+        user inspects to answer "did that message actually go"."""
+        return self._pending.stats()
+
+    def unconfirmed_for(self, chat_id: str) -> list:
+        """Unconfirmed (propagated) entries for a destination hash."""
+        return self._pending.pending_for(chat_id)
 
     # ── Chat info ────────────────────────────────────────────────────────
 

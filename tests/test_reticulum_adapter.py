@@ -241,15 +241,21 @@ async def test_send_empty_content_rejected():
 
 
 @pytest.mark.asyncio
-async def test_send_through_fake_transport_returns_failing_seam_result():
-    """send() exercises the seam and returns a well-formed SendResult —
-    never raises. The real receipt mapping lands with the LXMF transport."""
+async def test_send_through_fake_transport_returns_node_acceptance():
+    """send() exercises the seam and maps node acceptance (SENT) to
+    success=True with an entry in the pending set — never raises. The real
+    delivery outcome (DELIVERED vs FAILED) arrives as a state callback."""
     adapter = make_adapter()
     await adapter.connect()
     result = await adapter.send("0" * 32, "hello")
     assert isinstance(result, SendResult)
-    assert result.success is False
-    assert result.error is not None
+    # Node acceptance: the gateway's SendResult is binary, so accepted maps
+    # to success=True, and the send is recorded as unconfirmed in the
+    # adapter's own pending set (spec section 6).
+    assert result.success is True
+    entries = adapter.unconfirmed_for("0" * 32)
+    assert len(entries) == 1
+    assert entries[0].content == "hello"
     # The fake transport saw the packet.
     assert adapter._transport.sent == [("0" * 32, "hello")]
     await adapter.disconnect()
