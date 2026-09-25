@@ -484,6 +484,35 @@ class TestStatusPayloadInProcess(unittest.TestCase):
         ):
             self.assertEqual(self.server.status_payload()["acl"], "closed")
 
+    def test_acl_mode_default_is_closed_not_open(self):
+        """Unset HERMES_RETICUM_ALLOW_ALL must report the deny-by-default posture.
+
+        This is the case an operator on a fresh deployment actually hits, and it is
+        the one that regressed: this status field defaulted to "true" while
+        AccessControl defaulted to "false", so a correctly locked-down mesh reported
+        itself as "open". A security report being wrong in that direction is worse
+        than the field being absent.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for var in ("HERMES_RETICUM_ALLOW_ALL", "HERMES_RETICUM_ALLOWED_USERS"):
+                os.environ.pop(var, None)
+            self.assertEqual(self.server.status_payload()["acl"], "closed")
+
+    def test_acl_mode_default_agrees_with_access_control(self):
+        """Both readers of HERMES_RETICUM_ALLOW_ALL must default to the same posture.
+
+        Two modules read this var (AccessControl and ControlServer::_acl_mode). They
+        disagreed once; this pins them together so a future edit to either one fails
+        here instead of silently reporting the wrong posture.
+        """
+        from hermes_reticulum.core.acl import AccessControl
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for var in ("HERMES_RETICUM_ALLOW_ALL", "HERMES_RETICUM_ALLOWED_USERS"):
+                os.environ.pop(var, None)
+            self.assertFalse(AccessControl().allow_all)
+            self.assertNotEqual(self.server.status_payload()["acl"], "open")
+
 
 class TestStatusHttpEndpoint(unittest.TestCase):
     """GET /status over a real ThreadingHTTPServer (ephemeral port)."""

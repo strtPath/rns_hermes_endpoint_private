@@ -351,7 +351,12 @@ class ControlServer:
         }
 
     def _acl_mode(self) -> str:
-        allow_all = os.getenv("HERMES_RETICUM_ALLOW_ALL", "true").lower()
+        # Default "false" to match AccessControl (core/acl.py) and README/env.example:
+        # the mesh is deny-by-default and open mode must be opted into explicitly.
+        # This status field is what an operator reads to check their own posture, so a
+        # default of "true" here would report "open" on a correctly locked-down
+        # deployment — the wrong direction for a security report to be wrong in.
+        allow_all = os.getenv("HERMES_RETICUM_ALLOW_ALL", "false").lower()
         if allow_all in ("true", "1", "yes"):
             return "open"
         allowed_raw = os.getenv("HERMES_RETICUM_ALLOWED_USERS", "").strip()
