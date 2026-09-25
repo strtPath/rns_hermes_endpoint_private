@@ -135,6 +135,18 @@ else:
             self.retryable = retryable
             self.error_kind = error_kind
 
+    class _SessionSource:
+        """Attribute-accessible stand-in for the gateway's SessionSource.
+
+        The real ``build_source`` returns a ``SessionSource`` dataclass, not a
+        dict: tests read ``event.source.chat_id``. A dict-returning stub fails
+        those tests, which is what makes an unfaithful stub dangerous — the
+        suite goes green against the real gateway and red in CI, or vice versa.
+        """
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     class _BasePlatformAdapter:
         def __init__(self, config=None, platform=None, **kwargs):
             self.config = config
@@ -148,7 +160,7 @@ else:
             self.is_connected = False
 
         def build_source(self, **kwargs):
-            return kwargs
+            return _SessionSource(**kwargs)
 
         async def handle_message(self, event):
             return None

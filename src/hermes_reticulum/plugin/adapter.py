@@ -23,6 +23,7 @@ Foundation stage (design: docs/spec-reticulum-platform-adapter.md):
 import asyncio
 import contextlib
 import datetime
+import inspect
 import logging
 import threading
 import uuid
@@ -171,6 +172,10 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # across reconnects alongside the pending set, for the same reason.
         self._chunk_tag: Optional[int] = None
 
+        # Inbound handler slot. Declared here rather than assumed from the base
+        # class: see deliver_inbound() for why the adapter owns this hop.
+        self._message_handler = None
+
         # Thread bridge (spec section 5): transport callbacks arrive on the
         # RNS thread and are shuttled to the asyncio loop through a queue
         # drained by a task.
@@ -295,15 +300,39 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             user_id=source_hash,
             user_name=self._identity.get_name(source_hash, source_hash),
         )
-        await self.handle_message(
-            MessageEvent(
-                text=text,
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=str(uuid.uuid4()),
-                timestamp=datetime.datetime.now(),
-            )
+        event_obj = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(uuid.uuid4()),
+            timestamp=datetime.datetime.now(),
         )
+        await self.deliver_inbound(event_obj)
+
+    async def deliver_inbound(self, event) -> None:
+        """Hand one inbound event to the gateway's message handler.
+
+        The adapter owns this hop rather than calling the inherited
+        ``handle_message`` directly: that method and its ``_message_handler``
+        slot are gateway-version surface, and an adapter that only works when
+        the base class happens to provide them breaks silently — inbound goes
+        deaf — on a gateway that renames either. Falling back to the inherited
+        call keeps compatibility with a gateway that supplies its own handler.
+        """
+        if self._message_handler is not None:
+            result = self._message_handler(event)
+            if inspect.isawaitable(result):
+                await result
+            return
+        await self.handle_message(event)
+
+    def set_message_handler(self, handler) -> None:
+        """Install the gateway's inbound handler (``MessageEvent`` in).
+
+        Defined here so the adapter does not depend on the base class for a
+        method it requires (see :meth:`deliver_inbound`).
+        """
+        self._message_handler = handler
 
     @staticmethod
     def _normalize_inbound(event):
