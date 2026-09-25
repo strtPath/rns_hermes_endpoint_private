@@ -23,9 +23,17 @@ EXCLUDED_MODULES = {
     "hermes_reticulum.core.profiler",
     "hermes_reticulum.cli",
     "hermes_reticulum.plugin.adapter",
+    # The transport IS the RNS/LXMF integration; registration probes the
+    # installed stack for platform enablement. Both were added after this
+    # guard and need declaring, not exempting by accident.
+    "hermes_reticulum.plugin.transport",
+    "hermes_reticulum.plugin.registration",
     # tests: integration test files that drive the live bridge/RNS loop
     "test_loopback_lxmf",
     "test_core",
+    # Identity tests decode a real announce payload via RNS's msgpack vendor
+    # shim (no radio involved).
+    "test_reticulum_identity",
 }
 
 
@@ -36,6 +44,39 @@ def file_module_path(path, root):
     if rel.endswith("__init__"):
         rel = rel[: -len("__init__")]
     return rel.replace(os.sep, ".")
+
+
+def _guarded_import_linenos(tree):
+    """Line numbers of banned imports that sit inside a try/except ImportError.
+
+    A module may legitimately import the stack *optionally* — inside a
+    ``try: import LXMF / except ImportError:`` with a working fallback — so
+    the module stays usable where the stack is absent. That is not the
+    invariant this guard protects (a hard dependency in pure logic); it is
+    the opposite, and flagging it would push authors to delete the fallback.
+
+    Only the try/except-ImportError shape qualifies. A bare import in a
+    try/except-Exception still counts as banned, since the fallback there is
+    not about the dependency being optional.
+    """
+    guarded = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        catches_importerror = any(
+            (isinstance(h.type, ast.Name) and h.type.id == "ImportError")
+            or (isinstance(h.type, ast.Tuple) and any(
+                isinstance(e, ast.Name) and e.id == "ImportError" for e in h.type.elts
+            ))
+            for h in node.handlers
+            if h.type is not None
+        )
+        if not catches_importerror:
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                guarded.add(sub.lineno)
+    return guarded
 
 
 def scan_file(path, root):
@@ -49,12 +90,19 @@ def scan_file(path, root):
     )
     with open(path, encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=path)
+    if excluded:
+        return []
+    guarded = _guarded_import_linenos(tree)
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
-                if top in BANNED_MODULES and not excluded:
+                if (
+                    top in BANNED_MODULES
+                    and node.lineno not in guarded
+                    and not excluded
+                ):
                     found.append((node.lineno, alias.name))
         elif isinstance(node, ast.ImportFrom):
             if node.module:

@@ -140,7 +140,7 @@ def test_unrecognised_state_maps_to_unknown():
     for state in (REJECTED, 0x00, 0x01, 0x02, 0xFE, 0x09):
         result = delivery.map_receipt(pending, state, "0" * 32, "x")
         assert result.success is False
-        assert result.error_kind == "unknown", "state %#x" % state
+        assert result.error_kind == "unknown", f"state {state:#x}"
     assert len(pending) == 0
 
 

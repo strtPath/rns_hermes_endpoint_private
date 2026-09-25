@@ -24,7 +24,6 @@ initiative (spec section 16 invariant).
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Optional
 
 from gateway.platforms.base import SendResult
 
@@ -74,7 +73,7 @@ def sequence_chunks(parts: list, tag: str) -> list:
     n = len(parts)
     out = []
     for i, part in enumerate(parts, 1):
-        prefix = "[%s %d/%d] " % (tag, i, n)
+        prefix = f"[{tag} {i}/{n}] "
         encoded = prefix + part
         # Never let the prefix push a part over a single-block boundary.
         # If the part itself is over budget, truncate the part (not the prefix).
@@ -222,7 +221,7 @@ _STATE_NAMES = {
 
 def _state_name(state: int) -> str:
     """Map an LXMF state value to its name string (unknown → ``state_0xNN``)."""
-    return _STATE_NAMES.get(state, "state_%02x" % state)
+    return _STATE_NAMES.get(state, f"state_{state:02x}")
 
 
 _STATE_OUTCOMES = {
@@ -242,7 +241,7 @@ def map_receipt(
     state: int,
     destination: str,
     content: str,
-    reason: Optional[str] = None,
+    reason: str | None = None,
 ) -> SendResult:
     """Translate an LXMF delivery-state callback into a gateway ``SendResult``.
 
@@ -286,7 +285,7 @@ def map_receipt(
         )
 
     # Unrecognised / in-flight states: never a benign default.
-    err = reason if reason else "unrecognised delivery state 0x%02x" % state
+    err = reason if reason else f"unrecognised delivery state 0x{state:02x}"
     return SendResult(
         success=False,
         error=err,
@@ -328,7 +327,7 @@ def chunk_for_send(text: str, tag: str) -> list:
     # Widest prefix this send could need: longest tag, two-digit index/total.
     # Overestimating only makes the parts slightly shorter; underestimating
     # would force sequence_chunks to truncate, which is the lossy path.
-    reserve = len(("[%s 99/99] " % tag).encode("utf-8"))
+    reserve = len((f"[{tag} 99/99] ").encode())
     budget = _BLOCK_CONTENT_BUDGET - reserve
     if budget <= 0:
         return []

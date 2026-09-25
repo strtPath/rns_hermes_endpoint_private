@@ -290,7 +290,10 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # (the allowlist comes from the platform gate env, see registration.py).
         allowlist = self._allowlist()
         if allowlist and not self._in_allowlist(source_hash, allowlist):
-            logger.debug("Reticulum: dropping inbound from unallowed peer %r", source_hash[:8] if isinstance(source_hash, str) else "?")
+            logger.debug(
+                "Reticulum: dropping inbound from unallowed peer %r",
+                source_hash[:8] if isinstance(source_hash, str) else "?",
+            )
             return
         source = self.build_source(
             chat_id=source_hash,
@@ -436,7 +439,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         if self._chunk_tag is None:
             self._chunk_tag = 0
         self._chunk_tag += 1
-        tag = "p%d" % self._chunk_tag
+        tag = f"p{self._chunk_tag}"
         return delivery.chunk_for_send(content, tag)
 
     @staticmethod

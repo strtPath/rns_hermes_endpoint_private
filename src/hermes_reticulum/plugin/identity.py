@@ -22,7 +22,8 @@ Also carries the two validation predicates the adapter needs:
 """
 
 import logging
-from typing import Any, Dict, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any
 
 logger = logging.getLogger("hermes_reticulum.identity")
 
@@ -76,7 +77,7 @@ def is_allowed_destination(destination_hash: Any, allowlist: Iterable[str]) -> b
 
 def is_parseable_inbound(
     event: Any,
-    allowlist: Optional[Iterable[str]] = None,
+    allowlist: Iterable[str] | None = None,
 ) -> bool:
     """Spec section 14 malformed-inbound predicate.
 
@@ -118,8 +119,8 @@ class IdentityMap:
     loop thread (announce callbacks are queued, not fired in-place).
     """
 
-    def __init__(self, seed: Optional[Dict[str, str]] = None):
-        self._names: Dict[str, str] = dict(seed or {})
+    def __init__(self, seed: dict[str, str] | None = None):
+        self._names: dict[str, str] = dict(seed or {})
 
     # ── Write ────────────────────────────────────────────────────────────
 
@@ -132,7 +133,7 @@ class IdentityMap:
         if isinstance(destination_hash, str) and isinstance(display_name, str):
             self._names[destination_hash] = display_name
 
-    def seed(self, entries: Dict[str, str]) -> None:
+    def seed(self, entries: dict[str, str]) -> None:
         """Merge a config-provided dict into the map (existing keys win
         if a later ``set_name`` has already populated them — this is a
         merge, not a replacement)."""
@@ -142,7 +143,7 @@ class IdentityMap:
 
     # ── Read ─────────────────────────────────────────────────────────────
 
-    def get_name(self, destination_hash: Any, fallback: Optional[str] = None) -> str:
+    def get_name(self, destination_hash: Any, fallback: str | None = None) -> str:
         """Look up the display name for ``destination_hash``.
 
         Fallback (documented behaviour for unknown/invalid hashes):
@@ -152,13 +153,15 @@ class IdentityMap:
         """
         if not isinstance(destination_hash, str):
             return fallback if fallback is not None else ""
-        return self._names.get(destination_hash, fallback if fallback is not None else destination_hash)
+        return self._names.get(
+            destination_hash, fallback if fallback is not None else destination_hash
+        )
 
 
 # ── Display-name decode from LXMF announce app_data (spec section 12) ─────
 
 
-def decode_display_name(app_data: Any) -> Optional[str]:
+def decode_display_name(app_data: Any) -> str | None:
     """Decode a peer's display name from an LXMF announce ``app_data`` blob.
 
     Delegates to ``LXMF.display_name_from_app_data`` when the LXMF package
@@ -186,7 +189,7 @@ def record_announce(
     identity: IdentityMap,
     destination_hash: Any,
     app_data: Any,
-) -> Optional[str]:
+) -> str | None:
     """Decode ``app_data`` and, if a name is found, store it in ``identity``
     under ``destination_hash``. Returns the decoded name (or None).
 
