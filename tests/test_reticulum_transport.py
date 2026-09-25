@@ -132,15 +132,33 @@ class TestConstruction:
 
 
 class _FakeLXMessage:
-    DIRECT = "DIRECT"
-    OPPORTUNISTIC = "OPPORTUNISTIC"
-    PROPAGATED = "PROPAGATED"
-    SENT = 4
-    FAILED = 6
+    # Values mirror the real LXMessage constants (LXMessage.py:14-31). A fake
+    # with different numbers silently passes against the wrong comparisons.
+    GENERATING = 0x00
+    OUTBOUND = 0x01
+    SENDING = 0x02
+    SENT = 0x04
+    DELIVERED = 0x08
+    REJECTED = 0xFD
+    CANCELLED = 0xFE
+    FAILED = 0xFF
+
+    OPPORTUNISTIC = 0x01
+    DIRECT = 0x02
+    PROPAGATED = 0x03
 
     @staticmethod
     def state_name(state):
-        return {4: "sent", 6: "failed"}.get(state, "unknown")
+        return {
+            0x00: "generating",
+            0x01: "outbound",
+            0x02: "sending",
+            0x04: "sent",
+            0x08: "delivered",
+            0xFD: "rejected",
+            0xFE: "cancelled",
+            0xFF: "failed",
+        }.get(state, "unknown")
 
     def __init__(self, dest, source, content="", **kwargs):
         self.dest = dest
@@ -154,6 +172,9 @@ class _FakeLXMessage:
         self.kwargs = kwargs
         self.delivery_callback = None
         self.failed_callback = None
+        # Real messages carry a live state; OUTBOUND is the state a message is
+        # in immediately after handle_outbound queues it.
+        self.state = _FakeLXMessage.OUTBOUND
 
     def register_delivery_callback(self, cb):
         self.delivery_callback = cb
@@ -185,6 +206,12 @@ class _FakeRouter:
         self.kwargs = kwargs
         self.outbound = []
         self.delivery_cb = None
+        # Mirror the real router's propagation surface. Without these the
+        # policy call would AttributeError and the tests would prove nothing
+        # about the branch they mean to cover.
+        self.autopeer = True
+        self.autopeer_maxdepth = 4
+        self.outbound_propagation_node = None
 
     def register_delivery_identity(self, identity, display_name=None, stamp_cost=None):
         return _FakeDestination()
@@ -195,11 +222,27 @@ class _FakeRouter:
     def handle_outbound(self, lxm):
         self.outbound.append(lxm)
 
+    def set_outbound_propagation_node(self, destination_hash):
+        self.outbound_propagation_node = destination_hash
+
+    def get_outbound_propagation_node(self):
+        return self.outbound_propagation_node
+
 
 class _FakeTransport:
+    """Stands in for RNS.Transport.
+
+    The path methods are per-instance Mocks, not staticmethods, so a test can
+    assert whether a path was requested and control what has_path answers. A
+    staticmethod here would make ``assert_not_called`` meaningless.
+    """
+
     def __init__(self):
         self.started_with = None
         self.exit_calls = 0
+        self.has_path = mock.Mock(return_value=False)
+        self.hops_to = mock.Mock(return_value=128)
+        self.request_path = mock.Mock(return_value=None)
 
     @staticmethod
     def start(reticulum_instance):
@@ -209,14 +252,22 @@ class _FakeTransport:
     def exit_handler():
         FakeTransportHolder.exit_calls += 1
 
-    @staticmethod
-    def request_path(hash, **kwargs):
-        pass
-
 
 class FakeTransportHolder:
     started_with = None
     exit_calls = 0
+
+
+@pytest.fixture(autouse=True)
+def _no_real_waits(monkeypatch):
+    """Zero the path wait and the outcome grace period for every test.
+
+    Both are genuine behaviour, asserted separately, but sleeping through
+    them costs ~60s of suite time and a mocked sleep would spin the loop for
+    the full real deadline (time.time does not advance under a mock).
+    """
+    monkeypatch.setattr(transport_module.ReticulumTransport, "PATH_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(transport_module.ReticulumTransport, "OUTCOME_GRACE_SECONDS", 0.0)
 
 
 @pytest.fixture
@@ -237,7 +288,10 @@ def fake_rns(monkeypatch):
         )
     fake_rns_mod.Reticulum = mock.Mock(side_effect=_make_ret)
     fake_rns_mod.Destination = _FakeDestination
-    fake_rns_mod.Transport = _FakeTransport
+    # An INSTANCE, so the path methods are the per-test Mocks the assertions
+    # target. Assigning the class would expose unbound mocks and make
+    # assert_not_called on request_path meaningless.
+    fake_rns_mod.Transport = _FakeTransport()
     fake_rns_mod.Identity = mock.Mock()
     fake_rns_mod.Identity.recall = mock.Mock(return_value=None)
 
@@ -327,6 +381,169 @@ class TestSendTo:
         t = self._started_transport(fake_rns, tmp_path)
         t.router.handle_outbound = mock.Mock(side_effect=RuntimeError("boom"))
         assert t.send_to(FAKE_HASH, "hello") is False
+
+
+# ── Path-aware method selection ───────────────────────────────────────────
+# A reply to an offline phone has no path. DIRECT cancels in about a second
+# (MAX_PATHLESS_TRIES = 1), so a reply must go via a propagation node when one
+# is configured, and must be reported as FAILED when it does not leave. Before
+# this, send_to returned True for a message the router had cancelled, so every
+# dropped reply looked delivered.
+
+
+class TestPathAwareSend:
+    def _started_transport(self, fake_rns, tmp_path, extra=None):
+        t = transport_module.ReticulumTransport(
+            storage_path=str(tmp_path / "storage"), extra=extra or {}
+        )
+        t.start()
+        return t
+
+    def test_warm_path_sends_direct(self, fake_rns, tmp_path):
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = True
+        fake_rns.Transport.hops_to.return_value = 2
+        t = self._started_transport(fake_rns, tmp_path)
+        assert t.send_to(FAKE_HASH, "hello") is True
+        assert t.router.outbound[0].desired_method == _FakeLXMessage.DIRECT
+        # A warm path must not pay the path-request wait.
+        fake_rns.Transport.request_path.assert_not_called()
+
+    def test_cold_path_is_requested_before_giving_up(self, fake_rns, tmp_path):
+        """DIRECT does not request paths; we must, or it cancels instantly."""
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = False
+        t = self._started_transport(fake_rns, tmp_path)
+        t.PATH_WAIT_SECONDS = 0.0
+        t.send_to(FAKE_HASH, "hello")
+        fake_rns.Transport.request_path.assert_called()
+
+    def test_no_path_with_node_sends_propagated(self, fake_rns, tmp_path):
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = False
+        t = self._started_transport(fake_rns, tmp_path)
+        t.router.outbound_propagation_node = bytes.fromhex("ab" * 16)
+        t.PATH_WAIT_SECONDS = 0.0
+        assert t.send_to(FAKE_HASH, "hello") is True
+        assert t.router.outbound[0].desired_method == _FakeLXMessage.PROPAGATED
+
+    def test_no_path_and_no_node_sends_direct_and_warns(self, fake_rns, tmp_path, caplog):
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = False
+        t = self._started_transport(fake_rns, tmp_path)
+        t.router.outbound_propagation_node = None
+        t.PATH_WAIT_SECONDS = 0.0
+        t.send_to(FAKE_HASH, "hello")
+        assert t.router.outbound[0].desired_method == _FakeLXMessage.DIRECT
+
+    def test_propagation_off_never_propagates(self, fake_rns, tmp_path):
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = False
+        t = self._started_transport(
+            fake_rns, tmp_path, extra={"propagation_node": "off"}
+        )
+        t.router.outbound_propagation_node = bytes.fromhex("ab" * 16)
+        t.PATH_WAIT_SECONDS = 0.0
+        t.send_to(FAKE_HASH, "hello")
+        assert t.router.outbound[0].desired_method == _FakeLXMessage.DIRECT
+
+    def test_cancelled_message_reports_false(self, fake_rns, tmp_path):
+        """The whole point: a cancelled reply must not look delivered."""
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = True
+        fake_rns.Transport.hops_to.return_value = 2
+        t = self._started_transport(fake_rns, tmp_path)
+
+        def cancel(lxm):
+            t.router.outbound.append(lxm)
+            lxm.state = _FakeLXMessage.CANCELLED
+
+        t.router.handle_outbound = mock.Mock(side_effect=cancel)
+        assert t.send_to(FAKE_HASH, "hello") is False
+
+    def test_failed_message_reports_false(self, fake_rns, tmp_path):
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = True
+        t = self._started_transport(fake_rns, tmp_path)
+
+        def fail(lxm):
+            t.router.outbound.append(lxm)
+            lxm.state = _FakeLXMessage.FAILED
+
+        t.router.handle_outbound = mock.Mock(side_effect=fail)
+        assert t.send_to(FAKE_HASH, "hello") is False
+
+    def test_propagated_sent_state_counts_as_success(self, fake_rns, tmp_path):
+        """SENT is terminal success: a propagation node accepted the message."""
+        fake_rns.Identity.recall.return_value = mock.Mock()
+        fake_rns.Transport.has_path.return_value = True
+        t = self._started_transport(fake_rns, tmp_path)
+
+        def sent(lxm):
+            t.router.outbound.append(lxm)
+            lxm.state = _FakeLXMessage.SENT
+
+        t.router.handle_outbound = mock.Mock(side_effect=sent)
+        assert t.send_to(FAKE_HASH, "hello") is True
+
+    def test_no_identity_and_no_path_returns_false(self, fake_rns, tmp_path):
+        fake_rns.Identity.recall.return_value = None
+        fake_rns.Transport.has_path.return_value = False
+        t = self._started_transport(fake_rns, tmp_path)
+        t.PATH_WAIT_SECONDS = 0.0
+        assert t.send_to(FAKE_HASH, "hello") is False
+        assert t.router.outbound == []
+
+
+# ── Propagation policy ────────────────────────────────────────────────────
+
+
+class TestPropagationPolicy:
+    def _started_transport(self, fake_rns, tmp_path, extra=None):
+        t = transport_module.ReticulumTransport(
+            storage_path=str(tmp_path / "storage"), extra=extra or {}
+        )
+        t.start()
+        return t
+
+    def test_pinned_node_is_set_on_the_router(self, fake_rns, tmp_path):
+        node = "0badc0de0badc0de0badc0de0badc0de"
+        t = self._started_transport(fake_rns, tmp_path, extra={"propagation_node": node})
+        assert t.router.outbound_propagation_node == bytes.fromhex(node)
+        assert t.propagation_mode == "pinned"
+
+    def test_off_disables_autopeer(self, fake_rns, tmp_path):
+        t = self._started_transport(fake_rns, tmp_path, extra={"propagation_node": "off"})
+        assert t.router.autopeer is False
+        assert t.router.outbound_propagation_node is None
+
+    def test_auto_leaves_autopeer_alone(self, fake_rns, tmp_path):
+        t = self._started_transport(fake_rns, tmp_path, extra={"propagation_node": "auto"})
+        assert t.router.autopeer is True
+        assert t.router.outbound_propagation_node is None
+
+    def test_unset_defaults_to_auto(self, fake_rns, tmp_path):
+        t = self._started_transport(fake_rns, tmp_path)
+        assert t.propagation_mode == "auto"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "not-a-hash",
+            "0badc0de0badc0de0badc0de0badc0d",  # one char short
+            "gggggggggggggggggggggggggggggggg",  # right length, not hex
+            "yes",
+        ],
+    )
+    def test_invalid_value_fails_loudly(self, bad):
+        """A typo must not silently change delivery policy."""
+        with pytest.raises(ValueError):
+            transport_module.validate_propagation_node(bad)
+
+    def test_hash_is_case_insensitive(self):
+        mode, h = transport_module.validate_propagation_node("0BADC0DE0BADC0DE0BADC0DE0BADC0DE")
+        assert mode == "pinned"
+        assert h == "0badc0de0badc0de0badc0de0badc0de"
 
 
 # ── start/stop lifecycle with stubs ───────────────────────────────────

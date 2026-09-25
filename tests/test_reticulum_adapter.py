@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import time
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -206,6 +207,90 @@ def test_adapter_does_not_override_edit_message_with_a_lying_stub():
         "implementation reports failure, and a success-reporting stub would "
         "let the stream consumer finalize against an unedited message"
     )
+
+
+# ── Chunk pacing ──────────────────────────────────────────────────────────
+# A multi-part reply is a burst. On a live path that is fine; through a
+# propagation node the message still has to sync, so a burst spends LoRa
+# airtime for nothing. The pace follows the transport's own report of how the
+# last send went.
+
+
+class _TransportReportingPath(FakeTransport):
+    """FakeTransport whose path answer a test can flip."""
+
+    def __init__(self, direct=True):
+        super().__init__()
+        self.direct = direct
+
+    def last_send_was_direct(self):
+        return self.direct
+
+
+def test_direct_path_does_not_pace_chunks():
+    adapter = make_adapter()
+    adapter._transport = _TransportReportingPath(direct=True)
+    assert adapter._inter_chunk_delay() == adapter.INTER_CHUNK_DIRECT_SECONDS
+
+
+def test_propagated_path_paces_chunks():
+    adapter = make_adapter()
+    adapter._transport = _TransportReportingPath(direct=False)
+    assert adapter._inter_chunk_delay() == adapter.INTER_CHUNK_PROPAGATED_SECONDS
+
+
+def test_transport_without_path_state_is_treated_as_direct():
+    """An older/other transport must not invent a delay it cannot justify."""
+    adapter = make_adapter()
+
+    class _NoAnswer:
+        def send_to(self, *a):
+            return True
+
+    adapter._transport = _NoAnswer()
+    assert adapter._inter_chunk_delay() == adapter.INTER_CHUNK_DIRECT_SECONDS
+
+
+def test_path_state_error_is_treated_as_direct():
+    """A raising transport must not stall the send on an exception."""
+    adapter = make_adapter()
+
+    class _Raises:
+        def send_to(self, *a):
+            return True
+
+        def last_send_was_direct(self):
+            raise RuntimeError("no idea")
+
+    adapter._transport = _Raises()
+    assert adapter._inter_chunk_delay() == adapter.INTER_CHUNK_DIRECT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_multi_part_send_paces_between_chunks():
+    """The gap is applied between parts, and not after the last one."""
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    adapter = make_adapter()
+    assert await adapter.connect() is True
+    # Swap the transport AFTER connecting so send()'s is_connected gate passes,
+    # while the path answer still comes from this fake.
+    adapter._transport = _TransportReportingPath(direct=False)
+    long_text = "x" * 400  # forces more than one part
+
+    with mock.patch("asyncio.sleep", fake_sleep):
+        result = await adapter.send("ab" * 16, long_text)
+
+    assert result.success is True
+    assert len(adapter._transport.sent) > 1, "expected a multi-part send"
+    expected = len(adapter._transport.sent) - 1
+    assert len(sleeps) == expected, (
+        f"expected a pause between {expected} gaps, got {len(sleeps)}"
+    )
+    assert all(s == adapter.INTER_CHUNK_PROPAGATED_SECONDS for s in sleeps)
 
 
 # ── Inbound thread bridge (spec section 10) ────────────────────────────────

@@ -56,6 +56,15 @@ class Transport(Protocol):
         interface can carry the packet (maps to a transient failure)."""
         ...
 
+    def last_send_was_direct(self) -> bool:
+        """True when the most recent send went over a live path.
+
+        Optional: a transport that cannot answer returns True, so the adapter
+        paces as if the link were fast rather than inventing a delay. Used to
+        choose the gap between chunks of a multi-part reply.
+        """
+        ...
+
     def register_delivery_callback(self, callback) -> None:
         """Register ``callback(receipt)`` fired on delivery state changes."""
         ...
@@ -89,6 +98,9 @@ class FakeTransport:
 
     def send_to(self, destination_hash: str, payload: str) -> bool:
         self.sent.append((destination_hash, payload))
+        return True
+
+    def last_send_was_direct(self) -> bool:
         return True
 
     def register_delivery_callback(self, callback):
@@ -135,6 +147,12 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
     splits_long_messages = True
     # Reticulum clients render markdown, including fenced code blocks.
     supports_code_blocks = True
+
+    # Gap between chunks of a multi-part reply. Direct sends burst; propagated
+    # sends are paced, because the node still has to sync them and a burst
+    # spends LoRa airtime for no gain.
+    INTER_CHUNK_DIRECT_SECONDS = 0.0
+    INTER_CHUNK_PROPAGATED_SECONDS = 2.0
 
     def __init__(self, config, transport_factory=None, **kwargs):
         # Plugin platforms have no static Platform enum member: Platform._missing_
@@ -423,16 +441,27 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False, error="empty message", error_kind="bad_format"
             )
-        for part in parts:
+        for index, part in enumerate(parts):
             if not self._transport.send_to(chat_id, part):
                 # No path / no interface: transient, let the base-class retry
-                # logic and the ledger sweep behave (spec section 6).
+                # logic and the ledger sweep behave (spec section 6). With
+                # propagation configured, a pathless send still leaves the
+                # message on the node, so reaching here means it did not leave
+                # at all -- abort the rest rather than spray the mesh.
                 return SendResult(
                     success=False,
                     error="no interface could carry the packet",
                     retryable=True,
                     error_kind="transient",
                 )
+            # Pace multi-part sends. A burst of chunks is the fastest way to
+            # congest a LoRa link, and the transport already told us whether
+            # this send went direct (fast) or via a propagation node (slow).
+            # Only the parts after the first pay it.
+            if index + 1 < len(parts):
+                pause = self._inter_chunk_delay()
+                if pause > 0:
+                    await asyncio.sleep(pause)
         # The packet(s) reached the transport. The real delivery outcome
         # (DELIVERED vs SENT vs FAILED) arrives as a state callback from the
         # LXMF transport; this foundation-stage seam maps the node-acceptance
@@ -443,6 +472,28 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         # original content, so a propagated multi-part send stays inspectable as
         # one unconfirmed message rather than N fragments.
         return self._seam_acceptance(chat_id, content)
+
+    def _inter_chunk_delay(self) -> float:
+        """Seconds to wait between chunks of one multi-part reply.
+
+        A direct send over a live path can take a burst. A propagated send
+        travels to a node that then has to sync, so back-to-back chunks there
+        buy nothing and cost mesh airtime. Reads the transport's answer when it
+        can give one; a transport without the method is treated as direct.
+        """
+        asker = getattr(self._transport, "last_send_was_direct", None)
+        if not callable(asker):
+            return self.INTER_CHUNK_DIRECT_SECONDS
+        try:
+            direct = bool(asker())
+        except Exception as e:
+            logger.debug("Reticulum: path state unavailable (%s); pacing as direct", e)
+            return self.INTER_CHUNK_DIRECT_SECONDS
+        return (
+            self.INTER_CHUNK_DIRECT_SECONDS
+            if direct
+            else self.INTER_CHUNK_PROPAGATED_SECONDS
+        )
 
     def _chunk_content(self, content: str) -> list | None:
         """Split outbound content for transmission.

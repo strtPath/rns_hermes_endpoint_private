@@ -54,6 +54,47 @@ MIN_ANNOUNCE_INTERVAL_MIN = 1.0
 # and must not spam a shared mesh).
 DEFAULT_ANNOUNCE_INTERVAL_MIN = 60.0
 
+# Propagation node policy. "auto" lets LXMF autopeer with a node it discovers;
+# a 32-hex destination hash pins one explicitly (a user's own node, or one they
+# trust). "off" disables propagated delivery entirely, so a pathless reply fails
+# instead of parking somewhere.
+PROPAGATION_MODE_AUTO = "auto"
+PROPAGATION_MODE_OFF = "off"
+PROPAGATION_MODE_PINNED = "pinned"
+
+
+def validate_propagation_node(
+    value: Any, source: str = "propagation node"
+) -> tuple[str, str | None]:
+    """Parse the propagation setting into (mode, destination_hash).
+
+    Accepted forms:
+
+    - ``auto`` (or empty/unset) -> autopeer, LXMF's own default behaviour.
+    - ``off`` -> never propagate; a pathless reply fails honestly.
+    - a 32-character hex destination hash -> pin that node.
+
+    Anything else raises, at startup, rather than silently falling back to a
+    different delivery policy: this setting decides whether a reply can reach a
+    phone that is offline, so a typo must not quietly change the answer.
+    """
+    if value is None:
+        return PROPAGATION_MODE_AUTO, None
+    text = str(value).strip()
+    if not text:
+        return PROPAGATION_MODE_AUTO, None
+    lowered = text.lower()
+    if lowered == PROPAGATION_MODE_AUTO:
+        return PROPAGATION_MODE_AUTO, None
+    if lowered == PROPAGATION_MODE_OFF:
+        return PROPAGATION_MODE_OFF, None
+    if len(lowered) != 32 or any(c not in "0123456789abcdef" for c in lowered):
+        raise ValueError(
+            f"Invalid {source}={value!r}: expected 'auto', 'off', or a "
+            f"32-character hex destination hash."
+        )
+    return PROPAGATION_MODE_PINNED, lowered
+
 
 def validate_announce_interval(value: Any, source: str = "announce interval") -> float:
     """Validate an announce interval in minutes.
@@ -135,6 +176,17 @@ class ReticulumTransport:
                 or _get_scoped_secret("RETICULUM_RNS_CONFIG_PATH"))
             else None
         )
+        # Propagation policy: who carries a reply when the peer has no path.
+        # "auto" autopeers, "off" disables, or a 32-hex hash pins one node.
+        raw_propagation = extra.get("propagation_node")
+        if raw_propagation is None:
+            raw_propagation = _get_scoped_secret("RETICULUM_PROPAGATION_NODE")
+        self.propagation_mode, self.propagation_node_hash = (
+            validate_propagation_node(raw_propagation, "RETICULUM_PROPAGATION_NODE")
+        )
+        # True until a send proves otherwise: the adapter reads this to pace
+        # chunks, and a first chunk should never be delayed on a guess.
+        self._last_send_direct = True
         # Shared-instance mode is operator policy, not env state: take it
         # only from the explicit argument or PlatformConfig.extra.
         self.require_shared_instance = bool(
@@ -210,6 +262,7 @@ class ReticulumTransport:
         self.router = LXMF.LXMRouter(
             storagepath=str(self.storage_path),
         )
+        self._apply_propagation_policy()
 
         self.identity = self._load_or_create_identity(
             f"{self.storage_path}/gateway_identity"
@@ -252,6 +305,64 @@ class ReticulumTransport:
             "LXMF transport started (display name %s, announce every %g min)",
             self.display_name,
             self.announce_interval_min if self.announce_interval_min > 0 else 0,
+        )
+
+    def _apply_propagation_policy(self) -> None:
+        """Configure the router's outbound propagation node.
+
+        Three modes, from ``RETICULUM_PROPAGATION_NODE`` / PlatformConfig.extra:
+
+        - ``auto``: leave LXMF's own autopeering alone. It peers with nodes it
+          discovers, within ``AUTOPEER_MAXDEPTH`` (4) hops.
+        - ``off``: disable autopeering and clear any pinned node, so a reply
+          with no path fails instead of parking on a third party.
+        - a 32-hex hash: pin that node explicitly. Needed for a self-hosted or
+          trusted node, because autopeering only sees nodes that happen to
+          sync with us and gives no say over which one carries our traffic.
+
+        A pinned hash whose identity is not yet known is not fatal: the node's
+        announce populates it, and ``set_outbound_propagation_node`` accepts the
+        hash regardless. We log the current knowledge so a misconfigured hash
+        is visible rather than silent.
+        """
+        router = self.router
+        if router is None:
+            return
+
+        if self.propagation_mode == PROPAGATION_MODE_OFF:
+            router.autopeer = False
+            try:
+                router.set_outbound_propagation_node(None)
+            except Exception as e:
+                logger.debug("Clearing propagation node failed: %s", e)
+            logger.info(
+                "Propagation disabled (RETICULUM_PROPAGATION_NODE=off); a reply "
+                "with no path to the peer will fail rather than be propagated"
+            )
+            return
+
+        if self.propagation_mode == PROPAGATION_MODE_AUTO:
+            logger.info(
+                "Propagation node: auto (LXMF autopeering, max depth %s)",
+                getattr(router, "autopeer_maxdepth", "?"),
+            )
+            return
+
+        dest_hash = bytes.fromhex(self.propagation_node_hash or "")
+        try:
+            router.set_outbound_propagation_node(dest_hash)
+        except Exception as e:
+            logger.error(
+                "Could not pin propagation node %s: %s",
+                (self.propagation_node_hash or "")[:8],
+                e,
+            )
+            return
+        known = RNS.Identity.recall(dest_hash) is not None
+        logger.info(
+            "Propagation node pinned to %s.. (identity %s)",
+            (self.propagation_node_hash or "")[:8],
+            "known" if known else "not yet announced — awaiting its announce",
         )
 
     def _log_instance_state(self) -> None:
@@ -309,11 +420,101 @@ class ReticulumTransport:
 
     # ── Outbound ───────────────────────────────────────────────────────
 
+    # How long to wait for a path request to answer before giving up on
+    # direct delivery. LoRa hops are slow, so this is generous; it only
+    # applies when there is no path, so a warm path never pays it.
+    PATH_WAIT_SECONDS = 15.0
+
+    # Poll interval inside that wait. Injectable so a test can drive the
+    # deadline without sleeping for it (a mocked sleep does not advance
+    # time.time, so the loop would otherwise spin for the full real 15s).
+    PATH_POLL_SECONDS = 0.5
+
+    def _probe_path(self, dest_hash: bytes) -> tuple[bool, int]:
+        """(has_path, hops) for a destination, requesting one if absent.
+
+        DIRECT sends do not request paths (only OPPORTUNISTIC does), so a cold
+        router cancels a direct message in about a second
+        (``MAX_PATHLESS_TRIES = 1``) even when the peer is reachable and simply
+        has not announced recently. Asking first turns that guaranteed
+        cancellation into a likely delivery.
+        """
+        try:
+            if RNS.Transport.has_path(dest_hash):
+                return True, RNS.Transport.hops_to(dest_hash)
+        except Exception as e:
+            logger.debug("path probe failed: %s", e)
+            return False, 128
+
+        try:
+            RNS.Transport.request_path(dest_hash)
+        except Exception as e:
+            logger.debug("path request failed: %s", e)
+            return False, 128
+
+        deadline = time.time() + self.PATH_WAIT_SECONDS
+        while time.time() < deadline:
+            time.sleep(self.PATH_POLL_SECONDS)
+            try:
+                if RNS.Transport.has_path(dest_hash):
+                    hops = RNS.Transport.hops_to(dest_hash)
+                    logger.info(
+                        "Path to peer appeared after a request (hops=%s)", hops
+                    )
+                    return True, hops
+            except Exception:
+                pass
+        return False, 128
+
+    def _select_method(self, dest_hash: bytes, has_path: bool) -> int:
+        """Pick the LXMF delivery method for this send.
+
+        A path means DIRECT (the whole message travels end to end and we get a
+        real delivery receipt). No path means PROPAGATED when a node is
+        configured, so the reply parks on the node and reaches a phone that is
+        offline -- which is the normal state for a phone. With propagation
+        disabled we still try DIRECT, since the router may find a path in the
+        meantime; it will fail honestly if not.
+        """
+        if has_path:
+            return LXMF.LXMessage.DIRECT
+        if self.propagation_mode == PROPAGATION_MODE_OFF:
+            logger.info(
+                "No path to peer and propagation is off; attempting direct anyway"
+            )
+            return LXMF.LXMessage.DIRECT
+        node = None
+        router = self.router
+        if router is not None:
+            try:
+                node = router.get_outbound_propagation_node()
+            except Exception as e:
+                logger.debug("could not read outbound propagation node: %s", e)
+        if not node:
+            logger.warning(
+                "No path to peer and no propagation node configured; the message "
+                "will fail. Set RETICULUM_PROPAGATION_NODE to 'auto' or a node hash."
+            )
+            return LXMF.LXMessage.DIRECT
+        logger.info("No path to peer; sending via propagation node")
+        return LXMF.LXMessage.PROPAGATED
+
+    def last_send_was_direct(self) -> bool:
+        """True when the most recent send used a live path (DIRECT).
+
+        The adapter reads this to pace a multi-part reply: direct sends burst,
+        propagated sends are spaced. Defaults to True before any send, so the
+        first send of a turn is never paced on a guess.
+        """
+        return self._last_send_direct
+
     def send_to(self, destination_hash: str, payload: str) -> bool:
         """Send ``payload`` to a destination hash (32 hex chars).
 
-        Returns False (never raises) when no interface can carry the
-        packet — the transient failure the adapter maps to retryable.
+        Returns False (never raises) when the message could not be handed to
+        the mesh, or when the router cancels or fails it. A path is probed
+        first so the method can be chosen from real reachability rather than
+        assumed.
         """
         if not self._started or self.router is None or self.destination is None:
             logger.debug("send_to: transport not started")
@@ -326,23 +527,26 @@ class ReticulumTransport:
 
         try:
             identity = RNS.Identity.recall(dest_hash)
+            has_path, hops = self._probe_path(dest_hash)
             if identity is None:
-                # Unknown peer: request a path and poll briefly, as the
-                # standalone bridge does.
-                RNS.Transport.request_path(dest_hash)
-                for _ in range(8):
-                    time.sleep(1)
-                    identity = RNS.Identity.recall(dest_hash)
-                    if identity is not None:
-                        break
+                if not has_path:
+                    logger.info(
+                        "Peer identity unknown and no path after %.0fs — "
+                        "cannot send",
+                        self.PATH_WAIT_SECONDS,
+                    )
+                    return False
+                identity = RNS.Identity.recall(dest_hash)
                 if identity is None:
-                    logger.info("Identity unknown for destination — cannot send")
+                    logger.info("Path exists but identity still unknown — cannot send")
                     return False
 
             dest = RNS.Destination(
                 identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
                 LXMF.APP_NAME, "delivery",
             )
+            method = self._select_method(dest_hash, has_path)
+            self._last_send_direct = method == LXMF.LXMessage.DIRECT
             # Build the message the way the standalone bridge does. There is no
             # LXMRouter.message_for_destination in LXMF — it is LXMessage's
             # constructor — and the router must dispatch it via
@@ -353,7 +557,7 @@ class ReticulumTransport:
                 dest,
                 self.destination,
                 payload,
-                desired_method=LXMF.LXMessage.DIRECT,
+                desired_method=method,
                 include_ticket=True,
             )
             # Per-message callbacks (they live on LXMessage, not the router).
@@ -368,10 +572,69 @@ class ReticulumTransport:
                     lambda msg, _cb=self._failed_cb: _cb(self._extract_reason(msg))
                 )
             self.router.handle_outbound(lxm)
+
+            # handle_outbound only QUEUES the message: it returns while the
+            # router is still deciding whether a route exists. Reporting True
+            # here is what made every dropped message look delivered, so give
+            # the router a moment to reach a terminal state and report the
+            # truth. CANCELLED with no path is the common case this catches.
+            cancelled = self._await_outcome(lxm)
+            if cancelled:
+                logger.warning(
+                    "Message to %s.. was cancelled before leaving (hops=%s, "
+                    "method=%s) — not delivered",
+                    destination_hash[:8],
+                    hops,
+                    "propagated" if method == LXMF.LXMessage.PROPAGATED else "direct",
+                )
+                return False
+            logger.info(
+                "Message handed to the mesh for %s.. (hops=%s, method=%s)",
+                destination_hash[:8],
+                hops,
+                "propagated" if method == LXMF.LXMessage.PROPAGATED else "direct",
+            )
             return True
         except Exception as e:
             logger.error("Failed to send to destination: %s", e)
             return False
+
+    # Grace period for the router to reach a terminal state after queueing.
+    # A couple of seconds is enough to catch the pathless-cancel
+    # (MAX_PATHLESS_TRIES = 1) without holding the caller for a real delivery
+    # round trip. Injectable for the same reason as PATH_POLL_SECONDS.
+    OUTCOME_GRACE_SECONDS = 2.5
+    OUTCOME_POLL_SECONDS = 0.1
+
+    def _await_outcome(self, lxm) -> bool:
+        """True when the message reached a terminal failure state.
+
+        LXMF states: GENERATING, OUTBOUND, SENDING, SENT, DELIVERED,
+        FAILED, REJECTED, CANCELLED. SENT counts as success — a propagated
+        message is complete once the node accepts it. Only FAILED, REJECTED
+        and CANCELLED mean the reply did not leave.
+        """
+        terminal_failure = {
+            LXMF.LXMessage.FAILED,
+            LXMF.LXMessage.REJECTED,
+            LXMF.LXMessage.CANCELLED,
+        }
+        deadline = time.time() + self.OUTCOME_GRACE_SECONDS
+        # Always check at least once: with a zero grace period the loop body
+        # would never run, and a message already in a terminal state (the
+        # router can cancel synchronously inside handle_outbound) would be
+        # reported as delivered.
+        while True:
+            state = getattr(lxm, "state", None)
+            if state in terminal_failure:
+                return True
+            if state in (LXMF.LXMessage.DELIVERED, LXMF.LXMessage.SENT):
+                return False
+            if time.time() >= deadline:
+                break
+            time.sleep(self.OUTCOME_POLL_SECONDS)
+        # Still in flight after the grace period: in progress, not failed.
+        return False
 
     @staticmethod
     def _extract_inbound(message) -> tuple:
