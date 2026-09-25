@@ -34,6 +34,12 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
 
+from hermes_reticulum.plugin.identity import (
+    IdentityMap,
+    is_valid_destination,
+    is_parseable_inbound,
+)
+
 logger = logging.getLogger("hermes_reticulum.adapter")
 
 
@@ -156,13 +162,21 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         self._queue = None
         self._drain_task: Optional[asyncio.Task] = None
 
-        # Trivial identity stub (spec section 4): chat_id is the destination
-        # hash itself; the adapter-side name map is a later ticket.
-        self._names: Dict[str, str] = {}
+        # Identity map (spec section 4): chat_id is the destination hash
+        # itself; the adapter owns the hash → display-name map.
+        # ``_names`` is exposed as a property for the (existing) tests that
+        # write to ``adapter._names[...]`` directly.
+        self._identity = IdentityMap()
 
     @property
     def name(self) -> str:
         return "Reticulum"
+
+    @property
+    def _names(self) -> Dict[str, str]:
+        # Backward-compatible view of the identity map so existing tests
+        # (and future code) can read/write ``adapter._names[hash]`` directly.
+        return self._identity._names
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -253,12 +267,18 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             # (spec section 14).
             logger.debug("Reticulum: dropping unparseable inbound %r", event)
             return
+        # Spec section 14: also drop here if the source is not in the allowlist
+        # (the allowlist comes from the platform gate env, see registration.py).
+        allowlist = self._allowlist()
+        if allowlist and not self._in_allowlist(source_hash, allowlist):
+            logger.debug("Reticulum: dropping inbound from unallowed peer %r", source_hash[:8] if isinstance(source_hash, str) else "?")
+            return
         source = self.build_source(
             chat_id=source_hash,
-            chat_name=self._names.get(source_hash, source_hash),
+            chat_name=self._identity.get_name(source_hash, source_hash),
             chat_type="dm",
             user_id=source_hash,
-            user_name=self._names.get(source_hash, source_hash),
+            user_name=self._identity.get_name(source_hash, source_hash),
         )
         await self.handle_message(
             MessageEvent(
@@ -272,7 +292,12 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _normalize_inbound(event):
-        """Best-effort ``(source_hash, text)`` extraction; (None, None) to drop."""
+        """Best-effort ``(source_hash, text)`` extraction; (None, None) to drop.
+
+        Spec section 14: also drops when the source hash is not 32 hex chars
+        (the gateway's authz layer applies the allowlist separately; this
+        predicate here keeps the drain loop safe from unparseable input).
+        """
         if isinstance(event, dict):
             source_hash = event.get("source") or event.get("destination")
             text = event.get("text") or event.get("payload")
@@ -280,9 +305,9 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             source_hash, text = event[0], event[1]
         else:
             return None, None
-        if not isinstance(source_hash, str) or not source_hash:
+        if not is_valid_destination(source_hash):
             return None, None
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text:
             return None, None
         return source_hash, text
 
@@ -314,7 +339,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
             # (spec section 14): log it and send nothing.
             logger.warning("Reticulum: refusing to send empty message")
             return SendResult(success=False, error="empty message", error_kind="bad_format")
-        if not self._is_valid_hash(chat_id):
+        if not is_valid_destination(chat_id):
             # A malformed destination is a content error, not a transport one.
             return SendResult(
                 success=False,
@@ -344,12 +369,8 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_valid_hash(destination_hash: str) -> bool:
-        """A destination is 32 hex characters (LXMF hash)."""
-        return (
-            isinstance(destination_hash, str)
-            and len(destination_hash) == 32
-            and all(c in "0123456789abcdef" for c in destination_hash.lower())
-        )
+        """A destination is 32 hex characters (LXMF hash). Kept for compat."""
+        return is_valid_destination(destination_hash)
 
     # ── Chat info ────────────────────────────────────────────────────────
 
@@ -358,8 +379,36 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         hashes get a fallback built from the hash itself (spec section 10).
         """
         with contextlib.suppress(Exception):
-            name = self._names.get(chat_id, chat_id)
+            name = self._identity.get_name(chat_id, str(chat_id))
         return {"name": name, "type": "dm"}
+
+    # ── Access control helpers (spec section 7) ─────────────────────────
+
+    def _allowlist(self) -> Optional[list]:
+        """Read the allowlist from the platform gate env (multiplex-safe).
+
+        Returns None when the allowlist is unset/empty (allow-all or no
+        allowlist configured — the gateway's authz layer handles the
+        allow-all default, see ``authz_mixin.py``). Returns a list of
+        raw hex hashes (not normalized) when set.
+        """
+        try:
+            from gateway.platforms._shared import platform_gate_env
+            raw = platform_gate_env("HERMES_RETICUM_ALLOWED_USERS", "")
+        except ImportError:
+            return None
+        if not raw.strip():
+            return None
+        return [h.strip() for h in raw.split(",") if h.strip()]
+
+    @staticmethod
+    def _in_allowlist(destination_hash: str, allowlist: list) -> bool:
+        """Check ``destination_hash`` against a raw allowlist (colon/space
+        tolerant, matching the ACL's ``_normalize_hash`` behaviour)."""
+        def norm(h):
+            return h.strip().lower().replace(" ", "").replace(":", "")
+        target = norm(destination_hash) if isinstance(destination_hash, str) else ""
+        return any(norm(h) == target for h in allowlist)
 
     # ── Typing ───────────────────────────────────────────────────────────
 
