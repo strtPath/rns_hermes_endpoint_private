@@ -381,7 +381,19 @@ class TestLifecycle:
 
 
 class TestDisplayName:
-    def test_set_display_name_updates_callable_app_data(self, fake_rns, tmp_path):
+    def _stub_env(self, monkeypatch):
+        # Same isolation the construction tests use: read through the real
+        # reader but pin the env empty, so an operator who has configured
+        # RETICULUM_DISPLAY_NAME on their machine does not change the verdict.
+        def fake_get(name, default=None, **kwargs):
+            val = os.environ.get(name)
+            return default if val is None else val
+        monkeypatch.setattr(transport_module, "_get_scoped_secret", fake_get)
+        for var in ("RETICULUM_DISPLAY_NAME",):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_set_display_name_updates_callable_app_data(self, fake_rns, tmp_path, monkeypatch):
+        self._stub_env(monkeypatch)
         t = self._make_tested(fake_rns, tmp_path)
         assert t.display_name == "Hermes for Reticulum"
         t.set_display_name("Mesh Hermes")
