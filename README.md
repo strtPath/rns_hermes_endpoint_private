@@ -97,9 +97,9 @@ source venv/bin/activate
 # 4. Configure environment variables
 cp config/env.example .env
 # Edit .env for your deployment
-#   - HERMES_RETICUM_ALLOWED_USERS: LXMF hashes allowed to talk to the agent
+#   - HERMES_RETICULUM_ALLOWED_USERS: LXMF hashes allowed to talk to the agent
 #     (the bridge is DENY-BY-DEFAULT; without an allowlist entry, senders are
-#      rejected — set HERMES_RETICUM_ALLOW_ALL=true only if you mean it)
+#      rejected — set HERMES_RETICULUM_ALLOW_ALL=true only if you mean it)
 #   - HERMES_BIN: only needed if `hermes` is not on PATH
 
 # 5. Configure Reticulum (TCP Server interface)
@@ -197,9 +197,9 @@ Reticulum peers interconnect autonomously. An off-grid RNode only needs a path �
 | `RETICULUM_CONFIG` | `~/.reticulum` | Reticulum config directory |
 | `HERMES_BIN` | *(auto-detected)* | Path to the `hermes` binary |
 | `HERMES_TIMEOUT` | `300` | Hermes timeout (seconds) |
-| `HERMES_RETICUM_ALLOW_ALL` | `false` | Allow any sender |
-| `HERMES_RETICUM_ALLOWED_USERS` | *(empty)* | LXMF hash allowlist |
-| `HERMES_RETICUM_BLOCKED_USERS` | *(empty)* | LXMF hash blocklist |
+| `HERMES_RETICULUM_ALLOW_ALL` | `false` | Allow any sender |
+| `HERMES_RETICULUM_ALLOWED_USERS` | *(empty)* | LXMF hash allowlist |
+| `HERMES_RETICULUM_BLOCKED_USERS` | *(empty)* | LXMF hash blocklist |
 | `HERMES_TOOL_EMOJIS` | `~/.hermes/reticulum_tool_emojis.json` | Optional tool-emoji override map (see below) |
 | `MESH_GATE_TRIAGE` | `off` | Jev pre-gate triage stage: `off`, `hint_only`, or `allow_benign` (see below) |
 | `MESH_GATE_TRIAGE_CONF` | `0.6` | Confidence floor for auto-allow under `allow_benign` |
@@ -264,12 +264,12 @@ Override with `--hermes-bin` or the `HERMES_BIN` variable.
 
 ### Access control
 
-By default, only allowlisted addresses can interact (`HERMES_RETICUM_ALLOW_ALL=false`).
+By default, only allowlisted addresses can interact (`HERMES_RETICULUM_ALLOW_ALL=false`).
 
 ```bash
 # In .env
-HERMES_RETICUM_ALLOW_ALL=false
-HERMES_RETICUM_ALLOWED_USERS=your_client_lxmf_hash,optional_second_hash
+HERMES_RETICULUM_ALLOW_ALL=false
+HERMES_RETICULUM_ALLOWED_USERS=your_client_lxmf_hash,optional_second_hash
 ```
 
 Each client has a 32-character hex LXMF identity hash — from Sideband (Settings → Identity), your RNode/Reticulum identity, or `hermes-reticulum address` on the bridge itself.

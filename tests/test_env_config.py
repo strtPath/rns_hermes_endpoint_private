@@ -31,14 +31,14 @@ class TestDotenvReachesAcl(unittest.TestCase):
         self._saved = {
             var: os.environ.pop(var, None)
             for var in (
-                "HERMES_RETICUM_ALLOW_ALL",
-                "HERMES_RETICUM_ALLOWED_USERS",
-                "HERMES_RETICUM_BLOCKED_USERS",
+                "HERMES_RETICULUM_ALLOW_ALL",
+                "HERMES_RETICULUM_ALLOWED_USERS",
+                "HERMES_RETICULUM_BLOCKED_USERS",
             )
         }
         with open(".env", "w", encoding="utf-8") as fh:
-            fh.write("HERMES_RETICUM_ALLOW_ALL=false\n")
-            fh.write(f"HERMES_RETICUM_ALLOWED_USERS={ALLOWED}\n")
+            fh.write("HERMES_RETICULUM_ALLOW_ALL=false\n")
+            fh.write(f"HERMES_RETICULUM_ALLOWED_USERS={ALLOWED}\n")
 
     def tearDown(self):
         os.chdir(self._cwd)
@@ -60,7 +60,7 @@ class TestDotenvReachesAcl(unittest.TestCase):
 
     def test_allow_all_in_env_is_honoured_when_opted_in(self):
         with open(".env", "w", encoding="utf-8") as fh:
-            fh.write("HERMES_RETICUM_ALLOW_ALL=true\n")
+            fh.write("HERMES_RETICULUM_ALLOW_ALL=true\n")
         _load_dotenv()
         acl = AccessControl()
         self.assertTrue(acl.allow_all)

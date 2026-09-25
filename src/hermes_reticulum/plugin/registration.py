@@ -136,8 +136,8 @@ def register(ctx):
             "The client may be off-grid; route replies efficiently."
         ),
         cron_deliver_env_var="RETICULUM_HOME_CHANNEL",
-        allowed_users_env="HERMES_RETICUM_ALLOWED_USERS",
-        allow_all_env="HERMES_RETICUM_ALLOW_ALL",
+        allowed_users_env="HERMES_RETICULUM_ALLOWED_USERS",
+        allow_all_env="HERMES_RETICULUM_ALLOW_ALL",
     )
 
     logger.info("Reticulum/LXMF platform registered")

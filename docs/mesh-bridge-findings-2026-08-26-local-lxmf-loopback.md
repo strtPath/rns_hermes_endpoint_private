@@ -63,7 +63,7 @@ the mesh — and the client got it back.** The round-trip works on this box.
 The reply was an ACL rejection *because the test identity is not on the
 allowlist* — that is still a valid end-to-end proof of the mesh loop. To get
 a real Hermes-generated answer, run the bridge with
-`HERMES_RETICUM_ALLOW_ALL=true` for the test window, or add the test
+`HERMES_RETICULUM_ALLOW_ALL=true` for the test window, or add the test
 identity to the allowlist.
 
 ## What this means for the "stuck in propagation" report

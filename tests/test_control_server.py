@@ -469,23 +469,23 @@ class TestStatusPayloadInProcess(unittest.TestCase):
         self.assertFalse(self.server.status_payload()["session"]["running"])
 
     def test_acl_mode_reflects_env(self):
-        with mock.patch.dict(os.environ, {"HERMES_RETICUM_ALLOW_ALL": "true"}):
+        with mock.patch.dict(os.environ, {"HERMES_RETICULUM_ALLOW_ALL": "true"}):
             self.assertEqual(self.server.status_payload()["acl"], "open")
         with mock.patch.dict(
             os.environ,
-            {"HERMES_RETICUM_ALLOW_ALL": "false",
-             "HERMES_RETICUM_ALLOWED_USERS": "aa" * 16},
+            {"HERMES_RETICULUM_ALLOW_ALL": "false",
+             "HERMES_RETICULUM_ALLOWED_USERS": "aa" * 16},
         ):
             self.assertEqual(self.server.status_payload()["acl"], "allowlist")
         with mock.patch.dict(
             os.environ,
-            {"HERMES_RETICUM_ALLOW_ALL": "false",
-             "HERMES_RETICUM_ALLOWED_USERS": ""},
+            {"HERMES_RETICULUM_ALLOW_ALL": "false",
+             "HERMES_RETICULUM_ALLOWED_USERS": ""},
         ):
             self.assertEqual(self.server.status_payload()["acl"], "closed")
 
     def test_acl_mode_default_is_closed_not_open(self):
-        """Unset HERMES_RETICUM_ALLOW_ALL must report the deny-by-default posture.
+        """Unset HERMES_RETICULUM_ALLOW_ALL must report the deny-by-default posture.
 
         This is the case an operator on a fresh deployment actually hits, and it is
         the one that regressed: this status field defaulted to "true" while
@@ -494,12 +494,12 @@ class TestStatusPayloadInProcess(unittest.TestCase):
         than the field being absent.
         """
         with mock.patch.dict(os.environ, {}, clear=False):
-            for var in ("HERMES_RETICUM_ALLOW_ALL", "HERMES_RETICUM_ALLOWED_USERS"):
+            for var in ("HERMES_RETICULUM_ALLOW_ALL", "HERMES_RETICULUM_ALLOWED_USERS"):
                 os.environ.pop(var, None)
             self.assertEqual(self.server.status_payload()["acl"], "closed")
 
     def test_acl_mode_default_agrees_with_access_control(self):
-        """Both readers of HERMES_RETICUM_ALLOW_ALL must default to the same posture.
+        """Both readers of HERMES_RETICULUM_ALLOW_ALL must default to the same posture.
 
         Two modules read this var (AccessControl and ControlServer::_acl_mode). They
         disagreed once; this pins them together so a future edit to either one fails
@@ -508,7 +508,7 @@ class TestStatusPayloadInProcess(unittest.TestCase):
         from hermes_reticulum.core.acl import AccessControl
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            for var in ("HERMES_RETICUM_ALLOW_ALL", "HERMES_RETICUM_ALLOWED_USERS"):
+            for var in ("HERMES_RETICULUM_ALLOW_ALL", "HERMES_RETICULUM_ALLOWED_USERS"):
                 os.environ.pop(var, None)
             self.assertFalse(AccessControl().allow_all)
             self.assertNotEqual(self.server.status_payload()["acl"], "open")

@@ -513,7 +513,7 @@ class ReticulumPlatformAdapter(BasePlatformAdapter):
         """
         try:
             from gateway.platforms._shared import platform_gate_env
-            raw = platform_gate_env("HERMES_RETICUM_ALLOWED_USERS", "")
+            raw = platform_gate_env("HERMES_RETICULUM_ALLOWED_USERS", "")
         except ImportError:
             return None
         if not raw.strip():

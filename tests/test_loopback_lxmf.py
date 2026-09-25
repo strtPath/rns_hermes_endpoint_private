@@ -26,7 +26,7 @@ allowlist, so the bridge will take the ACL-rejection path and reply with a
 rejection message.  That is still a valid end-to-end proof: it confirms the
 bridge receives us and the reply traverses the mesh back to us.  To get a
 real Hermes-generated answer, temporarily run the bridge with
-HERMES_RETICUM_ALLOW_ALL=true or add the test identity to the allowlist.
+HERMES_RETICULUM_ALLOW_ALL=true or add the test identity to the allowlist.
 """
 
 import argparse

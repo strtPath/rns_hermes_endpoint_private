@@ -55,8 +55,8 @@ Edit `.env` — minimum required fields:
 HERMES_BIN=/path/to/hermes
 
 # LXMF hash of your mesh client (RNode, Sideband, etc.)
-HERMES_RETICUM_ALLOW_ALL=false
-HERMES_RETICUM_ALLOWED_USERS=YOUR_LXMF_HASH_HERE
+HERMES_RETICULUM_ALLOW_ALL=false
+HERMES_RETICULUM_ALLOWED_USERS=YOUR_LXMF_HASH_HERE
 ```
 
 **Why allowlist?** By default the bridge rejects unknown senders. Add the 32-character hex hash from your RNode identity, Sideband (Settings → Identity), or any client that will talk to the agent.
@@ -140,14 +140,14 @@ hermes-reticulum status     # bridge state
 hermes-reticulum run -v     # verbose log for debugging
 ```
 
-Confirm on the client side that your sender hash appears in `HERMES_RETICUM_ALLOWED_USERS` before testing.
+Confirm on the client side that your sender hash appears in `HERMES_RETICULUM_ALLOWED_USERS` before testing.
 
 ## Common issues
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `hermes: command not found` | Hermes not on PATH | Set `HERMES_BIN` in `.env` |
-| Message ignored | Sender not allowlisted (the bridge is deny-by-default) | Add client hash to `HERMES_RETICUM_ALLOWED_USERS`, or set `HERMES_RETICUM_ALLOW_ALL=true` |
+| Message ignored | Sender not allowlisted (the bridge is deny-by-default) | Add client hash to `HERMES_RETICULUM_ALLOWED_USERS`, or set `HERMES_RETICULUM_ALLOW_ALL=true` |
 | Client won't connect | No Reticulum path or blocked port | Check mesh peers, IP, port 37428, firewall, LoRa links |
 | LXMF identity error | Corrupted local identity store | Delete `~/.lxmf/storage` **only** if you can regenerate contacts |
 | Bridge receives messages but you get no AI reply | Agent process failing (bad Hermes flags, no model configured, timeout) | Run `hermes chat -q "reply OK only"` yourself; check the bridge log for `Hermes exited with code` |

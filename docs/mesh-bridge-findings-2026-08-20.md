@@ -115,7 +115,7 @@ remove the `-c ... --create-if-missing` branch in `hermes_client.chat()`.
 
 - ACL is in **allowlist mode** (`allow_all=False`, 2 allowed, 0 blocked).
 - The two allowed hashes (mobile + desktop) live in the `.env`
-  `HERMES_RETICUM_ALLOWED_USERS` — do **not** echo values.
+  `HERMES_RETICULUM_ALLOWED_USERS` — do **not** echo values.
 - Anyone else who finds the endpoint on the mesh gets
   `⛔ Access not authorized.` and never reaches Hermes.
 

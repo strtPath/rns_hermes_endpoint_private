@@ -36,18 +36,18 @@ class TestACL:
     """Test the access control module."""
 
     def test_open_mode(self, monkeypatch):
-        monkeypatch.setenv("HERMES_RETICUM_ALLOW_ALL", "true")
-        monkeypatch.delenv("HERMES_RETICUM_ALLOWED_USERS", raising=False)
-        monkeypatch.delenv("HERMES_RETICUM_BLOCKED_USERS", raising=False)
+        monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "true")
+        monkeypatch.delenv("HERMES_RETICULUM_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("HERMES_RETICULUM_BLOCKED_USERS", raising=False)
 
         acl = AccessControl()
         assert acl.mode == "open"
         assert acl.is_allowed("aabbccdd" * 4) is True
 
     def test_allowlist_mode(self, monkeypatch):
-        monkeypatch.setenv("HERMES_RETICUM_ALLOW_ALL", "false")
-        monkeypatch.setenv("HERMES_RETICUM_ALLOWED_USERS", "aabbccdd" * 4)
-        monkeypatch.delenv("HERMES_RETICUM_BLOCKED_USERS", raising=False)
+        monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "false")
+        monkeypatch.setenv("HERMES_RETICULUM_ALLOWED_USERS", "aabbccdd" * 4)
+        monkeypatch.delenv("HERMES_RETICULUM_BLOCKED_USERS", raising=False)
 
         acl = AccessControl()
         assert acl.mode == "allowlist"
@@ -55,20 +55,20 @@ class TestACL:
         assert acl.is_allowed("11223344" * 4) is False
 
     def test_blocklist(self, monkeypatch):
-        monkeypatch.setenv("HERMES_RETICUM_ALLOW_ALL", "true")
-        monkeypatch.setenv("HERMES_RETICUM_BLOCKED_USERS", "deadbeef" * 4)
-        monkeypatch.delenv("HERMES_RETICUM_ALLOWED_USERS", raising=False)
+        monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "true")
+        monkeypatch.setenv("HERMES_RETICULUM_BLOCKED_USERS", "deadbeef" * 4)
+        monkeypatch.delenv("HERMES_RETICULUM_ALLOWED_USERS", raising=False)
 
         acl = AccessControl()
         assert acl.is_allowed("deadbeef" * 4) is False
         assert acl.is_allowed("aabbccdd" * 4) is True
 
     def test_invalid_hash_ignored(self, monkeypatch):
-        monkeypatch.setenv("HERMES_RETICUM_ALLOW_ALL", "false")
+        monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "false")
         # short=bad, toolong=bad, valid=good
         valid = "1122334411223344aabbccdd11223344"
-        monkeypatch.setenv("HERMES_RETICUM_ALLOWED_USERS", f"short,toolonghashvalue,{valid}")
-        monkeypatch.delenv("HERMES_RETICUM_BLOCKED_USERS", raising=False)
+        monkeypatch.setenv("HERMES_RETICULUM_ALLOWED_USERS", f"short,toolonghashvalue,{valid}")
+        monkeypatch.delenv("HERMES_RETICULUM_BLOCKED_USERS", raising=False)
 
         acl = AccessControl()
         # Only the valid 32-char hash should be in the set

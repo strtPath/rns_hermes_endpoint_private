@@ -21,9 +21,9 @@ class AccessControl:
     Controls which LXMF senders can interact with the Hermes agent.
 
     Configuration via environment variables:
-      - HERMES_RETICUM_ALLOW_ALL=true      → open mode (opt-in; NOT the default)
-      - HERMES_RETICUM_ALLOWED_USERS=hex1,hex2 → allowlist (default mode)
-      - HERMES_RETICUM_BLOCKED_USERS=hex1,hex2 → blocklist
+      - HERMES_RETICULUM_ALLOW_ALL=true      → open mode (opt-in; NOT the default)
+      - HERMES_RETICULUM_ALLOWED_USERS=hex1,hex2 → allowlist (default mode)
+      - HERMES_RETICULUM_BLOCKED_USERS=hex1,hex2 → blocklist
     """
 
     def __init__(self):
@@ -33,16 +33,16 @@ class AccessControl:
         """Load ACL config from environment variables."""
         # Allow-all mode — FAIL CLOSED. Default is deny-by-default (allowlist
         # mode), matching README/env.example. Open mode must be opted into
-        # explicitly with HERMES_RETICUM_ALLOW_ALL=true.
-        allow_all = os.getenv("HERMES_RETICUM_ALLOW_ALL", "false").lower()
+        # explicitly with HERMES_RETICULUM_ALLOW_ALL=true.
+        allow_all = os.getenv("HERMES_RETICULUM_ALLOW_ALL", "false").lower()
         self.allow_all = allow_all in ("true", "1", "yes")
 
         # Allowlist
-        allowed_raw = os.getenv("HERMES_RETICUM_ALLOWED_USERS", "")
+        allowed_raw = os.getenv("HERMES_RETICULUM_ALLOWED_USERS", "")
         self.allowed_users: set[str] = self._parse_hash_set(allowed_raw)
 
         # Blocklist
-        blocked_raw = os.getenv("HERMES_RETICUM_BLOCKED_USERS", "")
+        blocked_raw = os.getenv("HERMES_RETICULUM_BLOCKED_USERS", "")
         self.blocked_users: set[str] = self._parse_hash_set(blocked_raw)
 
         logger.info(

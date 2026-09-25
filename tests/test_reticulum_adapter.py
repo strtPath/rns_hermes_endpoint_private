@@ -130,10 +130,17 @@ async def test_is_reconnect_reinitialises_from_scratch():
 
 
 @pytest.mark.asyncio
-async def test_foreign_callback_reaches_handle_message_exactly_once():
+async def test_foreign_callback_reaches_handle_message_exactly_once(monkeypatch):
     """An event pushed from a foreign thread (the way RNS would) is
     delivered to handle_message exactly once, then the drain task ends
-    cleanly on disconnect."""
+    cleanly on disconnect.
+
+    The allowlist is pinned empty: the adapter consults it on every inbound
+    event, so an operator's configured allowlist would otherwise decide this
+    test's verdict and their peer hash would appear in the failure output.
+    """
+    monkeypatch.delenv("HERMES_RETICULUM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("HERMES_RETICULUM_ALLOW_ALL", raising=False)
     recorder = HandlerRecorder()
     factory = CountingFactory()
     adapter = ReticulumPlatformAdapter(
@@ -259,3 +266,63 @@ async def test_send_through_fake_transport_returns_node_acceptance():
     # The fake transport saw the packet.
     assert adapter._transport.sent == [("0" * 32, "hello")]
     await adapter.disconnect()
+
+
+# ── Allowlist gating (spec section 14) ────────────────────────────────────
+# The behaviour the live phone test depends on: a listed peer gets through,
+# an unlisted one is dropped without a reply.
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_peer_is_admitted(monkeypatch):
+    monkeypatch.setenv("HERMES_RETICULUM_ALLOWED_USERS", "a" * 32)
+    monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "false")
+    recorder = HandlerRecorder()
+    factory = CountingFactory()
+    adapter = ReticulumPlatformAdapter(PlatformConfig(), transport_factory=factory)
+    adapter.set_message_handler(recorder)
+    assert await adapter.connect() is True
+
+    factory.transport._delivery_cb(("a" * 32, "let me in"))
+    deadline = time.monotonic() + 5.0
+    while not recorder.events and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    await adapter.disconnect()
+    assert len(recorder.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_unlisted_peer_is_dropped_without_a_reply(monkeypatch):
+    monkeypatch.setenv("HERMES_RETICULUM_ALLOWED_USERS", "a" * 32)
+    monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "false")
+    recorder = HandlerRecorder()
+    factory = CountingFactory()
+    adapter = ReticulumPlatformAdapter(PlatformConfig(), transport_factory=factory)
+    adapter.set_message_handler(recorder)
+    assert await adapter.connect() is True
+
+    factory.transport._delivery_cb(("b" * 32, "not on the list"))
+    await asyncio.sleep(0.5)
+    await adapter.disconnect()
+    assert recorder.events == []
+
+
+@pytest.mark.asyncio
+async def test_allowlist_matching_is_case_and_colon_tolerant(monkeypatch):
+    """Peers copy hashes from clients that render them in either case,
+    sometimes colon-separated; the comparison must not be literal."""
+    formatted = ":".join(("ab" * 16).upper()[i:i + 2] for i in range(0, 32, 2))
+    monkeypatch.setenv("HERMES_RETICULUM_ALLOWED_USERS", formatted.upper())
+    monkeypatch.setenv("HERMES_RETICULUM_ALLOW_ALL", "false")
+    recorder = HandlerRecorder()
+    factory = CountingFactory()
+    adapter = ReticulumPlatformAdapter(PlatformConfig(), transport_factory=factory)
+    adapter.set_message_handler(recorder)
+    assert await adapter.connect() is True
+
+    factory.transport._delivery_cb((("ab" * 16).lower(), "hi"))
+    deadline = time.monotonic() + 5.0
+    while not recorder.events and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    await adapter.disconnect()
+    assert len(recorder.events) == 1
