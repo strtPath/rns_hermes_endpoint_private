@@ -119,3 +119,26 @@ def test_invalid_interval_is_skipped_not_fatal(monkeypatch):
     extra = registration._env_enablement()
     assert extra is not None
     assert "announce_interval" not in extra
+
+
+# ── The gateway's enable gate (is_connected) ──────────────────────────────
+# gateway/config_env.py::_enable_plugin_platform skips a platform whose
+# is_connected returns False, at DEBUG level. A wrong answer here is silent:
+# the plugin registers, then no adapter is ever built.
+
+
+def test_is_connected_is_true_when_unconfigured():
+    """The gate asks "is this platform set up", not "is a socket open".
+
+    An earlier version read RETICULUM_CONNECTED, which nothing sets, so the
+    answer was permanently False and the adapter was never constructed.
+    """
+    assert registration._is_connected(None) is True
+
+
+def test_is_connected_ignores_a_runtime_state_var(monkeypatch):
+    """The old runtime flag must not change the verdict either way."""
+    monkeypatch.setenv("RETICULUM_CONNECTED", "false")
+    assert registration._is_connected(None) is True
+    monkeypatch.setenv("RETICULUM_CONNECTED", "true")
+    assert registration._is_connected(None) is True

@@ -71,12 +71,20 @@ def _validate_config(config) -> bool:
 
 
 def _is_connected(config) -> bool:
-    """Check if the adapter is currently connected.
+    """Whether Reticulum is CONFIGURED — the gateway's enable gate.
 
-    Called by the gateway status system; reads through the scoped reader
-    (spec section 2: never os.getenv under multiplexing).
+    The gateway calls this to decide whether to instantiate the adapter
+    (``gateway/config_env.py::_enable_plugin_platform``: a False return
+    skips the platform entirely, at debug level, so a wrong answer here is
+    silent). It asks "is this platform set up", NOT "is a socket open right
+    now" — the IRC reference plugin returns ``validate_config(config)`` for
+    the same reason.
+
+    Docking the answer to a runtime state flag (an earlier version read
+    RETICULUM_CONNECTED, which nothing ever sets) makes the gate permanently
+    False, so the adapter is never constructed and the node never announces.
     """
-    return (_get_scoped_secret("RETICULUM_CONNECTED", "") or "").lower() == "true"
+    return _validate_config(config)
 
 
 def _env_enablement() -> dict | None:
