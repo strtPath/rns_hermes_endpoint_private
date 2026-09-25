@@ -146,6 +146,11 @@ class _FakeLXMessage:
         self.dest = dest
         self.source = source
         self.content = content
+        # Real LXMessage turns its constructor kwargs into attributes
+        # (include_ticket, desired_method, ...); the fake must too, or a
+        # test reading them passes vacuously against the wrong call shape.
+        for key, value in kwargs.items():
+            setattr(self, key, value)
         self.kwargs = kwargs
         self.delivery_callback = None
         self.failed_callback = None
@@ -189,11 +194,6 @@ class _FakeRouter:
 
     def handle_outbound(self, lxm):
         self.outbound.append(lxm)
-
-    def message_for_destination(self, destination, content, **kwargs):
-        msg = _FakeLXMessage(destination, None, content, **kwargs)
-        self.outbound.append(msg)
-        return msg
 
 
 class _FakeTransport:
@@ -317,16 +317,14 @@ class TestSendTo:
         assert t.send_to("", "nope") is False
 
     def test_send_to_exception_returns_false(self, fake_rns, tmp_path):
+        """A raising dispatch is reported as a failed send, not an exception.
+
+        handle_outbound is the real entry point (LXMF has no
+        message_for_destination), so that is the seam to break.
+        """
         fake_rns.Identity.recall.return_value = mock.Mock()
         t = self._started_transport(fake_rns, tmp_path)
-        msg_holder = {}
-        real_msg_for = t.router.message_for_destination
-        def _boom(destination, content, **kwargs):
-            m = real_msg_for(destination, content, **kwargs)
-            m.send = mock.Mock(side_effect=RuntimeError("boom"))
-            msg_holder["m"] = m
-            return m
-        t.router.message_for_destination = _boom
+        t.router.handle_outbound = mock.Mock(side_effect=RuntimeError("boom"))
         assert t.send_to(FAKE_HASH, "hello") is False
 
 

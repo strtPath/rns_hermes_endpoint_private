@@ -342,11 +342,22 @@ class ReticulumTransport:
                 identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
                 LXMF.APP_NAME, "delivery",
             )
-            lxm = self.router.message_for_destination(dest, payload)
-            lxm.include_ticket = True
-            lxm.desired_method = LXMF.LXMessage.DIRECT
-            # Per-message callbacks (they live on LXMessage, not the
-            # router). Fire on the RNS thread; the adapter hops threads.
+            # Build the message the way the standalone bridge does. There is no
+            # LXMRouter.message_for_destination in LXMF — it is LXMessage's
+            # constructor — and the router must dispatch it via
+            # handle_outbound(), which owns path selection, stamp costing,
+            # propagation fallback and retries. Calling lxm.send() directly
+            # bypasses all of that.
+            lxm = LXMF.LXMessage(
+                dest,
+                self.destination,
+                payload,
+                desired_method=LXMF.LXMessage.DIRECT,
+                include_ticket=True,
+            )
+            # Per-message callbacks (they live on LXMessage, not the router).
+            # Register BEFORE dispatch so an immediate failure is not missed.
+            # They fire on the RNS thread; the adapter hops threads.
             if self._delivery_cb is not None:
                 lxm.register_delivery_callback(
                     lambda msg, _cb=self._delivery_cb: _cb(self._extract_inbound(msg))
@@ -355,10 +366,7 @@ class ReticulumTransport:
                 lxm.register_failed_callback(
                     lambda msg, _cb=self._failed_cb: _cb(self._extract_reason(msg))
                 )
-            # send() reaches RNS.Packet.send; the router marks the message
-            # failed (and our failed callback fires) when no interface
-            # could carry it.
-            lxm.send()
+            self.router.handle_outbound(lxm)
             return True
         except Exception as e:
             logger.error("Failed to send to destination: %s", e)
